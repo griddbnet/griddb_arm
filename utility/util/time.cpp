@@ -1157,7 +1157,7 @@ int64_t DateTime::getMaxUnixTime(bool trimMilliseconds) {
 		maxUnixTime =
 				static_cast<int64_t>(std::numeric_limits<int32_t>::max()) * 1000;
 	}
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) or defined(__aarch64__)
 	maxUnixTime = std::numeric_limits<int64_t>::max();
 #else
 	maxUnixTime =
