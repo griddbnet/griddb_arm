@@ -156,7 +156,7 @@
 #endif
 
 #ifndef UTIL_CPU_BUILD_AVX2
-#if defined(__GNUC__) && \
+#if defined(__x86_64__) && defined(__GNUC__) && \
 		(__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
 #define UTIL_CPU_BUILD_AVX2 1
 #else
