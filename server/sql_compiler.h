@@ -1,6 +1,6 @@
 ﻿/*
 	Copyright (c) 2017 TOSHIBA Digital Solutions Corporation
-
+	
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU Affero General Public License as
 	published by the Free Software Foundation, either version 3 of the
@@ -20,7 +20,6 @@
 #include "sql_parser.h"
 
 struct MetaContainerInfo;
-struct OptionParam;
 struct BindParm;
 class SQLHintInfo;
 class Query;
@@ -34,6 +33,8 @@ struct SQLHint {
 		MAX_DEGREE_OF_TASK_INPUT,
 		MAX_DEGREE_OF_EXPANSION,
 
+		MAX_GENERATED_ROWS,
+
 		DISTRIBUTED_POLICY,
 
 		INDEX_SCAN,
@@ -45,6 +46,12 @@ struct SQLHint {
 		LEADING,
 
 		TASK_ASSIGNMENT, 
+
+		LEGACY_PLAN,
+		COST_BASED_JOIN,
+		NO_COST_BASED_JOIN,
+
+		OPTIMIZER_FAILURE_POINT,
 
 		TABLE_ROW_COUNT,
 
@@ -69,7 +76,8 @@ struct SQLTableInfo {
 				containerId_,
 				schemaVersionId_,
 				UTIL_OBJECT_CODER_OPTIONAL(subContainerId_, -1),
-				UTIL_OBJECT_CODER_OPTIONAL(partitioningVersionId_, -1));
+				UTIL_OBJECT_CODER_OPTIONAL(partitioningVersionId_, -1),
+				UTIL_OBJECT_CODER_OPTIONAL(approxSize_, -1));
 
 		Id id_;
 		SQLType::TableType type_;
@@ -80,16 +88,17 @@ struct SQLTableInfo {
 		int32_t subContainerId_;
 		int64_t partitioningVersionId_;
 		bool isNodeExpansion_;
+		int64_t approxSize_;
 	};
 
 	struct SubInfo;
 	struct PartitioningInfo;
+	struct SQLIndexInfo;
+	struct BasicIndexInfoList;
 
 	typedef util::Vector<SubInfo> SubInfoList;
-	typedef util::Vector<int32_t> IndexInfoList;
+	typedef util::Vector<SQLIndexInfo> IndexInfoList;
 	typedef util::Vector<uint8_t> NullStatisticsList;
-
-	typedef util::Vector< util::Vector<ColumnId> > CompositeIndexInfoList;
 
 	typedef std::pair<TupleList::TupleColumnType, util::String> SQLColumnInfo;
 	typedef util::Vector<SQLColumnInfo> SQLColumnInfoList;
@@ -106,22 +115,18 @@ struct SQLTableInfo {
 	bool hasRowKey_;
 	bool writable_;
 	bool isView_;
+	bool isExpirable_;
 
 	IdInfo idInfo_;
 	SQLColumnInfoList columnInfoList_;
-	PartitioningInfo *partitioning_;
-	IndexInfoList indexInfoList_;
-
-	CompositeIndexInfoList compositeIndexInfoList_;
-	void setPartitionCount(uint32_t partitionCount);
+	const PartitioningInfo *partitioning_;
+	const IndexInfoList *indexInfoList_;
+	const BasicIndexInfoList *basicIndexInfoList_;
 
 	NoSQLColumnInfoList nosqlColumnInfoList_;
 	NoSQLColumnOptionList nosqlColumnOptionList_;
-
 	util::String sqlString_;
 
-	bool isExpirable_;
-	uint64_t approxSize_;
 	util::Vector<uint64_t> cardinalityList_;
 	util::Vector<uint8_t> nullsStats_;
 };
@@ -130,13 +135,13 @@ struct SQLTableInfo::SubInfo {
 	SubInfo();
 
 	UTIL_OBJECT_CODER_MEMBERS(
-			partitionId_, containerId_, schemaVersionId_, indexInfoList_);
+			partitionId_, containerId_, schemaVersionId_, approxSize_);
 
 	PartitionId partitionId_;
 	ContainerId containerId_;
 	SchemaVersionId schemaVersionId_;
-	IndexInfoList *indexInfoList_;
 	int64_t nodeAffinity_;
+	int64_t approxSize_;
 };
 
 struct SQLTableInfo::PartitioningInfo {
@@ -146,12 +151,7 @@ struct SQLTableInfo::PartitioningInfo {
 
 	explicit PartitioningInfo(util::StackAllocator &alloc);
 
-	void copy(PartitioningInfo &partitioningInfo);
-
-	SyntaxTree::TablePartitionType getPartitioningType() {
-		return static_cast<SyntaxTree::TablePartitionType>(
-				partitioningType_);
-	}
+	void copy(const PartitioningInfo &partitioningInfo);
 
 	UTIL_OBJECT_CODER_ALLOC_CONSTRUCTOR;
 	UTIL_OBJECT_CODER_MEMBERS(
@@ -165,8 +165,8 @@ struct SQLTableInfo::PartitioningInfo {
 	util::StackAllocator &alloc_;
 
 	uint8_t partitioningType_;
-	ColumnId partitioningColumnId_;
-	ColumnId subPartitioningColumnId_;
+	int32_t partitioningColumnId_;
+	int32_t subPartitioningColumnId_;
 	SubInfoList subInfoList_;
 	util::String tableName_;
 	bool isCaseSensitive_;
@@ -178,9 +178,41 @@ struct SQLTableInfo::PartitioningInfo {
 	IntervalList availableList_;
 };
 
+struct SQLTableInfo::SQLIndexInfo {
+
+	explicit SQLIndexInfo(util::StackAllocator &alloc);
+
+	UTIL_OBJECT_CODER_ALLOC_CONSTRUCTOR;
+	UTIL_OBJECT_CODER_MEMBERS(columns_);
+
+	util::Vector<ColumnId> columns_;
+};
+
+struct SQLTableInfo::BasicIndexInfoList {
+public:
+
+
+
+
+	explicit BasicIndexInfoList(util::StackAllocator &alloc);
+
+	void assign(util::StackAllocator &alloc, const IndexInfoList &src);
+
+	const util::Vector<ColumnId>& getFirstColumns() const;
+
+	bool isIndexed(ColumnId firstColumnId) const;
+
+	UTIL_OBJECT_CODER_ALLOC_CONSTRUCTOR;
+	UTIL_OBJECT_CODER_MEMBERS(columns_);
+
+private:
+	util::Vector<ColumnId> columns_;
+};
+
 class SQLTableInfoList {
 public:
 	typedef SyntaxTree::QualifiedName QualifiedName;
+	typedef SQLTableInfo::BasicIndexInfoList BasicIndexInfoList;
 	typedef int32_t NodeId;
 
 	explicit SQLTableInfoList(util::StackAllocator &alloc);
@@ -209,9 +241,7 @@ public:
 			const char8_t *dbName, const char8_t *tableName,
 			bool dbCaseSensitive, bool tableCaseSensitive) const;
 
-	void applyStatisticalHint(SQLHintInfo &hintInfo);
-
-	const SQLTableInfo::IndexInfoList& getIndexInfoList(
+	const BasicIndexInfoList* getIndexInfoList(
 			const SQLTableInfo::IdInfo &idInfo) const;
 
 private:
@@ -222,7 +252,6 @@ private:
 	List list_;
 	util::String *defaultDBName_;
 };
-
 
 
 class SQLHint::Coder {
@@ -257,6 +286,12 @@ class SQLPreparedPlan {
 public:
 	class Node;
 
+	struct Constants;
+	struct TotalProfile;
+	struct Profile;
+	struct OptProfile;
+
+	typedef int64_t ProfileKey;
 	typedef util::Vector<Node> NodeList;
 	typedef util::Vector<TupleValue> ValueList;
 	typedef util::Vector<TupleList::TupleColumnType> ValueTypeList;
@@ -269,6 +304,12 @@ public:
 
 	Node& back();
 	const Node& back() const;
+
+	static bool isDisabledNode(const Node &node);
+	static bool isDisabledExpr(const SyntaxTree::Expr &expr);
+
+	static SQLType::Id getDisabledNodeType();
+	static SQLType::Id getDisabledExprType();
 
 	void removeEmptyNodes();
 	void removeEmptyColumns();
@@ -290,8 +331,9 @@ public:
 	NodeList nodeList_;
 	ValueList parameterList_;
 	bool currentTimeRequired_;
-	util::Vector<BindParm*> *bindList_;
-	SQLHintInfo *hintInfo_;	
+
+	const SQLHintInfo *hintInfo_; 
+	SQLPlanningVersion planningVersion_;
 };
 
 class SQLPreparedPlan::Node {
@@ -324,6 +366,9 @@ public:
 		static const CommandOptionFlag CMD_OPT_JOIN_USE_INDEX;
 		static const CommandOptionFlag CMD_OPT_SCAN_MULTI_INDEX;
 		static const CommandOptionFlag CMD_OPT_WINDOW_SORTED;
+		static const CommandOptionFlag CMD_OPT_GROUP_RANGE;
+		static const CommandOptionFlag CMD_OPT_JOIN_DRIVING_NONE_LEFT;
+		static const CommandOptionFlag CMD_OPT_JOIN_DRIVING_SOME;
 	};
 
 	explicit Node(util::StackAllocator &alloc);
@@ -376,26 +421,42 @@ public:
 			updateSetList_,
 			createTableOpt_,
 			createIndexOpt_,
-			tqlPred_,
 			partitioningInfo_,
 			UTIL_OBJECT_CODER_ENUM(commandType_, SyntaxTree::CMD_NONE),
 			cmdOptionList_,
 			insertColumnMap_,
-			insertSetList_);
+			insertSetList_,
+			profile_);
 
 	Id id_;
 
 	Type type_;
-	QualifiedName *qName_;
+	const QualifiedName *qName_;
 
+	/**
+		@note SCANは常に入力なし、SELECTは0-2入力、その他は1入力以上
+	 */
 	IdList inputList_;
 
+	/**
+		@note
+			- AGGREGATE: (グルーピング対象カラムの列)
+			- SORT: (ソート対象カラムの列(ソート順序指定あり))
+			- JOIN: (メインのON条件: EQ|LT|GT|LE|GE), (WHERE条件)[, (他のON条件)]
+			- SELECT: [(WHERE条件)[, (他のON条件)]]
+			- SCAN: (WHERE条件)
+	 */
 	ExprList predList_;
 
+	/**
+		@note
+			- SQLProcessorで使用されるのはAGGREGATE、JOIN、SCAN、SELECTのみ
+			- 上記以外に、SORT、UNIONにおいても使用
+	 */
 	ExprList outputList_;
 
 	SQLTableInfo::IdInfo tableIdInfo_;
-	SQLTableInfo::IndexInfoList *indexInfoList_;
+	const SQLTableInfo::BasicIndexInfoList *indexInfoList_;
 
 	int64_t offset_;
 	int64_t limit_;
@@ -404,6 +465,9 @@ public:
 
 	AggregationPhase aggPhase_;
 
+	/**
+		@note JOIN、SELECTでのみ有効
+	 */
 	JoinType joinType_;
 
 	UnionType unionType_;
@@ -411,24 +475,185 @@ public:
 
 	ExprList *updateSetList_;
 
-	SyntaxTree::CreateTableOption *createTableOpt_;
-	SyntaxTree::CreateIndexOption *createIndexOpt_;
-	util::String *tqlPred_;
+	/**
+		@note DDLの場合、セット
+		@note DMLの場合、パーティショニングカラム等を特定するためにセット。プロセッサ内で内部解析
+	 */
+	const SyntaxTree::CreateTableOption *createTableOpt_;
+	const SyntaxTree::CreateIndexOption *createIndexOpt_;
 
-	PartitioningInfo *partitioningInfo_;
+	/**
+		@note DMLの対象がラージの場合のサブコンテナ情報
+	 */
+	const PartitioningInfo *partitioningInfo_;
+	/**
+		@note コマンド種別. DDL特定
+	 */
 	CommandType commandType_;
-	SyntaxTree::ExprList *cmdOptionList_;
-	InsertColumnMap *insertColumnMap_;
-	SyntaxTree::ExprList *insertSetList_;
+	const SyntaxTree::ExprList *cmdOptionList_;
+	const InsertColumnMap *insertColumnMap_;
+	const SyntaxTree::ExprList *insertSetList_;
 	const NoSQLColumnInfoList *nosqlTypeList_;
 	const NoSQLColumnInfoList *nosqlColumnOptionList_;
-	OptionParam *optionParam_;
+
+	TotalProfile *profile_;
+	ProfileKey profileKey_;
+};
+
+struct SQLPreparedPlan::Constants {
+	enum StringConstant {
+		STR_REORDER_JOIN,
+		STR_REVERSED_COST,
+
+		STR_TREE_WEIGHT,
+		STR_FILTERED_TREE_WEIGHT,
+		STR_NODE_DEGREE,
+
+		STR_FILTER,
+		STR_FILTER_LEVEL,
+		STR_FILTER_DEGREE,
+		STR_FILTER_WEAKNESS,
+
+		STR_EDGE,
+		STR_EDGE_LEVEL,
+		STR_EDGE_DEGREE,
+		STR_EDGE_WEAKNESS,
+
+		STR_HINT,
+
+		END_STR
+	};
+
+	static const util::NameCoderEntry<StringConstant> CONSTANT_LIST[];
+	static const util::NameCoder<StringConstant, END_STR> CONSTANT_CODER;
+};
+
+struct SQLPreparedPlan::TotalProfile {
+	TotalProfile();
+
+	static bool clearIfEmpty(TotalProfile *&profile);
+
+	UTIL_OBJECT_CODER_MEMBERS(plan_);
+
+	Profile *plan_;
+};
+
+struct SQLPreparedPlan::Profile {
+	Profile();
+
+	static bool clearIfEmpty(Profile *&profile);
+
+	UTIL_OBJECT_CODER_MEMBERS(optimization_);
+
+	OptProfile *optimization_;
+};
+
+struct SQLPreparedPlan::OptProfile {
+	struct Join;
+	struct JoinCost;
+	struct JoinNode;
+	struct JoinTree;
+
+	typedef int32_t JoinOrdinal;
+	typedef util::Vector<JoinOrdinal> JoinOrdinalList;
+
+	typedef SyntaxTree::QualifiedName QualifiedName;
+
+	OptProfile();
+
+	static bool clearIfEmpty(OptProfile *&profile);
+
+	UTIL_OBJECT_CODER_MEMBERS(joinReordering_);
+
+	util::Vector<Join> *joinReordering_;
+};
+
+struct SQLPreparedPlan::OptProfile::Join {
+	Join();
+
+	UTIL_OBJECT_CODER_MEMBERS(
+			nodes_, tree_, candidates_,
+			UTIL_OBJECT_CODER_OPTIONAL(reordered_, false),
+			UTIL_OBJECT_CODER_OPTIONAL(tableCostAffected_, false),
+			UTIL_OBJECT_CODER_OPTIONAL(costBased_, true));
+
+	util::Vector<JoinNode> *nodes_;
+	JoinTree *tree_;
+
+	util::Vector<JoinTree> *candidates_;
+	bool reordered_;
+	bool tableCostAffected_;
+	bool costBased_;
+
+	ProfileKey profileKey_;
+};
+
+struct SQLPreparedPlan::OptProfile::JoinNode {
+	JoinNode();
+
+	UTIL_OBJECT_CODER_MEMBERS(
+			ordinal_,
+			qName_,
+			UTIL_OBJECT_CODER_OPTIONAL(approxSize_, -1));
+
+	JoinOrdinal ordinal_;
+	QualifiedName *qName_;
+	int64_t approxSize_;
+};
+
+struct SQLPreparedPlan::OptProfile::JoinTree {
+	JoinTree();
+
+	UTIL_OBJECT_CODER_MEMBERS(
+			UTIL_OBJECT_CODER_OPTIONAL(ordinal_, -1),
+			left_,
+			right_,
+			UTIL_OBJECT_CODER_ENUM(
+					criterion_, Constants::END_STR, Constants::CONSTANT_CODER),
+			cost_,
+			best_,
+			other_,
+			target_);
+
+	JoinOrdinal ordinal_;
+	JoinTree *left_;
+	JoinTree *right_;
+	Constants::StringConstant criterion_;
+	JoinCost *cost_;
+
+	JoinTree *best_;
+	util::Vector<JoinTree> *other_;
+	JoinOrdinalList *target_;
+};
+
+struct SQLPreparedPlan::OptProfile::JoinCost {
+	JoinCost();
+
+	UTIL_OBJECT_CODER_MEMBERS(
+			UTIL_OBJECT_CODER_OPTIONAL(filterLevel_, 0),
+			UTIL_OBJECT_CODER_OPTIONAL(filterDegree_, 0),
+			UTIL_OBJECT_CODER_OPTIONAL(filterWeakness_, 0),
+			UTIL_OBJECT_CODER_OPTIONAL(edgeLevel_, 0),
+			UTIL_OBJECT_CODER_OPTIONAL(edgeDegree_, 0),
+			UTIL_OBJECT_CODER_OPTIONAL(edgeWeakness_, 0),
+			UTIL_OBJECT_CODER_OPTIONAL(approxSize_, -1));
+
+	uint32_t filterLevel_; 
+	uint32_t filterDegree_; 
+	uint64_t filterWeakness_; 
+
+	uint32_t edgeLevel_; 
+	uint32_t edgeDegree_; 
+	uint64_t edgeWeakness_; 
+
+	int64_t approxSize_; 
 };
 
 class SQLHintInfo {
 public:
 	typedef SQLPreparedPlan::Node PlanNode;
 	typedef SQLPreparedPlan::Node::Id PlanNodeId;
+	typedef SQLPreparedPlan::Constants::StringConstant StringConstant;
 	typedef uint32_t HintTableId;
 	typedef SyntaxTree::Expr Expr;
 	typedef SyntaxTree::ExprList ExprList;
@@ -438,11 +663,8 @@ public:
 	typedef util::Map<StatisticalHintKey, util::Vector<SQLHintValue> > StatisticalHintMap;
 	typedef util::Vector<PlanNodeId> PlanNodeIdList;
 	typedef util::Vector<HintTableId> HintTableIdList;
-	typedef util::Map<util::String, HintTableId> HintTableIdMap;
 
 	typedef SQLTableInfo::Id TableInfoId; 
-	typedef util::Map<util::String, TableInfoId> TableInfoIdMap;
-
 
 	static const HintTableId START_HINT_TABLEID;
 	static const HintTableId UNDEF_HINT_TABLEID;
@@ -453,6 +675,39 @@ public:
 		REPORT_WARNING,
 		REPORT_INFO
 	};
+
+	struct SymbolElement {
+		SymbolElement();
+
+		StringConstant value_;
+	};
+
+	struct SymbolList {
+		enum {
+			SYMBOL_LIST_SIZE = 3
+		};
+
+		StringConstant getValue(size_t pos) const;
+		void setValue(size_t pos, StringConstant value);
+
+		SymbolElement elems_[SYMBOL_LIST_SIZE];
+	};
+
+	struct HintTableIdMapValue {
+		HintTableIdMapValue(HintTableId id, const util::String &origName);
+
+		const util::String origName_;
+		const HintTableId id_;
+	};
+	typedef util::Map<util::String, HintTableIdMapValue> HintTableIdMap;
+
+	struct TableInfoIdMapValue {
+		TableInfoIdMapValue(TableInfoId id, const util::String &origName);
+
+		const util::String origName_;
+		const TableInfoId id_;
+	};
+	typedef util::Map<util::String, TableInfoIdMapValue> TableInfoIdMap;
 
 	struct HintTableIdListKey {
 		explicit HintTableIdListKey(util::StackAllocator &alloc);
@@ -472,6 +727,7 @@ public:
 		SQLHint::Id hintId_;
 		const Expr* hintExpr_;
 		HintTableIdList hintTableIdList_;
+		SymbolList symbolList_;
 		bool isTree_;
 
 		ParsedHint& operator=(const ParsedHint &another);
@@ -481,6 +737,7 @@ public:
 		SQLHint::Id hintId_;
 		const Expr* hintExpr_;
 	};
+
 	typedef util::MultiMap<HintTableIdListKey, ParsedHint> JoinHintMap;
 	typedef util::Map<TableInfoId, SimpleHint> ScanHintMap;
 	typedef std::pair<HintTableId, HintTableId> JoinMethodHintKey;
@@ -489,6 +746,7 @@ public:
 	explicit SQLHintInfo(util::StackAllocator &alloc);
 	~SQLHintInfo();
 
+	bool hasHint(SQLHint::Id) const;
 	const HintExprArray* getHintList(SQLHint::Id) const;
 
 	void getHintValueList(SQLHint::Id id, util::Vector<TupleValue> &valueList) const;
@@ -497,6 +755,9 @@ public:
 			const util::Vector<const util::String*> &nodeNameList,
 			SQLHint::Id filter,
 			util::Vector<SQLHintInfo::ParsedHint> &hintList) const;
+
+	const SQLHintValue* findStatisticalHint(
+			SQLHint::Id hintId, const char8_t *tableName) const;
 
 	bool findScanHint(const TableInfoId tableInfoId, const SimpleHint* &scanHint) const;
 
@@ -507,6 +768,10 @@ public:
 	bool findJoinMethodHint(
 			const JoinMethodHintKey &key, SQLHint::Id filter,
 			const SimpleHint* &scanHint) const;
+	const SQLHintValue* findStatisticalHint(
+			SQLHint::Id hintId, const char8_t *tableName);
+
+	const util::Vector<ParsedHint>& getSymbolHintList() const;
 
 	void setReportLevel(ReportLevel flag);
 
@@ -516,14 +781,12 @@ public:
 	void reportWarning(const char8_t* message) const;
 	void reportInfo(const char8_t* message) const;
 
-	void makeHintMap(const SyntaxTree::ExprList*, SQLTableInfoList &tableInfoList);
-
-	void applyStatisticalHint(SQLTableInfo &tableInfo);
+	void makeHintMap(const SyntaxTree::ExprList *hintList);
 
 	void makeJoinHintMap(const SQLPreparedPlan &plan);
 
-	void insertHintTableIdMap(const util::String& name, HintTableId id);
-	void insertTableInfoIdMap(const util::String& name, TableInfoId id);
+	void insertHintTableIdMap(const util::String& origName, HintTableId id);
+	void insertTableInfoIdMap(const util::String& origName, TableInfoId id);
 
 	HintTableId getHintTableId(const util::String& name) const;
 
@@ -531,6 +794,7 @@ public:
 
 private:
 	void parseStatisticalHint(SQLHint::Id hintId, const Expr &hintExpr);
+	void parseSymbolHint(SQLHint::Id hintId, const Expr *hintExpr);
 
 	HintTableId getHintTableId(const Expr &hintArgExpr) const;
 	TableInfoId getTableInfoId(const Expr &hintArgExpr) const;
@@ -563,6 +827,8 @@ private:
 
 	bool checkHintArguments(SQLHint::Id hintId, const Expr &hintExpr) const;
 
+	void checkExclusiveHints(SQLHint::Id hintId1, SQLHint::Id hintId2) const;
+
 	bool checkArgCount(
 			const Expr &hintExpr,
 			size_t count, bool isMinimum) const;
@@ -574,17 +840,21 @@ private:
 	bool checkAllArgsValueType(
 			const Expr &hintExpr,
 			TupleList::TupleColumnType type,
-			int64_t minValue = std::numeric_limits<int64_t>::min()) const;
+			int64_t minValue = std::numeric_limits<int64_t>::min(),
+			int64_t maxValue = std::numeric_limits<int64_t>::max()) const;
 
 	bool checkArgValueType(
 			const Expr &hintExpr, size_t pos,
 			TupleList::TupleColumnType type,
-			int64_t minValue = std::numeric_limits<int64_t>::min()) const;
+			int64_t minValue = std::numeric_limits<int64_t>::min(),
+			int64_t maxValue = std::numeric_limits<int64_t>::max()) const;
+
+	bool checkValueRange(int64_t value, int64_t min, int64_t max) const;
 
 	bool checkArgIsTable(
-			const Expr &hintExpr, size_t pos) const;
+			const Expr &hintExpr, size_t pos, bool forSymbol = false) const;
 
-	bool checkLeadingTreeArgmentsType(const Expr &expr) const;
+	bool checkLeadingTreeArgumentsType(const Expr &expr) const;
 
 	util::StackAllocator &alloc_;
 	HintExprMap hintExprMap_;
@@ -594,6 +864,7 @@ private:
 	TableInfoIdMap tableInfoIdMap_;
 	ScanHintMap scanHintMap_;
 	JoinMethodHintMap joinMethodHintMap_;
+	util::Vector<ParsedHint> symbolHintList_;
 	ReportLevel reportLevel_;
 };
 
@@ -626,6 +897,7 @@ public:
 	class IntegralPartitioner;
 	class OptimizationContext;
 	class OptimizationUnit;
+	class OptimizationOption;
 	class CompileOption;
 	class ProcessorUtils;
 	class Profiler;
@@ -634,6 +906,8 @@ public:
 
 	class GenRAContext;
 	class GenOverContext;
+
+	class ReorderJoin;
 
 	typedef SQLTableInfo TableInfo;
 	typedef SQLTableInfoList TableInfoList;
@@ -669,6 +943,8 @@ public:
 		OPT_REMOVE_REDUNDANCY,
 		OPT_REMOVE_INPUT_REDUNDANCY,
 		OPT_ASSIGN_JOIN_PRIMARY_COND,
+		OPT_MAKE_SCAN_COST_HINTS,
+		OPT_MAKE_JOIN_PUSH_DOWN_HINTS,
 		OPT_MAKE_INDEX_JOIN,
 		OPT_FACTORIZE_PREDICATE,
 		OPT_REORDER_JOIN,
@@ -694,11 +970,13 @@ public:
 
 	void setExplainType(SyntaxTree::ExplainType explainType);
 
+	void setQueryStartTime(int64_t currentTime);
+
 	void setPlanSizeLimitRatio(size_t ratio);
 	void setIndexScanEnabled(bool enabled);
 	void setMultiIndexScanEnabled(bool enabled);
 
-	void compile(const Select &in, Plan &out, SQLConnectionEnvironment  *control = NULL);
+	void compile(const Select &in, Plan &out, SQLConnectionControl *control = NULL);
 
 	bool isRecompileOnBindRequired() const;
 	void bindParameterTypes(Plan &plan);
@@ -720,7 +998,34 @@ public:
 			const char8_t *str1, const char8_t *str2, bool caseSensitive);
 
 private:
+	class CompilerSource;
+
+	class CompilerInitializer {
+	public:
+		class End {
+		public:
+			explicit End(CompilerInitializer &init);
+		};
+
+		explicit CompilerInitializer(const CompileOption *option);
+
+		operator bool();
+		const SQLCompiler* operator->();
+
+		ProfilerManager& profilerManager();
+
+		void close();
+
+	private:
+		struct InitializerConstants {
+			static CompileOption INVALID_OPTION;
+		};
+
+		const CompileOption *baseOption_;
+	};
+
 	typedef TupleList::TupleColumnType ColumnType;
+	typedef TupleColumnTypeUtils ColumnTypeUtils;
 
 	typedef SQLType::AggregationPhase AggregationPhase;
 
@@ -747,8 +1052,6 @@ private:
 
 	typedef std::pair<PlanNodeId, PlanNodeId> JoinExpansionEntry;
 	typedef util::Vector<JoinExpansionEntry> JoinExpansionList;
-
-
 	typedef util::Vector< std::pair<uint64_t, uint32_t> > JoinMatchCountList;
 
 	typedef std::pair<uint64_t, uint32_t> JoinExpansionScore;
@@ -785,6 +1088,13 @@ private:
 		JOIN_RIGHT_INPUT = 1
 	};
 
+	enum {
+		FUNCTION_SCALAR = 0,
+		FUNCTION_AGGR,
+		FUNCTION_WINDOW,
+		FUNCTION_PSEUDO_WINDOW
+	};
+
 	typedef PlanNode::IdList JoinNodeIdList[JOIN_INPUT_COUNT];
 	typedef util::Vector<uint32_t> JoinUnifyingUnitList[JOIN_INPUT_COUNT];
 	typedef bool JoinBoolList[JOIN_INPUT_COUNT];
@@ -794,13 +1104,17 @@ private:
 	typedef util::Vector<uint32_t> JoinKeyIdList[JOIN_INPUT_COUNT];
 	typedef util::Vector<bool> JoinInputUsageList[JOIN_INPUT_COUNT];
 
+	typedef std::pair<SQLPreparedPlan::ProfileKey, PlanNodeId> KeyToNodeId;
+	typedef util::Vector<KeyToNodeId> KeyToNodeIdList;
+
 	static const ColumnId REPLACED_AGGR_COLUMN_ID;
 
 	static const uint64_t JOIN_SCORE_MAX;
 	static const uint64_t DEFAULT_MAX_INPUT_COUNT;
 	static const uint64_t DEFAULT_MAX_EXPANSION_COUNT;
+	static const SQLPlanningVersion LEGACY_JOIN_REORDERING_VERSION;
 
-	void genDistributedPlan(Plan &plan);
+	void genDistributedPlan(Plan &plan, bool costCheckOnly);
 
 	void genUnionAllShallow(
 			const util::Vector<PlanNodeId> &inputIdList,
@@ -818,7 +1132,8 @@ private:
 
 	void checkLimit(Plan &plan);
 
-	void validateCreateTableOption(SyntaxTree::CreateTableOption &option);
+	void validateCreateTableOption(const SyntaxTree::CreateTableOption &option);
+	void validateScanOptionForVirtual(const PlanExprList &scanOptionList, bool isVirtual);
 	void validateCreateIndexOptionForVirtual(
 			SyntaxTree::QualifiedName &indexName,
 			SyntaxTree::CreateIndexOption &option, Plan::ValueTypeList *typeList);
@@ -829,14 +1144,16 @@ private:
 	void setTargetTableInfo(const char *tableName, bool isCaseSensitive,
 			const SQLTableInfo &tableInfo, SQLPreparedPlan::Node &node);
 
-	size_t validateWindowFunctionOccurence(
+	size_t validateWindowFunctionOccurrence(
 			const Select &select,
 			size_t &genuineWindowExprCount, size_t &pseudoWindowExprCount);
 	bool findWindowExpr(const ExprList &exprList, bool resolved, const Expr* &foundExpr);
 	bool findWindowExpr(const Expr &expr, bool resolved, const Expr* &foundExpr);
+	bool isRankingWindowExpr(const Expr &expr);
 
-	bool isWindowExprType(Type type, bool &windowOnly, bool &pseudoWindow);
+	uint32_t calcFunctionCategory(const Expr &expr, bool resolved);
 
+	static bool isRangeGroupNode(const PlanNode &node);
 	static bool isWindowNode(const PlanNode &node);
 
 	void checkNestedAggrWindowExpr(
@@ -845,15 +1162,42 @@ private:
 			size_t &aggrCount);
 
 	void checkNestedAggrWindowExpr(const ExprList &exprList, bool resolved);
-
-	void genSelectAggrProjection(
-			ExprList *&aggrExprList, PlanExprList &selectList, 
-			PlanNodeId &productedNodeId, Plan &plan);
 	void genFrom(const Select &select, const Expr* &whereExpr, Plan &plan);
 
 	void genWhere(GenRAContext &cxt, Plan &plan);
 	void genGroupBy(GenRAContext &cxt, ExprRef &havingExprRef, Plan &plan);
 	void genHaving(GenRAContext &cxt, const ExprRef &havingExprRef, Plan &plan);
+
+	bool genRangeGroup(GenRAContext &cxt, ExprRef &havingExprRef, Plan &plan);
+
+	bool genRangeGroupIdNode(
+			Plan &plan, const Select &select, int32_t &rangeGroupIdPos);
+	static bool isRangeGroupPredicate(const ExprList *groupByList);
+
+	void adjustRangeGroupOutput(
+			Plan &plan, PlanNode &node, const Expr &keyExpr);
+	void adjustRangeGroupOutput(Expr &outExpr, const Expr &keyExpr);
+
+	Expr resolveRangeGroupPredicate(
+			const Plan &plan, const Expr &whereCond, const Expr &keyExpr,
+			const Expr &keyExprInCond, const Expr &optionExpr);
+	Expr makeRangeGroupIdExpr(Plan &plan, const Expr &optionExpr);
+	Expr makeRangeGroupPredicate(
+			const Expr &keyExpr, Type fillType, int64_t interval,
+			TupleValue lower, TupleValue upper, int64_t limit);
+
+	int64_t resolveRangeGroupIntervalOrOffset(
+			int64_t baseInterval, int64_t unit, bool forInterval);
+	void adjustRangeGroupInterval(
+			int64_t &interval, int64_t &offset, const TupleValue &timeZone);
+	bool findRangeGroupBoundary(
+			const Expr &expr, const Expr &keyExpr, TupleValue &value,
+			bool forLower);
+	TupleValue resolveRangeGroupTimeZone(const TupleValue &specified);
+	Expr* makeRangeGroupConst(const TupleValue &value);
+
+	bool findDistinctAggregation(const ExprList *exprList);
+	bool findDistinctAggregation(const Expr *expr);
 
 	bool genSplittedSelectProjection(
 			GenRAContext &cxt, const ExprList &inSelectList,
@@ -909,7 +1253,10 @@ private:
 	void genAggrFunc(GenRAContext &cxt, Plan &plan);
 	void genLastOutput(GenRAContext &cxt, Plan &plan);
 	void appendUniqueExpr(const PlanExprList &appendlist, PlanExprList &outList);
+
 	void dumpPlanNode(Plan &plan);
+	void dumpExprList(const PlanExprList &node);
+
 	void trimExprList(size_t len, PlanExprList &list);
 	void hideSelectListName(GenRAContext &cxt, SQLPreparedPlan::Node &inputNode, Plan &plan);
 	void restoreSelectListName(GenRAContext &cxt, PlanExprList &restoreList, Plan &plan);
@@ -1029,8 +1376,11 @@ private:
 
 	Expr genSubqueryRef(const Expr &inExpr, Mode mode);
 	Expr genConstExpr(
-		const Plan &plan, const TupleValue &value, Mode mode,
-		const char* name = NULL);
+			const Plan &plan, const TupleValue &value, Mode mode,
+			const char8_t *name = NULL);
+	Expr genConstExprBase(
+			const Plan *plan, const TupleValue &value, Mode mode,
+			const char8_t *name = NULL);
 	Expr genTupleIdExpr(const Plan &plan, uint32_t inputId, Mode mode);
 	Expr genCastExpr(
 			const Plan &plan, ColumnType columnType, Expr *inExpr,
@@ -1093,8 +1443,15 @@ private:
 			PlanExprList &outExprList2, AggregationPhase &outPhase2,
 			const PlanExprList *groupExprList, PlanExprList *groupExprList2);
 	bool splitExprListSub(
-			const Expr &inExpr, PlanExprList &outExprList, Expr *&outExpr,
-			uint32_t parentLevel, size_t groupCount, bool aggregating);
+			const Expr &inExpr, PlanExprList &outExprList,
+			const Expr *&outExpr, uint32_t parentLevel, size_t groupCount,
+			bool aggregating, bool lastTop,
+			util::Vector<uint32_t> *inputOffsetList);
+
+	static void makeSplittingInputOffsetList(
+			const PlanExprList &exprList, util::Vector<uint32_t> &offsetList);
+	static void makeSplittingInputSizeList(
+			const Expr &expr, util::Vector<uint32_t> &sizeList);
 	void setSplittedExprListType(
 			PlanExprList &exprList, AggregationPhase &phase);
 
@@ -1136,18 +1493,39 @@ private:
 			const Plan &plan, bool insertOrUpdateFound);
 	static bool isForInsertOrUpdate(const PlanNode &node);
 
+	void finalizeScanCostHints(Plan &plan, bool tableCostAffected);
+
+	void applyPlanningOption(Plan &plan);
+	static void applyPlanningVersion(
+			const SQLPlanningVersion &src, SQLPlanningVersion &dest);
+
 	void applyScanOption(Plan &plan);
 	void applyScanOption(
-			PlanNode::CommandOptionFlag &optionFlag, const PlanNode &node, const SQLHintInfo &hint);
-	void applyIndexScanHints(Plan &plan);
+			PlanNode::CommandOptionFlag &optionFlag, const PlanNode &node,
+			const SQLHintInfo &hint);
 
 	void applyJoinOption(Plan &plan);
 	void applyJoinOption(
 			const Plan &plan, const PlanNode &node,
 			PlanNode::CommandOptionFlag &optionFlag, const SQLHintInfo &hint);
 
+	void relocateOptimizationProfile(Plan &plan);
+	bool relocateOptimizationProfile(
+			Plan &plan, const KeyToNodeIdList &keyToNodeIdList,
+			util::Vector<SQLPreparedPlan::OptProfile::Join> *&joinList);
+	void addOptimizationProfile(
+			Plan *plan, PlanNode *node,
+			SQLPreparedPlan::OptProfile::Join *profile);
+	SQLPreparedPlan::OptProfile& prepareOptimizationProfile(
+			Plan *plan, PlanNode *node);
+	SQLPreparedPlan::ProfileKey prepareProfileKey(PlanNode &node);
+
+	void checkOptimizationUnitSupport(OptimizationUnitType type);
 	bool isOptimizationUnitEnabled(OptimizationUnitType type);
+	bool isOptimizationUnitCheckOnly(OptimizationUnitType type);
+
 	static OptimizationFlags getDefaultOptimizationFlags();
+	static OptimizationOption makeJoinPushDownHintsOption();
 
 	void optimize(Plan &plan);
 
@@ -1163,9 +1541,11 @@ private:
 	bool removeInputRedundancy(Plan &plan);
 	bool removeAggregationRedundancy(Plan &plan);
 	bool assignJoinPrimaryCond(Plan &plan, bool &complexFound);
-	bool makeIndexJoin(Plan &plan);
+	bool makeScanCostHints(Plan &plan);
+	bool makeJoinPushDownHints(Plan &plan);
+	bool makeIndexJoin(Plan &plan, bool checkOnly);
 	bool factorizePredicate(Plan &plan);
-	bool reorderJoin(Plan &plan);
+	bool reorderJoin(Plan &plan, bool &tableCostAffected);
 
 	typedef util::Map<uint32_t, uint32_t> JoinGroupMapStubType;
 
@@ -1179,7 +1559,16 @@ private:
 			const util::Vector<JoinEdge> &joinEdgeList,
 			const util::Vector<JoinOperation> &srcJoinOpList,
 			const util::Vector<SQLHintInfo::ParsedHint> &joinHintList,
-			util::Vector<JoinOperation> &destJoinOpList); 
+			util::Vector<JoinOperation> &destJoinOpList, bool legacy,
+			bool profiling);
+
+	static bool reorderJoinSubLegacy(
+			util::StackAllocator &alloc,
+			const util::Vector<JoinNode> &joinNodeList,
+			const util::Vector<JoinEdge> &joinEdgeList,
+			const util::Vector<JoinOperation> &srcJoinOpList,
+			const util::Vector<SQLHintInfo::ParsedHint> &joinHintList,
+			util::Vector<JoinOperation> &destJoinOpList, bool profiling);
 
 	static void assignJoinGroupId(
 			util::StackAllocator &alloc,
@@ -1190,13 +1579,25 @@ private:
 	static void dumpJoinScoreList(
 			std::ostream &os, const util::Deque<JoinScore*>& joinScoreList);
 
-	void makeJoinHintMap(const SQLPreparedPlan &plan);
+	void makeJoinHintMap(Plan &plan);
 
-	void dumpJoinGraph(
+	void addJoinReorderingProfile(
+			Plan &plan, const util::Vector<PlanNodeId> &nodeIdList,
+			const util::Vector<PlanNodeId> &joinIdList,
+			const util::Vector<JoinNode> &joinNodeList,
+			const util::Vector<JoinOperation> &joinOpList);
+	void profileJoinTables(
+			const Plan &plan, const util::Vector<PlanNodeId> &nodeIdList,
+			const util::Vector<JoinNode> &joinNodeList,
+			SQLPreparedPlan::OptProfile::Join &profile) const;
+	void dumpJoinTables(
 			std::ostream &os, const Plan &plan,
-			const util::Vector<PlanNodeId> &nodeIdList,
+			const util::Vector<PlanNodeId> &nodeIdList) const;
+	void dumpJoinGraph(
+			std::ostream &os,
 			const util::Vector<JoinEdge> &joinEdgeList,
 			const util::Vector<JoinOperation> &joinOpList) const;
+	const char8_t* getJoinTableName(const PlanNode &node) const;
 
 	bool makeJoinGraph(
 			const Plan &plan, PlanNodeId &tailNodeId,
@@ -1205,7 +1606,7 @@ private:
 			util::Vector<PlanNodeId> &joinIdList,
 			util::Vector<JoinNode> &joinNodeList,
 			util::Vector<JoinEdge> &joinEdgeList,
-			util::Vector<JoinOperation> &joinOpList);
+			util::Vector<JoinOperation> &joinOpList, bool legacy);
 
 	bool makeJoinNodes(
 			const Plan &plan, const PlanNode &node,
@@ -1221,6 +1622,12 @@ private:
 			const util::Map<PlanNodeId, JoinNodeId> &nodeIdMap,
 			util::Vector<JoinNode> &joinNodeList,
 			util::Vector<JoinEdge> &joinEdgeList);
+
+	void makeJoinNodesCost(
+			const Plan &plan, const PlanNode &node,
+			util::Vector<int64_t> &approxSizeList);
+	int64_t resolveJoinNodeApproxSize(
+			const PlanNode &node, const SQLHintInfo *hintInfo);
 
 	static void makeJoinEdgesSub(
 			const Plan &plan, const PlanNode &node, const Expr &expr,
@@ -1245,6 +1652,9 @@ private:
 			const Plan &plan, const PlanNode &node, const Expr &expr,
 			const util::Map<PlanNodeId, JoinNodeId> &nodeIdMap,
 			PlanNodeId &resultNodeId, ColumnId *resultColumnId);
+	static const PlanNode* findJoinPredNode(
+			const Plan &plan, PlanNodeId joinNodeId,
+			util::Vector<PlanNodeId> &predIdList);
 
 	void applyJoinOrder(
 			Plan &plan, const util::Vector<PlanNodeId> &nodeIdList,
@@ -1276,10 +1686,19 @@ private:
 
 	uint64_t getMaxInputCount(const Plan &plan);
 	uint64_t getMaxExpansionCount(const Plan &plan);
+	int64_t getMaxGeneratedRows(const Plan &plan);
+
+	bool isLegacyJoinReordering(const Plan &plan);
+	static bool isLegacyPlanning(
+			const Plan &plan, const SQLPlanningVersion &legacyVersion);
+	SQLPlanningVersion getPlanningVersionHint(const SQLHintInfo *hintInfo);
 
 	bool getSingleHintValue(
 			const SQLHintInfo *hintInfo, SQLHint::Id hint, uint64_t defaultValue,
 			uint64_t &value);
+	size_t getMultipleHintValues(
+			const SQLHintInfo *hintInfo, SQLHint::Id hint, uint64_t *valueList,
+			size_t valueCount, size_t minValueCount);
 
 	void initializeMinimizingTargets(
 			const Plan &plan, PlanNodeId &resultId, bool &unionFound,
@@ -1336,7 +1755,7 @@ private:
 
 	bool makeJoinNarrowingKeyTables(
 			const Plan &plan, const PlanNode &node,
-			const JoinNodeIdList &joinInputList, uint32_t expansionLimit,
+			const JoinNodeIdList &joinInputList,
 			const TableNarrowingList &tableNarrowingList,
 			JoinKeyTableList &keyTableList, bool &joinCondNarrowable);
 	static bool splitJoinByReachableUnit(
@@ -1345,11 +1764,13 @@ private:
 			JoinInputUsageList &inputUsageList, JoinBoolList &singleUnitList);
 
 	bool tryMakeJoinAllUnitDividableExpansion(
-			SQLType::JoinType joinType, const JoinNodeIdList &joinInputList,
+			SQLType::JoinType joinType,
+			PlanNode::CommandOptionFlag cmdOptionFlag,
+			const JoinNodeIdList &joinInputList,
 			JoinKeyTableList &keyTableList, const JoinKeyIdList &joinKeyIdList,
 			const JoinUnifyingUnitList &unifyingUnitList,
 			const JoinBoolList &singleUnitList, uint32_t expansionLimit,
-			JoinExpansionInfo &expansionInfo);
+			JoinExpansionInfo *expansionInfo);
 	void makeJoinAllUnitNonDividableExpansion(
 			const JoinNodeIdList &joinInputList,
 			const JoinKeyIdList &joinKeyIdList,
@@ -1359,20 +1780,22 @@ private:
 			const JoinInputUsageList &inputUsageList,
 			JoinNodeIdList &joinInputList, JoinExpansionInfo &expansionInfo);
 
-	static void makeJoinUnitDividableExpansion(
+	static bool makeJoinUnitDividableExpansion(
 			const JoinBoolList &dividableList,
 			const JoinNodeIdList &joinInputList,
 			JoinKeyTableList &keyTableList, const JoinKeyIdList &joinKeyIdList,
-			const JoinUnifyingUnitList &unifyingUnitList, uint32_t unitIndex,
+			const JoinUnifyingUnitList &unifyingUnitList,
+			const JoinBoolList *drivingOptList, uint32_t unitIndex,
 			uint32_t unitLimit, bool fullMatch,
 			JoinKeyIdList &joinSubKeyIdList,
 			JoinMatchCountList &matchCountList,
 			util::Vector<uint32_t> &subLimitList,
-			JoinExpansionBuildInfo &buildInfo);
-	static void getJoinUnitDividableExpansionLimit(
-			const JoinSizeList &unitSizeList, uint64_t unitLimit,
+			JoinExpansionBuildInfo *buildInfo);
+	static bool getJoinUnitDividableExpansionLimit(
+			const JoinSizeList &unitSizeList, uint64_t baseUnitLimit,
 			bool fullMatch, const JoinBoolList &dividableList,
-			uint32_t &dividingSide, uint64_t &sideLimit);
+			const JoinBoolList *drivingOptList, uint32_t &dividingSide,
+			uint64_t &sideLimit, uint64_t &unitLimit);
 
 	static void makeJoinUnitExpansion(
 			const JoinNodeIdList &joinInputList,
@@ -1388,13 +1811,16 @@ private:
 			util::Vector<bool> &fullMatchList);
 	static void arrangeJoinExpansionLimit(
 			JoinMatchCountList &matchCountList,
-			util::Vector<uint32_t> &unitLimitList, uint32_t totalLimit);
+			util::Vector<uint32_t> &unitLimitList, uint64_t totalLimit);
 
 	static bool checkJoinUnitDividable(
 			SQLType::JoinType joinType, const JoinBoolList &singleUnitList,
 			JoinBoolList &dividableList);
 	static bool getJoinDividableList(
 			SQLType::JoinType joinType, JoinBoolList &dividableList);
+	static const JoinBoolList* getJoinUnitDrivingOptionList(
+			PlanNode::CommandOptionFlag cmdOptionFlag,
+			const JoinBoolList &dividableList, JoinBoolList &baseJoinOptList);
 
 	static uint32_t getJoinSmallerSide(const JoinNodeIdList &joinInputList);
 	static uint32_t getJoinSmallerSide(const JoinKeyTableList &keyTableList);
@@ -1420,8 +1846,7 @@ private:
 			uint32_t joinInputId, SQLType::JoinType joinType);
 	static bool isJoinExpansionMetaInputRequired(
 			uint32_t joinInputId, SQLType::JoinType joinType,
-			const JoinNodeIdList &joinInputList,
-			const JoinExpansionInfo &expansionInfo, bool &metaOnly);
+			const JoinNodeIdList &joinInputList, bool &metaOnly);
 	static size_t getJoinExpansionMetaUnificationCount(
 			uint32_t joinInputId, SQLType::JoinType joinType,
 			const JoinNodeIdList &joinInputList,
@@ -1553,8 +1978,12 @@ private:
 			bool *columnFound);
 	void disableSubqueryLimitOffset(Plan &plan, PlanNodeId nodeId);
 
+	void removeEmptyNodes(OptimizationContext &cxt, Plan &plan);
+	void removeEmptyColumns(OptimizationContext &cxt, Plan &plan);
+
 	Expr genDisabledExpr();
 	static bool isDisabledExpr(const Expr &expr);
+	static Type getDisabledExprType();
 
 	static uint64_t applyRatio(uint64_t denom, uint64_t ratio);
 
@@ -1577,6 +2006,10 @@ private:
 	void setNodeAndRefDisabled(
 			Plan &plan, PlanNodeId nodeId,
 			util::Vector<uint32_t> &nodeRefList);
+	static void setDisabledNodeType(PlanNode &node);
+
+	static bool isDisabledNode(const PlanNode &node);
+	static Type getDisabledNodeType();
 
 	bool factorizeExpr(Expr &inExpr, Expr *&outExpr, ExprList *andList);
 	bool factorizeOrExpr(Expr &inExpr, Expr *&outExpr, ExprList *andList);
@@ -1601,18 +2034,30 @@ private:
 			const PlanExprList &exprList, SQLType::Id type, bool forWindow);
 	static uint32_t getNodeAggregationLevel(const PlanExprList &exprList);
 
-	bool isNallowingJoinInput(
+	void assignReducedScanCostHints(Plan &plan);
+	bool applyScanCostHints(const Plan &srcPlan, Plan &destPlan);
+
+	bool findJoinPushDownHintingTarget(const Plan &plan);
+	bool applyJoinPushDownHints(const Plan &srcPlan, Plan &destPlan);
+	static PlanNode::CommandOptionFlag getJoinDrivingOptionMask();
+
+	bool isNarrowingJoinInput(
 			const Plan &plan, const PlanNode &node, uint32_t inputId);
-	bool isNallowingNode(const PlanNode &node);
-	static bool isNallowingPredicate(
+	bool isNarrowingNode(const PlanNode &node);
+	static bool isNarrowingPredicate(
 			const Expr &expr, const uint32_t *inputId);
 
 	bool findIndexedPredicate(
-			const Plan &plan, const PlanNode &node, uint32_t inputId);
-	bool findIndexedPredicate(
+			const Plan &plan, const PlanNode &node, uint32_t inputId,
+			bool withUnionScan);
+	bool findIndexedPredicateSub(
+			const Plan &plan, const PlanNode &node, uint32_t inputId,
+			const uint32_t *unionInputId);
+	bool findIndexedPredicateSub(
 			const Plan &plan, const PlanNode &node,
-			const SQLTableInfo::IndexInfoList &indexInfoList,
-			uint32_t inputId, const Expr &expr, bool &firstUnmatched);
+			const SQLTableInfo::BasicIndexInfoList &indexInfoList,
+			uint32_t inputId, const uint32_t *unionInputId, const Expr &expr,
+			bool &firstUnmatched);
 
 	void dereferenceAndAppendExpr(
 			Plan &plan, PlanNodeRef &node, uint32_t inputId, const Expr &inExpr,
@@ -1644,6 +2089,9 @@ private:
 			const util::Map<uint32_t, uint32_t> *inputIdMap,
 			const PlanNode *inputNode = NULL);
 	void replaceExprInput(Expr &expr, uint32_t inputId);
+
+	void copyPlan(const Plan &src, Plan &dest);
+	void copyNode(const PlanNode &src, PlanNode &dest);
 
 	void copyExprList(
 			const PlanExprList &src, PlanExprList &dest, bool shallow);
@@ -1693,9 +2141,7 @@ private:
 
 	Type resolveFunction(const Expr &expr);
 	bool filterFunction(Type &type, size_t argCount);
-	void resolveTimestampField(
-			const Plan &plan, Mode mode, Type type, const ExprList *inExprList,
-			Expr *&outExpr);
+	void arrangeFunctionArgs(Type type, Expr &expr);
 
 	uint32_t genSourceId();
 
@@ -1723,27 +2169,35 @@ private:
 	TupleValue::VarContext& getVarContext();
 	const CompileOption& getCompileOption();
 
+	static bool isIndexScanEnabledDefault();
+
 	const TableInfoList& getTableInfoList() const;
 	SubqueryStack& getSubqueryStack();
 
+	static util::AllocUniquePtr<SubqueryStack>::ReturnType makeSubqueryStack(
+			util::StackAllocator &alloc);
+	static util::AllocUniquePtr<
+			OptimizationOption>::ReturnType makeOptimizationOption(
+			util::StackAllocator &alloc, const OptimizationOption &src);
+
 	static util::StackAllocator& varContextToAllocator(
 			TupleValue::VarContext &varCxt);
-
-	static bool checkAcceptableTupleType(
-			TupleList::TupleColumnType type);	
+	template<typename T> static T* emptyPtr();
 
 	util::StackAllocator &alloc_;
 
 	TupleValue::VarContext &varCxt_;
+	CompilerInitializer init_;
 	const TableInfoList *tableInfoList_;
-	SubqueryStack *subqueryStack_;
+	util::AllocUniquePtr<SubqueryStack> subqueryStack_;
 	uint32_t lastSrcId_;
 	PendingColumnList pendingColumnList_;
 	TableInfoIdList metaTableInfoIdList_;
 	Plan::ValueTypeList *parameterTypeList_;
-	const char* inputSql_;
+	const char8_t *inputSql_;
 	uint32_t subqueryLevel_; 
 	SyntaxTree::ExplainType explainType_;
+	util::DateTime queryStartTime_;
 
 	size_t planSizeLimitRatio_;
 	uint64_t generatedScanCount_;
@@ -1751,7 +2205,7 @@ private:
 	TableNarrowingList *tableNarrowingList_;
 
 	const CompileOption *compileOption_;
-	OptimizationFlags optimizationFlags_;
+	util::AllocUniquePtr<OptimizationOption> optimizationOption_;
 
 	bool currentTimeRequired_;
 	bool isMetaDataQuery_;
@@ -1766,6 +2220,8 @@ private:
 	bool neverReduceExpr_;
 
 	Profiler *profiler_;
+	SQLPreparedPlan::ProfileKey nextProfileKey_;
+	CompilerInitializer::End initEnd_;
 };
 
 template<typename V>
@@ -2046,7 +2502,7 @@ struct SQLCompiler::JoinNode {
 
 	util::Vector<JoinEdgeId> edgeIdList_;
 
-	uint64_t approxSize_;
+	int64_t approxSize_;
 	util::Vector<uint64_t> cardinalityList_;
 };
 
@@ -2081,6 +2537,9 @@ struct SQLCompiler::JoinOperation {
 	static const uint64_t HINT_LEADING_LIST = 1; 
 	static const uint64_t HINT_LEADING_TREE = 2; 
 	uint64_t hintType_;
+
+	SQLPreparedPlan::OptProfile::Join *profile_;
+	bool tableCostAffected_;
 };
 
 class SQLCompiler::JoinScore {
@@ -2273,6 +2732,7 @@ public:
 	size_t otherTopPos_;
 	size_t otherColumnCount_;
 	bool inSubQuery_;
+	PlanNodeRef scalarWhereNodeRef_;
 
 private:
 	GenRAContext(const GenRAContext&);
@@ -2529,6 +2989,8 @@ class SQLCompiler::TableNarrowingList {
 public:
 	explicit TableNarrowingList(util::StackAllocator &alloc);
 
+	static TableNarrowingList* tryDuplicate(const TableNarrowingList *src);
+
 	void put(const TableInfo &tableInfo);
 	bool contains(TableInfo::Id id) const;
 	NarrowingKey resolve(
@@ -2539,9 +3001,6 @@ private:
 
 	typedef util::Vector<Entry> EntryList;
 	typedef util::Vector<NarrowingKey> KeyList;
-
-	TableNarrowingList(const TableNarrowingList&);
-	TableNarrowingList& operator=(const TableNarrowingList&);
 
 	util::StackAllocator &alloc_;
 	EntryList entryList_;
@@ -2636,26 +3095,74 @@ public:
 	bool operator()();
 	bool operator()(bool optimized);
 
+	bool isCheckOnly() const;
+
 private:
 	OptimizationContext &cxt_;
 	OptimizationUnitType type_;
 };
 
+class SQLCompiler::OptimizationOption {
+public:
+	explicit OptimizationOption(ProfilerManager *manager);
+
+	bool isSupported(OptimizationUnitType type) const;
+	bool isEnabled(OptimizationUnitType type) const;
+	bool isCheckOnly(OptimizationUnitType type) const;
+
+	bool isSomeEnabled() const;
+	OptimizationFlags getEnablementFlags() const;
+
+	bool isSomeCheckOnly() const;
+
+	void supportFull();
+	void support(OptimizationUnitType type, bool enabled);
+	void setCheckOnly(OptimizationUnitType type);
+
+private:
+	static OptimizationFlags getFullFlags();
+	static bool isFlagOn(OptimizationFlags flags, OptimizationUnitType type);
+	static void setFlag(
+			OptimizationFlags &flags, OptimizationUnitType type, bool value);
+
+	OptimizationFlags supportFlags_;
+	OptimizationFlags enablementFlags_;
+	OptimizationFlags checkOnlyFlags_;
+};
+
 class SQLCompiler::CompileOption {
 public:
-	CompileOption();
+	explicit CompileOption(const CompilerSource *src = NULL);
 
 	void setTimeZone(const util::TimeZone &timeZone);
 	const util::TimeZone& getTimeZone() const;
 
+	void setPlanningVersion(const SQLPlanningVersion &version);
+	const SQLPlanningVersion& getPlanningVersion() const;
+
+	void setCostBasedJoin(bool value);
+	bool isCostBasedJoin() const;
+
 	static const CompileOption& getEmptyOption();
+
+	static const SQLCompiler* findBaseCompiler(
+			const CompileOption *option, CompilerInitializer&);
 
 private:
 	static const CompileOption EMPTY_OPTION;
 
 	util::TimeZone timeZone_;
+
+	SQLPlanningVersion planningVersion_;
+	bool costBasedJoin_;
+
+	const SQLCompiler *baseCompiler_;
 };
 
+/**
+	@brief SQLProcessorの機能に依存するユーティリティ
+	@note SQLProcessorにおいて実装
+ */
 class SQLCompiler::ProcessorUtils {
 public:
 	static bool predicateToMetaTarget(
@@ -2684,7 +3191,18 @@ public:
 			const TableInfo &tableInfo,
 			util::Vector<uint32_t> &affinityRevList);
 
+	static bool isRangeGroupSupportedType(ColumnType type);
+	static TupleValue getRangeGroupBoundary(
+			util::StackAllocator &alloc, ColumnType keyType, TupleValue base,
+			bool forLower, bool inclusive);
+	static bool adjustRangeGroupBoundary(
+			TupleValue &lower, TupleValue &upper, int64_t interval,
+			int64_t offset);
+
 	static TupleValue evalConstExpr(
+			TupleValue::VarContext &varCxt, const Expr &expr,
+			const CompileOption &option);
+	static void checkExprArgs(
 			TupleValue::VarContext &varCxt, const Expr &expr,
 			const CompileOption &option);
 	static bool checkArgCount(
@@ -2695,6 +3213,7 @@ public:
 	static bool isExperimentalFunction(Type exprType);
 	static bool isWindowExprType(
 			Type type, bool &windowOnly, bool &pseudoWindow);
+	static bool isExplicitOrderingAggregation(Type exprType);
 
 	static ColumnType getResultType(
 			Type exprType, size_t index, AggregationPhase phase,
@@ -2703,6 +3222,9 @@ public:
 	static ColumnType filterColumnType(ColumnType type);
 	static bool updateArgType(
 			Type exprType, util::Vector<ColumnType> &argTypeList);
+	static bool findConstantArgType(
+			Type exprType, size_t startIndex, size_t &index,
+			ColumnType &argType);
 
 	static TupleValue convertType(
 			TupleValue::VarContext &varCxt, const TupleValue &src,
@@ -2745,6 +3267,8 @@ public:
 	struct OptimizationUnitResult;
 
 	explicit Profiler(util::StackAllocator &alloc);
+
+	static Profiler* tryDuplicate(const Profiler *src);
 
 	void setPlan(const Plan &plan);
 	void setTableInfoList(const SQLTableInfoList &list);
@@ -2825,6 +3349,16 @@ private:
 	util::Mutex mutex_;
 	Profiler::Target target_;
 	EntryList entryList_;
+};
+
+class SQLCompiler::CompilerSource {
+public:
+	explicit CompilerSource(const SQLCompiler *baseCompiler);
+
+	static const SQLCompiler* findBaseCompiler(const CompilerSource *src);
+
+private:
+	const SQLCompiler *baseCompiler_;
 };
 
 struct JDBCDatabaseMetadata {

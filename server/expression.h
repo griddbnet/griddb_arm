@@ -76,7 +76,7 @@ typedef struct SortExpr {
 	Expr *expr;
 	bool nullsLast;
 	SortExpr() : order(ASC), expr(NULL), nullsLast(true) {}
-	SortExpr *dup(TransactionContext &txn, ObjectManager &objectManager);
+	SortExpr *dup(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy);
 } SortItem;
 
 /*!
@@ -178,6 +178,9 @@ public:
 	bool isString() const;
 	bool isGeometry() const;
 	bool isTimestamp() const;
+	bool isMicroTimestamp() const;
+	bool isNanoTimestamp() const;
+	bool isTimestampFamily() const;
 	bool isArrayValue() const;
 	bool isValue() const;
 	bool isExprLabel() const;
@@ -190,6 +193,7 @@ public:
 	QpPassMode getPassMode(TransactionContext &txn);
 
 	Type getType();
+	ColumnType resolveValueType() const;
 	int getValueAsInt();
 	int64_t getValueAsInt64();
 	double getValueAsDouble();
@@ -198,12 +202,13 @@ public:
 	Geometry *getGeometry();
 	const ExprList &getArgList();
 	Expr *getArrayElement(
-		TransactionContext &txn, ObjectManager &objectManager, size_t idx);
+		TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy, size_t idx);
 	size_t getArrayLength(
-		TransactionContext &txn, ObjectManager &objectManager) const;
+		TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) const;
 	Timestamp getTimeStamp();
+	NanoTimestamp getNanoTimestamp();
 
-	virtual Expr *dup(TransactionContext &txn, ObjectManager &objectManager);
+	virtual Expr *dup(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy);
 
 	/*!
 	 * @param Generate expression with null value
@@ -263,7 +268,7 @@ public:
 	}
 
 	/*!
-	 * @brief Generate expression from string with quote-escapeing
+	 * @brief Generate expression from string with quote-escaping
 	 *
 	 * @param s Quoted string
 	 * @param txn The transaction context
@@ -319,6 +324,21 @@ public:
 		return QP_NEW_BY_TXN(txn) Expr(t.getUnixTime(), txn, true);
 	}
 
+	static Expr *newTimestampValue(
+			const util::PreciseDateTime &t, TransactionContext &txn,
+			ColumnType type) {
+		switch (type) {
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+			return newTimestampValue(ValueProcessor::getMicroTimestamp(t), txn);
+		case COLUMN_TYPE_NANO_TIMESTAMP:
+			return newTimestampValue(ValueProcessor::getNanoTimestamp(t), txn);
+		default:
+			assert(type == COLUMN_TYPE_TIMESTAMP);
+			return newTimestampValue(
+					ValueProcessor::getTimestamp(t.getBase()), txn);
+		}
+	}
+
 	/*!
 	 * @brief Generate expression of Timestamp value
 	 *
@@ -329,6 +349,14 @@ public:
 	 */
 	static Expr *newTimestampValue(Timestamp t, TransactionContext &txn) {
 		return QP_NEW_BY_TXN(txn) Expr(t, txn, true);
+	}
+
+	static Expr *newTimestampValue(MicroTimestamp t, TransactionContext &txn) {
+		return QP_NEW_BY_TXN(txn) Expr(t, txn);
+	}
+
+	static Expr *newTimestampValue(NanoTimestamp t, TransactionContext &txn) {
+		return QP_NEW_BY_TXN(txn) Expr(t, txn);
 	}
 
 	/*!
@@ -351,8 +379,8 @@ public:
 	 *
 	 * @return generated expression
 	 */
-	static Expr *newExprArray(ExprList &v, TransactionContext &txn, ObjectManager &objectManager) {
-		return QP_NEW_BY_TXN(txn) Expr(&v, txn, objectManager);
+	static Expr *newExprArray(ExprList &v, TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
+		return QP_NEW_BY_TXN(txn) Expr(&v, txn, objectManager, strategy);
 	}
 
 	static Expr *newFunctionNode(Token &fnName, ExprList *args,
@@ -477,7 +505,7 @@ public:
 	 */
 	bool castNumericValue();
 
-	virtual Expr *eval(TransactionContext &txn, ObjectManager &objectManager,
+	virtual Expr *eval(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		ContainerRowWrapper *column_values, FunctionMap *function_map,
 		EvalMode mode);
 
@@ -494,8 +522,9 @@ public:
 		return !(*this == e);
 	}
 
-	TermCondition *toCondition(TransactionContext &txn, MapType mapType,
-		Query &queryObj, bool notFlag);
+	TermCondition *toCondition(
+			TransactionContext &txn, MapType mapType, Query &queryObj,
+			bool notFlag, bool &semiFiltering);
 
 	bool aggregate(TransactionContext &txn, Collection &collection,
 		util::XArray<OId> &resultRowIdList, Value &result);
@@ -545,23 +574,24 @@ public:
 	 */
 	int compareAsValue(TransactionContext &txn, Expr *e2, bool nullsLast) {
 		if (isValue() && e2->isValue() && !value_->isArray() &&
-			!e2->value_->isArray()) {
+				!e2->value_->isArray()) {
+			Comparator op = ComparatorTable::findComparator(
+					value_->getType(), e2->value_->getType());
 #ifdef QP_USE_STRING_COMPARATOR
-			if (ComparatorTable::comparatorTable_[value_->getType()][e2->value_->getType()]) {
-				return ComparatorTable::comparatorTable_[value_->getType()]
-									  [e2->value_->getType()](txn,
-										  value_->data(), value_->size(),
-										  e2->value_->data(),
-										  e2->value_->size());
+			if (op) {
+				return op(
+						txn,
+						value_->data(), value_->size(),
+						e2->value_->data(),
+						e2->value_->size());
 			}
 #else
-			if (value_->getType() != COLUMN_TYPE_STRING &&
-				ComparatorTable::comparatorTable_[value_->getType()][e2->value_->getType()]) {
-				return ComparatorTable::comparatorTable_[value_->getType()]
-									  [e2->value_->getType()](txn,
-										  value_->data(), value_->size(),
-										  e2->value_->data(),
-										  e2->value_->size());
+			if (value_->getType() != COLUMN_TYPE_STRING && op) {
+				return op(
+						txn,
+						value_->data(), value_->size(),
+						e2->value_->data(),
+						e2->value_->size());
 			}
 			else if (value_->getType() == COLUMN_TYPE_STRING) {
 				size_t size1 = value_->size(), size2 = e2->value_->size();
@@ -606,26 +636,31 @@ protected:
 		value_ = QP_NEW Value();
 	}
 
-	Expr *evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
-		const Operator op[][11], ContainerRowWrapper *column_values,
-		FunctionMap *function_map, const char *mark, EvalMode mode);
-	typedef void (*Calculator)(TransactionContext &txn, uint8_t const *p,
-		uint32_t size1, uint8_t const *q, uint32_t size2, Value &value);
-	Expr *evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
-		const Calculator op[][11], ContainerRowWrapper *column_values,
-		FunctionMap *function_map, const char *mark, EvalMode mode);
-	Expr *evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
-		const Operation opType, ContainerRowWrapper *column_values,
-		FunctionMap *function_map, const char *mark, EvalMode mode);
+	Expr *evalSubBinOp(
+			TransactionContext &txn, ObjectManagerV4 &objectManager,
+			AllocateStrategy &strategy, const ValueOperatorTable &opTable,
+			ContainerRowWrapper *column_values, FunctionMap *function_map,
+			const char *mark, EvalMode mode);
+	Expr *evalSubBinOp(
+			TransactionContext &txn, ObjectManagerV4 &objectManager,
+			AllocateStrategy &strategy, const ValueCalculatorTable &opTable,
+			ContainerRowWrapper *column_values, FunctionMap *function_map,
+			const char *mark, EvalMode mode);
+	Expr *evalSubBinOp(
+			TransactionContext &txn, ObjectManagerV4 &objectManager,
+			AllocateStrategy &strategy, const Operation opType,
+			ContainerRowWrapper *column_values, FunctionMap *function_map,
+			const char *mark, EvalMode mode);
 
-	Expr *evalSubUnaryOpBaseZero(TransactionContext &txn,
-		ObjectManager &objectManager, const Calculator op[][11],
-		ContainerRowWrapper *column_values, FunctionMap *function_map,
-		const char *mark, EvalMode mode);
+	Expr *evalSubUnaryOpBaseZero(
+			TransactionContext &txn, ObjectManagerV4 &objectManager,
+			AllocateStrategy &strategy, const ValueCalculatorTable &opTable,
+			ContainerRowWrapper *column_values, FunctionMap *function_map,
+			const char *mark, EvalMode mode);
 
 	bool isIncludedBy(Expr *outerExpr);
 	bool isAntinomy(Expr *testExpr);
-	Expr *transposeExpr(TransactionContext &txn, ObjectManager &objectManager);
+	Expr *transposeExpr(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy);
 
 	void Init();
 
@@ -637,6 +672,9 @@ protected:
 	Expr(float v, TransactionContext &txn);
 	Expr(double v, TransactionContext &txn);
 
+	Expr(const MicroTimestamp &v, TransactionContext &txn);
+	Expr(const NanoTimestamp &v, TransactionContext &txn);
+
 	Expr(const char *s, TransactionContext &txn, bool isLabel = false,
 		bool needDequote = false);
 
@@ -647,7 +685,7 @@ protected:
 
 	Expr(Value *array, TransactionContext &txn);
 
-	Expr(ExprList *args, TransactionContext &txn, ObjectManager &objectManager);
+	Expr(ExprList *args, TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy);
 
 	Expr(Operation op, Expr *arg1, Expr *arg2, TransactionContext &txn);
 	Expr(Operation op, ExprList &args, TransactionContext &txn);
@@ -664,8 +702,10 @@ protected:
 	Expr(const char *name, TqlSpecialId *func, TransactionContext &txn);
 	Expr(TrivalentLogicType logicType, TransactionContext &txn);
 
-	template <typename T, typename R>
-	const char *stringifyValue(TransactionContext &txn);
+	template<typename T, typename R>
+	const char* stringifyValue(TransactionContext &txn);
+	template<typename T>
+	const char8_t* stringifyTimestamp(TransactionContext &txn);
 
 	virtual bool isValueOrColumn() {
 		return isColumn() || isValue();

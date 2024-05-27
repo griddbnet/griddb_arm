@@ -19,10 +19,17 @@
 #include "util/numeric.h"
 
 #include "c_utility_cpp.h"
-#include "sql_common.h"
 
 #include "sql_rewrite.h"
 #include "newsql_interface.h"
+
+namespace {
+struct ConstantsChecker {
+	ConstantsChecker() {
+		UTIL_STATIC_ASSERT(GS_TYPE_STRING_NULL == GS_TYPE_TIMESTAMP_ARRAY + 1);
+	}
+};
+}
 
 extern "C" {
 #include "sqliteInt.h"
@@ -248,13 +255,13 @@ const char8_t* SQLVdbeUtils::VdbeUtils::Impl::specialNumericToString(
 bool SQLVdbeUtils::VdbeUtils::Impl::stringToSpecialNumeric(
 		const char8_t *buffer, size_t length, double &result) {
 
-	std::pair<const char8_t*, const char8_t*> trimed(buffer, buffer + length);
-	trimSpace(trimed.first, trimed.second);
+	std::pair<const char8_t*, const char8_t*> trimmed(buffer, buffer + length);
+	trimSpace(trimmed.first, trimmed.second);
 
-	const int32_t sign = tokenizeNumericSign(trimed.first, trimed.second);
+	const int32_t sign = tokenizeNumericSign(trimmed.first, trimmed.second);
 
 	const TupleString::BufferInfo bufInfo(
-			trimed.first, static_cast<size_t>(trimed.second - trimed.first));
+			trimmed.first, static_cast<size_t>(trimmed.second - trimmed.first));
 
 	if (!ValueUtils::CONFIG_NAN_AS_NULL &&
 			ValueUtils::orderPartNoCase(bufInfo, CONSTANT_NAN_STR) == 0) {
@@ -569,8 +576,8 @@ TupleValue SQLVdbeUtils::VdbeUtils::sqlPrintf(
 		}
 		else if (argType == TupleTypes::TYPE_STRING ||
 				argType == TupleTypes::TYPE_BLOB ||
-				argType == TupleTypes::TYPE_TIMESTAMP ||
-				argType == TupleTypes::TYPE_BOOL) {
+				argType == TupleTypes::TYPE_BOOL ||
+				TypeUtils::isTimestampFamily(argType)) {
 			const TupleValue &strArg = ValueUtils::toString(cxt, arg);
 			const size_t strSize = strArg.varSize();
 			if (strSize >
@@ -680,8 +687,8 @@ bool SQLVdbeUtils::VdbeUtils::toLong(
 		}
 	}
 
-	const size_t trimedLen = static_cast<size_t>(tail - buffer);
-	if (trimedLen > static_cast<unsigned>(std::numeric_limits<int>::max())) {
+	const size_t trimmedLen = static_cast<size_t>(tail - buffer);
+	if (trimmedLen > static_cast<unsigned>(std::numeric_limits<int>::max())) {
 		result = int64_t();
 		return false;
 	}
@@ -690,7 +697,7 @@ bool SQLVdbeUtils::VdbeUtils::toLong(
 	UTIL_STATIC_ASSERT(sizeof(i64Result) == sizeof(result));
 
 	const bool succeeded = sqlite3Atoi64(
-			buffer, &i64Result, static_cast<int>(trimedLen), SQLITE_UTF8) ==
+			buffer, &i64Result, static_cast<int>(trimmedLen), SQLITE_UTF8) ==
 			SQLITE_OK;
 	result = i64Result;
 

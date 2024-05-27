@@ -59,7 +59,7 @@ import com.toshiba.mwcloud.gs.common.RowMapper;
  * <p>1つのコンテナのカラム間で、ASCIIの大文字・小文字表記だけが異なる
  * 名前のものを複数定義することはできません。その他、コンテナ定義における
  * カラム名の文字種や長さ、カラム数には制限があります。具体的には、
- * GridDBテクニカルリファレンスを参照してください。特に記載のない限り、
+ * GridDB機能リファレンスを参照してください。特に記載のない限り、
  * カラム名を指定する操作では、ASCIIの大文字・小文字表記の違いは区別
  * されません。</p>
  *
@@ -75,7 +75,8 @@ import com.toshiba.mwcloud.gs.common.RowMapper;
  * <tr><td>LONG</td><td>{@link Long}または{@code long}</td></tr>
  * <tr><td>FLOAT</td><td>{@link Float}または{@code float}</td></tr>
  * <tr><td>DOUBLE</td><td>{@link Double}または{@code double}</td></tr>
- * <tr><td>TIMESTAMP</td><td>{@link java.util.Date}</td></tr>
+ * <tr><td>TIMESTAMP(通常精度:ミリ秒)</td><td>{@link java.util.Date}</td></tr>
+ * <tr><td>TIMESTAMP(高精度:マイクロ・ナノ秒)</td><td>{@link java.sql.Timestamp}</td></tr>
  * <tr><td>GEOMETRY</td><td>{@link Geometry}</td></tr>
  * <tr><td>BLOB</td><td>{@link Blob}を実装したクラス</td></tr>
  * <tr><td>STRING配列</td><td>{@code String[]}</td></tr>
@@ -91,7 +92,7 @@ import com.toshiba.mwcloud.gs.common.RowMapper;
  * </table>
  *
  * <p>フィールドの値の表現範囲やサイズには制限があります。
- * 具体的には、付録の章の値の範囲の説明、ならびに、GridDBテクニカル
+ * 具体的には、付録の章の値の範囲の説明、ならびに、GridDB機能
  * リファレンスを参照してください。制限に反する値をコンテナに格納することは
  * できません。</p>
  *
@@ -140,6 +141,9 @@ import com.toshiba.mwcloud.gs.common.RowMapper;
  * <tr><td>配列型</td><td>要素数0の配列</td></tr>
  * </tbody>
  * </table>
+ *
+ * <p>日時精度は、{@link TimePrecision#value()}もしくは
+ * {@link ColumnInfo#getTimePrecision()}により明示的に指定できます。</p>
  *
  * <p>トランザクション処理では、デフォルトで自動コミットモードが有効になっています。
  * 自動コミットモードでは、変更操作は逐次確定し、明示的に取り消すことができません。
@@ -215,7 +219,7 @@ import com.toshiba.mwcloud.gs.common.RowMapper;
  * <p>Multiple column names that are different only in upper-
  * and lowercase letters cannot be defined in a table.
  * Further the allowed characters, the length of column names and
- * the number of columns are limited. See the GridDB Technical
+ * the number of columns are limited. See the GridDB Features
  * Reference for the details. In the operations specifying column
  * names, ASCII uppercase and lowercase characters are identified as
  * same unless otherwise noted. Use {@link RowField} to specify
@@ -251,7 +255,7 @@ import com.toshiba.mwcloud.gs.common.RowMapper;
  * </table>
  *
  * <p>There are the restrictions on the display range and size of the
- * field value. See the GridDB Technical Reference and the appendix
+ * field value. See the GridDB Features Reference and the appendix
  * "Range of values" for the details.
  * Values contrary to the restriction cannot be stored in a Container.</p>
  *
@@ -1013,7 +1017,7 @@ public interface Container<K, R> extends Closeable {
 	 * <p>1つのコンテナの索引間で、ASCIIの大文字・小文字表記だけが異なる
 	 * 名前のものを複数定義することはできません。その他、索引の定義において
 	 * 使用できる索引名の文字種や長さには制限があります。具体的には、
-	 * GridDBテクニカルリファレンスを参照してください。特に記載のない限り、
+	 * GridDB機能リファレンスを参照してください。特に記載のない限り、
 	 * 索引名を指定する操作では、ASCIIの大文字・小文字表記の違いは
 	 * 区別されません。</p>
 	 *
@@ -1111,7 +1115,7 @@ public interface Container<K, R> extends Closeable {
 	 * <p>If an index name is set, a new index is created only if
 	 * there is no index with the same name or the different name
 	 * only in upper- or lowercase letters in the target
-	 * container. See the GridDB Technical Reference for the
+	 * container. See the GridDB Features Reference for the
 	 * details. In defining an index name, there are limits on
 	 * the allowed characters and the length. In the operations of
 	 * index, the names are not case-sensitive unless otherwise
@@ -1452,7 +1456,7 @@ public interface Container<K, R> extends Closeable {
 	 * <p>トリガ種別や通知条件などの違いによらず、1つのコンテナのトリガ間で、
 	 * ASCIIの大文字・小文字表記を含め同一の名前のものを複数定義することは
 	 * できません。その他、トリガの定義において使用できるトリガ名の文字種や
-	 * 長さには制限があります。具体的には、GridDBテクニカルリファレンスを
+	 * 長さには制限があります。具体的には、GridDB機能リファレンスを
 	 * 参照してください。特に記載のない限り、トリガ名を指定する操作では、
 	 * ASCIIの大文字・小文字表記の違いが区別されます。</p>
 	 *
@@ -1564,7 +1568,7 @@ public interface Container<K, R> extends Closeable {
 	 * {@link #dropTrigger(String)}により削除することが推奨されます。</p>
 	 *
 	 * <p>一つのコンテナに対して設定できるトリガの最大数、ならびに、トリガの
-	 * 各種設定値の上限については、GridDBテクニカルリファレンスを参照してください。</p>
+	 * 各種設定値の上限については、GridDB機能リファレンスを参照してください。</p>
 	 *
 	 * @param info 設定対象のトリガ情報
 	 *
@@ -1602,7 +1606,7 @@ public interface Container<K, R> extends Closeable {
 	 * notification conditions, in a container cannot be
 	 * defined. And there are the limitations, the allowed characters
 	 * and the length, on the trigger names. See the GridDB
-	 * Technical Reference for the details. Trigger names are
+	 * Features Reference for the details. Trigger names are
 	 * case-sensitive unless otherwise noted.</p>
 	 *
 	 * <b>Trigger type</b>
@@ -1714,7 +1718,7 @@ public interface Container<K, R> extends Closeable {
 	 * Therefore, a trigger having an invalid notification destination URI
 	 * is recommended to be deleted by using {@link #dropTrigger(String)}.</p>
 	 *
-	 * <p>See the GridDB Technical Reference for the maximum number of
+	 * <p>See the GridDB Features Reference for the maximum number of
 	 * triggers that can be set for a single Container and the upper limit of the
 	 * values for various trigger settings.</p>
 	 *

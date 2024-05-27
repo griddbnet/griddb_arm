@@ -25,11 +25,11 @@
 #include "base_index.h"
 #include "data_type.h"
 #include "gs_error.h"
-#include "object_manager.h"
+#include "object_manager_v4.h"
 #include "value_processor.h"  
 #include "value.h"			   
 #include "value_operator.h"
-#include "container_key.h"
+#include "container_key_processor.h"
 #include <iomanip>
 #include <iostream>
 
@@ -59,58 +59,26 @@ struct StringKey {
 	}
 };
 
-class FullContainerKeyCursor : public BaseObject {
-public:
-	FullContainerKeyCursor(
-		TransactionContext &txn, ObjectManager &objectManager, OId oId) :
-		BaseObject(txn.getPartitionId(), objectManager, oId),
-		body_(NULL), bodySize_(0), key_(NULL) {
-		bodySize_ = ValueProcessor::decodeVarSize(getBaseAddr());
-		body_ = getBaseAddr() + ValueProcessor::getEncodedVarSize(bodySize_);  
+template<typename T>
+struct BaseTimestampKey {
+	friend std::ostream& operator<<(
+			std::ostream &output, const BaseTimestampKey &key) {
+		ValueProcessor::dumpRawTimestamp(output, key.base_);
+		return output;
 	}
-	FullContainerKeyCursor(
-		PartitionId pId, ObjectManager &objectManager) :
-		BaseObject(pId, objectManager), body_(NULL), bodySize_(0), key_(NULL) {};
-	FullContainerKeyCursor(FullContainerKey *key) : 
-		BaseObject(NULL), body_(NULL), bodySize_(0), key_(key) {
-		const void *srcBody;
-		size_t srcSize;
-		key->toBinary(srcBody, srcSize);
-		body_ = const_cast<uint8_t *>(static_cast<const uint8_t *>(srcBody));
-		bodySize_ = srcSize;
+	bool operator==(const BaseTimestampKey &key) const {
+		return ValueProcessor::compareTimestamp(base_, key.base_) == 0;
 	}
-	void initialize(TransactionContext &txn, const FullContainerKey &src, const AllocateStrategy &allocateStrategy) {
-		UNUSED_VARIABLE(txn);
-		const void *srcBody;
-		size_t srcSize;
-		src.toBinary(srcBody, srcSize);
-		bodySize_ = srcSize;
+	bool operator<(const BaseTimestampKey &key) const {
+		return ValueProcessor::compareTimestamp(base_, key.base_) < 0;
+	}
 
-		uint32_t headerSize = ValueProcessor::getEncodedVarSize(bodySize_);  
+	T base_;
+};
 
-		OId oId;
-		allocate<uint8_t>(headerSize + bodySize_, allocateStrategy, 
-			oId, OBJECT_TYPE_VARIANT);
-
-		uint64_t encodedLength = ValueProcessor::encodeVarSize(bodySize_);
-		memcpy(getBaseAddr(), &encodedLength, headerSize);
-		body_ = getBaseAddr() + headerSize;
-		memcpy(body_, static_cast<const uint8_t *>(srcBody), bodySize_);
-	}
-	FullContainerKey getKey() const {
-		if (key_ == NULL) {
-			return FullContainerKey(KeyConstraint(), getBaseAddr());
-		} else {
-			return *key_;
-		}
-	}
-	const uint8_t *getKeyBody() const {
-		return body_;
-	}
-private:
-	uint8_t *body_;
-	uint64_t bodySize_;
-	FullContainerKey *key_;
+struct MicroTimestampKey : public BaseTimestampKey<MicroTimestamp> {
+};
+struct NanoTimestampKey : public BaseTimestampKey<NanoTimestamp> {
 };
 
 struct FullContainerKeyObject {
@@ -224,8 +192,8 @@ public:
 		TYPE_UNDEF_KEY,
 	};
 
-	BtreeMap(TransactionContext &txn, ObjectManager &objectManager,
-		const AllocateStrategy &strategy, BaseContainer *container = NULL,
+	BtreeMap(TransactionContext &txn, ObjectManagerV4 &objectManager,
+		AllocateStrategy &strategy, BaseContainer *container = NULL,
 		TreeFuncInfo *funcInfo = NULL)
 		: BaseIndex(txn, objectManager, strategy, container, funcInfo, MAP_TYPE_BTREE),
 		  nodeMaxSize_(NORMAL_MAX_ITEM_SIZE),
@@ -233,8 +201,8 @@ public:
 		  elemSize_(DEFAULT_ELEM_SIZE)
 		  , isUnique_(false), keyType_(COLUMN_TYPE_WITH_BEGIN), btreeMapType_(TYPE_UNDEF_KEY)
 	{}
-	BtreeMap(TransactionContext &txn, ObjectManager &objectManager, OId oId,
-		const AllocateStrategy &strategy, BaseContainer *container = NULL,
+	BtreeMap(TransactionContext &txn, ObjectManagerV4 &objectManager, OId oId,
+		AllocateStrategy &strategy, BaseContainer *container = NULL,
 		TreeFuncInfo *funcInfo = NULL)
 		: BaseIndex(txn, objectManager, oId, strategy, container, funcInfo, MAP_TYPE_BTREE) {
 		BNode<char, char> rootNode(this, allocateStrategy_);
@@ -264,6 +232,11 @@ public:
 	};
 
 public:
+	class TermConditionUpdator;
+
+	template <typename P, typename K, typename V, typename R>
+	class TermConditionRewriter;
+
 	/*!
 		@brief Information related to a search
 	*/
@@ -271,36 +244,49 @@ public:
 	private:
 		bool isEqual_;		  
 		bool isCaseSensitive_;
+		TermConditionUpdator *condUpdator_;
 
 	public:
-		SearchContext(util::StackAllocator &alloc, util::Vector<ColumnId> &columnIds)
-			: BaseIndex::SearchContext(alloc, columnIds),
-			  isEqual_(false),
-			  isCaseSensitive_(true)
-		{
-		}
-		SearchContext(util::StackAllocator &alloc, ColumnId columnId)
-			: BaseIndex::SearchContext(alloc, columnId),
-			  isEqual_(false),
-			  isCaseSensitive_(true)
-		{
+		SearchContext(
+				util::StackAllocator &alloc,
+				const util::Vector<ColumnId> &columnIds) :
+				BaseIndex::SearchContext(alloc, columnIds),
+				isEqual_(false),
+				isCaseSensitive_(true),
+				condUpdator_(NULL) {
 		}
 
-		SearchContext(util::StackAllocator &alloc, TermCondition &startCond,
-			TermCondition &endCond,
-			ResultSize limit)
-			: BaseIndex::SearchContext(
-				  alloc, startCond, endCond, limit),
-			  isEqual_(false),
-			  isCaseSensitive_(true)
-		{}
-		SearchContext(util::StackAllocator &alloc, TermCondition &cond,
-			ResultSize limit)
-			: BaseIndex::SearchContext(
-				  alloc, cond, limit),
-			  isEqual_(true),
-			  isCaseSensitive_(true)
-		{}
+		SearchContext(util::StackAllocator &alloc, ColumnId columnId) :
+				BaseIndex::SearchContext(alloc, columnId),
+				isEqual_(false),
+				isCaseSensitive_(true),
+				condUpdator_(NULL) {
+		}
+
+		SearchContext(
+				util::StackAllocator &alloc, TermCondition &startCond,
+				TermCondition &endCond, ResultSize limit) :
+				BaseIndex::SearchContext(alloc, startCond, endCond, limit),
+				isEqual_(false),
+				isCaseSensitive_(true),
+				condUpdator_(NULL) {
+		}
+
+		SearchContext(
+				util::StackAllocator &alloc, TermCondition &cond,
+				ResultSize limit) :
+				BaseIndex::SearchContext(alloc, cond, limit),
+				isEqual_(true),
+				isCaseSensitive_(true),
+				condUpdator_(NULL) {
+		}
+
+		void clear() {
+			BaseIndex::SearchContext::clear();
+			isEqual_ = false;
+			isCaseSensitive_ = true;
+			condUpdator_ = NULL;
+		}
 
 		void setCaseSensitive(bool isCaseSensitive) {
 			isCaseSensitive_ = isCaseSensitive;
@@ -370,6 +356,15 @@ public:
 
 			return strstrm.str();
 		}
+
+		void setTermConditionUpdator(TermConditionUpdator *condUpdator) {
+			condUpdator_ = condUpdator;
+		}
+
+		TermConditionUpdator* getTermConditionUpdator() {
+			return condUpdator_;
+		}
+
 	};
 
 	/*!
@@ -386,33 +381,32 @@ public:
 
 
 	static inline int32_t keyCmp(TransactionContext &txn,
-		ObjectManager &objectManager, const StringObject &e1,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const StringObject &e1,
 		const StringKey &e2, BaseIndex::Setting &);
 
 	static inline int32_t keyCmp(TransactionContext &txn,
-		ObjectManager &objectManager, const StringKey &e1,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const StringKey &e1,
 		const StringObject &e2, BaseIndex::Setting &);
 
 	static inline int32_t keyCmp(TransactionContext &txn,
-		ObjectManager &objectManager, const FullContainerKeyObject &e1,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const FullContainerKeyObject &e1,
 		const FullContainerKeyAddr &e2, BaseIndex::Setting &setting);
 	static inline int32_t keyCmp(TransactionContext &txn,
-		ObjectManager &objectManager, const FullContainerKeyAddr &e1,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const FullContainerKeyAddr &e1,
 		const FullContainerKeyObject &e2, BaseIndex::Setting &setting);
 
 	template <typename K>
-	static inline int32_t keyCmp(TransactionContext &txn, ObjectManager &objectManager,
+	static inline int32_t keyCmp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		const K &e1, const K &e2, BaseIndex::Setting &);
 
 
-	static int32_t compositeInfoCmp(TransactionContext &txn, ObjectManager &objectManager,
+	static int32_t compositeInfoCmp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	   const CompositeInfoObject *e1, const CompositeInfoObject *e2, BaseIndex::Setting &setting);
 
 
 	template <typename S>
-	static inline bool compositeInfoMatch(TransactionContext &txn, ObjectManager &objectManager,
+	bool compositeInfoMatch(TransactionContext &txn, ObjectManagerV4 &objectManager,
 		const S *e, BaseIndex::Setting &setting);
-
 
 	int32_t initialize(TransactionContext &txn, ColumnType columnType,
 		bool isUnique, BtreeMapType btreeMapType, uint32_t elemSize = DEFAULT_ELEM_SIZE);
@@ -485,7 +479,7 @@ public:
 			loc = 0;
 		}
 		else {
-			node.load(cursor.nodeId_);
+			node.load(cursor.nodeId_, false);
 			loc = cursor.loc_;
 		}
 		bool hasNext = false;
@@ -514,18 +508,18 @@ public:
 		}
 		else {
 			BNode<Timestamp, OId> node(
-				txn, *getObjectManager(), getTailNodeOId(), allocateStrategy_);
+				txn, *getObjectManager(), getTailNodeOId(), *const_cast<AllocateStrategy*>(&allocateStrategy_));
 			return node.getKeyValue(node.numkeyValues() - 1).value_;
 		}
 	}
 	static OId getTailDirect(TransactionContext &txn,
-		ObjectManager &objectManager, OId tailNodeOId) {
+		ObjectManagerV4 &objectManager, AllocateStrategy& allocateStrategy, OId tailNodeOId) {
 		if (tailNodeOId == UNDEF_OID) {
 			return UNDEF_OID;
 		}
 		else {
 			BNode<Timestamp, OId> node(
-				txn, objectManager, tailNodeOId, AllocateStrategy());
+				txn, objectManager, tailNodeOId, allocateStrategy);
 			if (node.numkeyValues() == 0) {
 				return UNDEF_OID;
 			}
@@ -536,12 +530,12 @@ public:
 	}
 
 	inline OId getTailNodeOId() const {
-		BNode<char, char> rootNode(this, allocateStrategy_);
+		BNode<char, char> rootNode(this, *const_cast<AllocateStrategy*>(&allocateStrategy_));
 		return rootNode.getTailNodeOId();
 	}
 
 	inline bool isEmpty() const {
-		BNode<char, char> rootNode(this, allocateStrategy_);
+		BNode<char, char> rootNode(this, *const_cast<AllocateStrategy*>(&allocateStrategy_));
 		return rootNode.numkeyValues() == 0;
 	}
 
@@ -589,7 +583,7 @@ private:
 	template <typename P, typename K, typename V, CompareComponent C>
 	class CmpFunctor {
 	public:
-		int32_t operator()(TransactionContext &txn, ObjectManager &objectManager,
+		int32_t operator()(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 			const KeyValue<P, V> &e1, 
 			const KeyValue<K, V> &e2,
 			Setting &setting) {
@@ -599,24 +593,24 @@ private:
 
 				const S *ptr1 = reinterpret_cast< const S * >(&(e1.key_));
 				const T *ptr2 = reinterpret_cast< const T * >(&(e2.key_));
-				return cmp(txn, objectManager, *ptr1, e1.value_, *ptr2, e2.value_, setting, Component());
+				return cmp(txn, objectManager, strategy, *ptr1, e1.value_, *ptr2, e2.value_, setting, Component());
 		}
 
 		template <typename S, typename T, typename U>
-		int32_t cmp(TransactionContext &txn, ObjectManager &objectManager,
+		int32_t cmp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 			const S &key1, const U &value1, 
 			const T &key2, const U &value2, 
 			Setting &setting, const ComponentKey & ) {
 			UNUSED_VARIABLE(value1);
 			UNUSED_VARIABLE(value2);
-			return keyCmp(txn, objectManager, key1, key2, setting);
+			return keyCmp(txn, objectManager, strategy, key1, key2, setting);
 		}
 		template <typename S, typename T, typename U>
-		int32_t cmp(TransactionContext &txn, ObjectManager &objectManager,
+		int32_t cmp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 			const S &key1, const U &value1, 
 			const T &key2, const U &value2, 
 			Setting &setting, const ComponentKeyValue & ) {
-			int32_t ret = keyCmp(txn, objectManager, key1, key2, setting);
+			int32_t ret = keyCmp(txn, objectManager, strategy, key1, key2, setting);
 			if (ret == 0) {
 				ret = value1 < value2 ? -1 : (value1 == value2 ? 0 : 1);
 			}
@@ -666,19 +660,19 @@ private:
 	template <typename K, typename V>
 	class BNode : public BaseObject {
 	public:
-		BNode(const BtreeMap *map, const AllocateStrategy &allocateStrategy)
-			: BaseObject(map->getPartitionId(), *(map->getObjectManager())),
+		BNode(const BtreeMap *map, AllocateStrategy &allocateStrategy)
+			: BaseObject(*(map->getObjectManager()), allocateStrategy),
 			  allocateStrategy_(allocateStrategy) {
 			BaseObject::copyReference(UNDEF_OID, map->getBaseAddr());
 		}
 
-		BNode(TransactionContext &txn, ObjectManager &objectManager,
-			const AllocateStrategy &allocateStrategy)
-			: BaseObject(txn.getPartitionId(), objectManager),
+		BNode(TransactionContext &txn, ObjectManagerV4 &objectManager,
+			AllocateStrategy &allocateStrategy)
+			: BaseObject(objectManager, allocateStrategy),
 			  allocateStrategy_(allocateStrategy) {}
-		BNode(TransactionContext &txn, ObjectManager &objectManager, OId oId,
-			const AllocateStrategy &allocateStrategy)
-			: BaseObject(txn.getPartitionId(), objectManager, oId),
+		BNode(TransactionContext &txn, ObjectManagerV4 &objectManager, OId oId,
+			AllocateStrategy &allocateStrategy)
+			: BaseObject(objectManager, allocateStrategy, oId),
 			  allocateStrategy_(allocateStrategy) {}
 
 		void directLoad(const BtreeMap *map) {
@@ -702,9 +696,9 @@ private:
 			}
 			else {
 				BaseObject childrenDirtyObject(
-					txn.getPartitionId(), *getObjectManager());
+					*getObjectManager(), allocateStrategy_);
 				OId *childrenList = childrenDirtyObject.allocate<OId>(
-					sizeof(OId) * (nodeMaxSize + 1), allocateStrategy_,
+					sizeof(OId) * (nodeMaxSize + 1),
 					header.children_, OBJECT_TYPE_BTREE_MAP);
 				for (int32_t i = 0; i < nodeMaxSize + 1; ++i) {
 					childrenList[i] = UNDEF_OID;
@@ -714,16 +708,16 @@ private:
 		inline OId getChild(TransactionContext &txn, int32_t nth) const {
 			assert(getImage()->getHeader().children_ != UNDEF_OID);
 
-			BaseObject baseObject(txn.getPartitionId(), *getObjectManager(),
-				getImage()->getHeader().children_);
+			BaseObject baseObject(*getObjectManager(),
+				allocateStrategy_, getImage()->getHeader().children_);
 			OId *oIdList = baseObject.getBaseAddr<OId *>();
 			return oIdList[nth];
 		}
 		inline void setChild(TransactionContext &txn, int32_t nth, OId oId) {
 			assert(getImage()->getHeader().children_ != UNDEF_OID);
 
-			UpdateBaseObject baseObject(txn.getPartitionId(),
-				*getObjectManager(), getImage()->getHeader().children_);
+			UpdateBaseObject baseObject(
+				*getObjectManager(), allocateStrategy_, getImage()->getHeader().children_);
 			OId *oIdListDirtyObject = baseObject.getBaseAddr<OId *>();
 			oIdListDirtyObject[nth] = oId;
 		}
@@ -735,14 +729,14 @@ private:
 			if (image->getHeader().size_ == 0) {
 				image->setKeyValue(0, &val);
 			}
-			else if (cmp(txn, *getObjectManager(), val,
+			else if (cmp(txn, *getObjectManager(), allocateStrategy_, val,
 						 *image->getKeyValue(numkeyValues() - 1), setting) > 0) {
 				image->setKeyValue(numkeyValues(), &val);
 			}
 			else {
 				int32_t i, j;
 				for (i = 0; i < image->getHeader().size_; ++i) {
-					if (cmp(txn, *getObjectManager(), val,
+					if (cmp(txn, *getObjectManager(), allocateStrategy_, val,
 							*image->getKeyValue(i), setting) < 0) {
 						for (j = image->getHeader().size_; j > i; --j) {
 							image->setKeyValue(j, image->getKeyValue(j - 1));
@@ -768,8 +762,8 @@ private:
 			BNodeImage<K, V> *image = getImage();
 			assert(image->getHeader().children_ != UNDEF_OID);
 
-			UpdateBaseObject baseObject(txn.getPartitionId(),
-				*getObjectManager(), image->getHeader().children_);
+			UpdateBaseObject baseObject(
+				*getObjectManager(), allocateStrategy_, image->getHeader().children_);
 			OId *oIdListDirtyObject = baseObject.getBaseAddr<OId *>();
 			for (int32_t i = numkeyValues(); i >= m; --i) {
 				oIdListDirtyObject[i + 1] = oIdListDirtyObject[i];
@@ -780,8 +774,8 @@ private:
 		inline void removeChild(TransactionContext &txn, int32_t m) {
 			BNodeImage<K, V> *image = getImage();
 			assert(image->getHeader().children_ != UNDEF_OID);
-			UpdateBaseObject baseObject(txn.getPartitionId(),
-				*getObjectManager(), image->getHeader().children_);
+			UpdateBaseObject baseObject(
+				*getObjectManager(), allocateStrategy_, image->getHeader().children_);
 			OId *oIdListDirtyObject = baseObject.getBaseAddr<OId *>();
 			for (int32_t i = m; i < image->getHeader().size_; ++i) {
 				oIdListDirtyObject[i] = oIdListDirtyObject[i + 1];
@@ -818,9 +812,9 @@ private:
 			BNodeImage<K, V> *image = getImage();
 			StringCursor *stringCursor =
 				reinterpret_cast<StringCursor *>(e.key_.ptr_);
-			BaseObject object(txn.getPartitionId(), *getObjectManager());
+			BaseObject object(*getObjectManager(), allocateStrategy_);
 			StringObject *stringObject = object.allocateNeighbor<StringObject>(
-				stringCursor->getObjectSize(), allocateStrategy_,
+				stringCursor->getObjectSize(),
 				image->getKeyValue(m)->key_.oId_, image->getHeader().self_,
 				OBJECT_TYPE_BTREE_MAP);
 			memcpy(stringObject, stringCursor->data(),
@@ -840,8 +834,17 @@ private:
 			image->getKeyValue(m)->value_ = e.value_;
 			image->getHeader().size_++;
 		}
-
-
+		inline void allocateVal(
+			TransactionContext& txn, int32_t m, KeyValue<FullContainerKeyObject, KeyDataStoreValue>& e, Setting& setting) {
+			UNUSED_VARIABLE(txn);
+			UNUSED_VARIABLE(setting);
+			BNodeImage<K, V>* image = getImage();
+			const FullContainerKeyCursor* keyCursor =
+				reinterpret_cast<const FullContainerKeyCursor*>(e.key_.ptr_);
+			image->getKeyValue(m)->key_.oId_ = keyCursor->getBaseOId();
+			image->getKeyValue(m)->value_ = e.value_;
+			image->getHeader().size_++;
+		}
 		inline void setKey(
 			TransactionContext &txn, CompositeInfoObject &src, CompositeInfoObject &dest, Setting &setting) {
 
@@ -860,39 +863,39 @@ private:
 			dest = src;
 		}
 
-		inline void freeVal(TransactionContext &txn, int32_t m) {
+		inline void freeVal(int32_t m) {
 			KeyValue<K, V> *e = getImage()->getKeyValue(m);
 			typedef typename MapKeyTraits<K>::TYPE S;
 			S *key = reinterpret_cast<S *>(&(e->key_));
-			freeKey(txn, *key);
+			freeKey(*key);
 		}
 
 		inline void freeKey(
-			TransactionContext &txn, StringKey &key) {
+			StringKey &key) {
+			ChunkAccessor ca;
 			getObjectManager()->free(
-				txn.getPartitionId(), key.oId_);
+				ca, allocateStrategy_.getGroupId(), key.oId_);
 		}
 		inline void freeKey(
-			TransactionContext &, FullContainerKeyAddr &) {
+			FullContainerKeyAddr &) {
 		}
-
 		inline void freeKey(
-			TransactionContext &txn, CompositeInfoObject &key) {
-			key.freeKey(txn, *getObjectManager());
+			CompositeInfoObject &key) {
+			key.freeKey(*getObjectManager(), allocateStrategy_);
 		}
 
 		template <typename S>
 		inline void freeKey(
-			TransactionContext &, S &) {
+			S &) {
 			UTIL_STATIC_ASSERT((!util::IsSame<K, StringObject>::VALUE));
 			UTIL_STATIC_ASSERT((!util::IsSame<K, FullContainerKeyObject>::VALUE));
 			UTIL_STATIC_ASSERT((!util::IsSame<S, CompositeInfoObject>::VALUE));
 		}
 
-
 		inline bool finalize(TransactionContext &txn, ResultSize &removeNum) {
 			BNodeImage<K, V> *image = getImage();
 			int32_t valueNum = image->getHeader().size_;
+			ChunkAccessor ca;
 			while (valueNum >= 0) {
 				if (!isLeaf()) {
 					OId childOId = getChild(txn, valueNum);
@@ -909,7 +912,7 @@ private:
 					}
 				}
 				if (valueNum > 0) {
-					freeVal(txn, valueNum - 1);
+					freeVal(valueNum - 1);
 					removeVal(valueNum - 1);
 				} else {
 					image->getHeader().size_ = -1;
@@ -919,7 +922,7 @@ private:
 			if (removeNum > 0) {
 				if (!isLeaf()) {
 					getObjectManager()->free(
-						txn.getPartitionId(), image->getHeader().children_);
+						ca, allocateStrategy_.getGroupId(), image->getHeader().children_);
 				}
 				BaseObject::finalize();
 			}
@@ -927,10 +930,11 @@ private:
 		}
 
 		inline void remove(TransactionContext &txn) {
+			ChunkAccessor ca;
 			BNodeImage<K, V> *image = getImage();
 			if (image->getHeader().children_ != UNDEF_OID) {
 				getObjectManager()->free(
-					txn.getPartitionId(), image->getHeader().children_);
+					ca, allocateStrategy_.getGroupId(), image->getHeader().children_);
 			}
 			BaseObject::finalize();
 		}
@@ -998,7 +1002,7 @@ private:
 		inline std::string dump(TransactionContext &txn, TreeFuncInfo *funcInfo);
 
 	private:
-		const AllocateStrategy &allocateStrategy_;
+		AllocateStrategy &allocateStrategy_;
 		BNode(const BNode &);  
 		BNode &operator=(const BNode &);  
 		BNodeImage<K, V> *getImage() const {
@@ -1194,11 +1198,12 @@ private:
 		BtreeMap *tree_;
 	};
 
-
 	template<typename K>
 	struct MapKeyTraits {
 		typedef K TYPE;
 	};
+
+	struct SearchBulkFunc;
 
 	template<typename Action>
 	void switchToBasicType(ColumnType type, Action &action);
@@ -1254,7 +1259,7 @@ private:
 	}
 
 	template <typename P, typename V>
-	inline bool isMatch(TransactionContext &txn, ObjectManager &objectManager,
+	inline bool isMatch(TransactionContext &txn, ObjectManagerV4 &objectManager,
 		const KeyValue<P, V> &e, BaseIndex::Setting &setting) {
 		typedef typename MapKeyTraits<P>::TYPE S;
 		if (isComposite<P>()) {
@@ -1277,7 +1282,7 @@ private:
 			} else if (elemSize >= 40) {
 				baseNodeSize = 2 * 1024;
 			}
-			int32_t elemAreaSize = baseNodeSize - sizeof(BNodeHeader) - ObjectAllocator::BLOCK_HEADER_SIZE;
+			int32_t elemAreaSize = baseNodeSize - sizeof(BNodeHeader) - ObjectManagerV4::OBJECT_HEADER_SIZE;
 			int32_t maxElemNum = elemAreaSize / elemSize;
 			if (maxElemNum % 2 == 0) {
 				nodeSize = (maxElemNum - 2) + 1;
@@ -1298,7 +1303,7 @@ private:
 			} else if (elemSize >= 40) {
 				baseNodeSize = 2 * 1024;
 			}
-			int32_t elemAreaSize = baseNodeSize - sizeof(BNodeHeader) - ObjectAllocator::BLOCK_HEADER_SIZE;
+			int32_t elemAreaSize = baseNodeSize - sizeof(BNodeHeader) - ObjectManagerV4::OBJECT_HEADER_SIZE;
 			int32_t maxElemNum = elemAreaSize / elemSize;
 			if (maxElemNum % 2 == 0) {
 				nodeSize = (maxElemNum - 2) / 2;
@@ -1318,7 +1323,7 @@ private:
 			}
 			OId nodeId = baseHeadNode.getChild(txn, 0);
 			if (nodeId != UNDEF_OID) {
-				baseHeadNode.load(nodeId);
+				baseHeadNode.load(nodeId, false);
 			}
 			else {
 				break;
@@ -1344,7 +1349,7 @@ private:
 			while (1) {
 				OId nodeId;
 				size = currentNode->numkeyValues();
-				if (cmp(txn, *getObjectManager(), val,
+				if (cmp(txn, *getObjectManager(), allocateStrategy_, val,
 						currentNode->getKeyValue(size - 1), setting) > 0) {
 					if (currentNode->isLeaf()) {
 						loc = size;
@@ -1359,7 +1364,7 @@ private:
 					while (l < r) {
 						int32_t i = (l + r) >> 1;
 						int32_t currentCmpResult =
-							cmp(txn, *getObjectManager(), val,
+							cmp(txn, *getObjectManager(), allocateStrategy_, val,
 								currentNode->getKeyValue(i), setting);
 						if (currentCmpResult > 0) {
 							l = i + 1;
@@ -1374,7 +1379,7 @@ private:
 					}
 					assert(r == l);
 					int32_t cmpResult = cmp(txn, *getObjectManager(),
-						val, currentNode->getKeyValue(l), setting);
+						allocateStrategy_, val, currentNode->getKeyValue(l), setting);
 					if (cmpResult < 0) {
 						if (currentNode->isLeaf()) {
 							loc = l;
@@ -1402,7 +1407,7 @@ private:
 					}
 				}
 				if (nodeId != UNDEF_OID) {
-					node.load(nodeId);
+					node.load(nodeId, false);
 					currentNode = &node;
 				}
 				else {
@@ -1434,8 +1439,8 @@ private:
 		BNode<K, V> &dirtyNode2, KeyValue<K, V> &val) {
 		val = dirtyNode1.getKeyValue(nodeMinSize_);
 		OId node2Id;
-		dirtyNode2.allocateNeighbor<BNodeImage<K, V> >(
-			getNormalNodeSize<K, V>(getElemSize<K, V>()), allocateStrategy_, node2Id,
+		dirtyNode2.template allocateNeighbor<BNodeImage<K, V> >(
+			getNormalNodeSize<K, V>(getElemSize<K, V>()), node2Id,
 			dirtyNode1.getSelfOId(), OBJECT_TYPE_BTREE_MAP);
 
 		dirtyNode2.initialize(
@@ -1474,7 +1479,7 @@ private:
 			else {
 				while (!node.isRoot()) {
 					findUpNode(txn, node, loc);
-					node.load(node.getParentOId());
+					node.load(node.getParentOId(), false);
 					if (loc > 0) {
 						break;
 					}
@@ -1487,9 +1492,9 @@ private:
 		}
 		else {
 			if (loc >= 0) {
-				node.load(node.getChild(txn, loc));
+				node.load(node.getChild(txn, loc), false);
 				while (!node.isLeaf()) {
-					node.load(node.getChild(txn, node.numkeyValues()));
+					node.load(node.getChild(txn, node.numkeyValues()), false);
 				}
 				loc = node.numkeyValues() - 1;
 				return true;
@@ -1497,7 +1502,7 @@ private:
 			else {
 				while (!node.isRoot()) {
 					findUpNode(txn, node, loc);
-					node.load(node.getParentOId());
+					node.load(node.getParentOId(), false);
 					if (loc > 0) {
 						break;
 					}
@@ -1526,7 +1531,7 @@ private:
 			if (!tmpNode.isRoot()) {
 				while (!node.isRoot()) {
 					findUpNode(txn, node, loc);
-					node.load(node.getParentOId());
+					node.load(node.getParentOId(), false);
 					if (node.numkeyValues() > loc) {
 						break;
 					}
@@ -1539,9 +1544,9 @@ private:
 		else {
 			loc++;
 			if (node.numkeyValues() >= loc) {
-				node.load(node.getChild(txn, loc));
+				node.load(node.getChild(txn, loc), false);
 				while (!node.isLeaf()) {
-					node.load(node.getChild(txn, 0));
+					node.load(node.getChild(txn, 0), false);
 				}
 				loc = 0;
 				return true;
@@ -1549,7 +1554,7 @@ private:
 			else {
 				while (!node.isRoot()) {
 					findUpNode(txn, node, loc);
-					node.load(node.getParentOId());
+					node.load(node.getParentOId(), false);
 					if (node.numkeyValues() >= loc) {
 						break;
 					}
@@ -1666,10 +1671,10 @@ private:
 	int32_t find(TransactionContext &txn, SearchContext &sc,
 		util::XArray<R> &idList, OutputOrder outputOrder);
 
-	template <typename K, typename V, typename R>
+	template <typename P, typename K, typename V, typename R>
 	bool getAllByAscending(TransactionContext &txn, ResultSize limit,
 		util::XArray<R> &result, ResultSize suspendLimit, 
-		KeyValue<K, V> &suspendKeyValue) {
+		KeyValue<K, V> &suspendKeyValue, Setting &setting) {
 		bool isSuspend = false;
 		if (isEmpty()) {
 			return isSuspend;
@@ -1679,7 +1684,8 @@ private:
 		int32_t loc = 0;
 		while (true) {
 			KeyValue<K, V> currentVal = node.getKeyValue(loc);
-			pushResultList<K, V, R>(currentVal, result);
+			if (!isComposite<P>() || isMatch(txn, *getObjectManager(), currentVal, setting))
+				pushResultList<K, V, R>(currentVal, result);
 			if (!nextPos(txn, node, loc) || result.size() >= limit) {
 				break;
 			}
@@ -1692,17 +1698,17 @@ private:
 		return isSuspend;
 	}
 
-	template <typename K, typename V, typename R>
+	template <typename P, typename K, typename V, typename R>
 	int32_t getAllByAscending(
 		TransactionContext &txn, ResultSize limit, util::XArray<R> &result);
 	template <typename K, typename V, typename R>
 	int32_t getAllByAscending(TransactionContext &txn, ResultSize limit,
 		util::XArray<R> &result, BtreeMap::BtreeCursor &cursor);
 
-	template <typename K, typename V, typename R>
+	template <typename P, typename K, typename V, typename R>
 	bool getAllByDescending(TransactionContext &txn, ResultSize limit,
 		util::XArray<R> &result, ResultSize suspendLimit, 
-		KeyValue<K, V> &suspendKeyValue) {
+				KeyValue<K, V> &suspendKeyValue, Setting &setting) {
 		bool isSuspend = false;
 		if (isEmpty()) {
 			return isSuspend;
@@ -1712,7 +1718,8 @@ private:
 		int32_t loc = node.numkeyValues() - 1;
 		while (true) {
 			KeyValue<K, V> currentVal = node.getKeyValue(loc);
-			pushResultList<K, V, R>(currentVal, result);
+			if (!isComposite<P>() || isMatch(txn, *getObjectManager(), currentVal, setting))
+				pushResultList<K, V, R>(currentVal, result);
 			if (!prevPos(txn, node, loc) || result.size() >= limit) {
 				break;
 			}
@@ -1834,8 +1841,7 @@ private:
 	void replaceRoot(TransactionContext &txn, BNode<K, V> &replaceNode) {
 		BNode<K, V> baseRootNode(this, allocateStrategy_);
 
-		getObjectManager()->setDirty(
-			txn.getPartitionId(), replaceNode.getSelfOId());
+		replaceNode.setDirty();
 		replaceNode.setRootNodeHeader(baseRootNode.getKeyType(),
 			baseRootNode.getBtreeMapType(), baseRootNode.isUnique(),
 			baseRootNode.getTailNodeOId());
@@ -1852,6 +1858,50 @@ private:
 	V getMaxValue();
 	template <typename V>
 	V getMinValue();
+
+
+	int32_t searchBulk(
+			TransactionContext &txn, SearchContext &sc, util::XArray<OId> &idList,
+			OutputOrder outputOrder);
+
+	template <typename P, typename K, typename V, typename R, CompareComponent C>
+	int32_t findBulk(
+			TransactionContext &txn, SearchContext &sc, util::XArray<R> &idList,
+			OutputOrder outputOrder);
+
+	template <typename P, typename K, typename V, CompareComponent C>
+	int32_t findNext(
+			TransactionContext &txn, P &key, KeyValue<K, V> &keyValue,
+			Setting &setting, BNode<K, V> &node, int32_t &loc);
+	template <typename P, typename K, typename V, typename R, CompareComponent C>
+	bool findNext(
+			TransactionContext &txn, SearchContext &sc, util::XArray<R> &idList,
+			Setting &setting, BNode<K, V> &node, int32_t &loc);
+
+	template <typename P, typename K, typename V, typename R, CompareComponent C>
+	bool findGreaterNext(
+			TransactionContext &txn, KeyValue<P, V> &keyValue,
+			int32_t isIncluded, ResultSize limit, util::XArray<R> &result,
+			ResultSize suspendLimit, KeyValue<K, V> &suspendKeyValue,
+			Setting &setting, BNode<K, V> &node, int32_t &loc);
+	template <typename P, typename K, typename V, typename R, CompareComponent C>
+	bool findRangeNext(
+			TransactionContext &txn, KeyValue<P, V> &startKeyValue,
+			int32_t isStartIncluded, KeyValue<P, V> &endKeyValue,
+			int32_t isEndIncluded, ResultSize limit, util::XArray<R> &result,
+			ResultSize suspendLimit, KeyValue<K, V> &suspendKeyValue,
+			Setting &setting, BNode<K, V> &node, int32_t &loc);
+
+	template <typename P, typename K, typename V, CompareComponent C>
+	bool findNodeNext(
+			TransactionContext &txn, KeyValue<P, V> &val, BNode<K, V> &node,
+			int32_t &loc, CmpFunctor<P, K, V, C> &cmp, Setting &setting);
+	template <typename P, typename K, typename V, CompareComponent C>
+	bool findTopNodeNext(
+			TransactionContext &txn, KeyValue<P, V> &val, BNode<K, V> &node,
+			int32_t &loc, CmpFunctor<P, K, V, C> &cmp, Setting &setting);
+
+	static void errorInvalidSearchCondition();
 };
 
 template <typename K, typename V>
@@ -1868,8 +1918,8 @@ void BtreeMap::split(TransactionContext &txn, BNode<K, V> &dirtyNode1,
 		BNode<K, V> dirtyParentNode(
 			txn, *getObjectManager(), allocateStrategy_);
 		if (dirtyNode1.isRoot()) {
-			dirtyParentNode.allocateNeighbor<BNodeImage<K, V> >(
-				getNormalNodeSize<K, V>(getElemSize<K, V>()), allocateStrategy_, parentOId,
+			dirtyParentNode.template allocateNeighbor<BNodeImage<K, V> >(
+				getNormalNodeSize<K, V>(getElemSize<K, V>()), parentOId,
 				dirtyNode1.getSelfOId(), OBJECT_TYPE_BTREE_MAP);
 			dirtyParentNode.initialize(
 				txn, parentOId, false, nodeMaxSize_, elemSize_);
@@ -1885,7 +1935,7 @@ void BtreeMap::split(TransactionContext &txn, BNode<K, V> &dirtyNode1,
 		else {
 			dirtyParentNode.load(dirtyNode1.getParentOId(), OBJECT_FOR_UPDATE);
 			int32_t parentNodeSize = dirtyParentNode.numkeyValues();
-			if (cmpInternal(txn, *getObjectManager(), middleVal,
+			if (cmpInternal(txn, *getObjectManager(), allocateStrategy_, middleVal,
 					dirtyParentNode.getKeyValue(parentNodeSize - 1), setting) > 0) {
 				dirtyParentNode.setChild(
 					txn, parentNodeSize + 1, dirtyNode2.getSelfOId());
@@ -1894,7 +1944,7 @@ void BtreeMap::split(TransactionContext &txn, BNode<K, V> &dirtyNode1,
 			}
 			else {
 				for (i = 0; i < parentNodeSize; ++i) {
-					if (cmpInternal(txn, *getObjectManager(), middleVal,
+					if (cmpInternal(txn, *getObjectManager(), allocateStrategy_, middleVal,
 							dirtyParentNode.getKeyValue(i), setting) < 0) {
 						for (j = parentNodeSize; j > i; --j) {
 							dirtyParentNode.setKeyValue(
@@ -1934,16 +1984,13 @@ void BtreeMap::merge(TransactionContext &txn, BNode<K, V> &node,
 			allocateStrategy_);  
 
 		if (upIndex > 0) {
-			preSibNode.load(parentNode.getChild(txn, upIndex - 1));
+			preSibNode.load(parentNode.getChild(txn, upIndex - 1), false);
 		}
 		if (preSibNode.getBaseOId() != UNDEF_OID &&
 			preSibNode.numkeyValues() > nodeMinSize_) {
-			getObjectManager()->setDirty(
-				txn.getPartitionId(), node.getSelfOId());
-			getObjectManager()->setDirty(
-				txn.getPartitionId(), preSibNode.getSelfOId());
-			getObjectManager()->setDirty(
-				txn.getPartitionId(), parentNode.getSelfOId());
+			node.setDirty();
+			preSibNode.setDirty();
+			parentNode.setDirty();
 			BNode<K, V> *dirtyNode = &node;
 			BNode<K, V> *dirtyPreSibNode = &preSibNode;
 			BNode<K, V> *dirtyParentNode = &parentNode;
@@ -1971,16 +2018,13 @@ void BtreeMap::merge(TransactionContext &txn, BNode<K, V> &node,
 			BNode<K, V> followSibNode(txn, *getObjectManager(),
 				allocateStrategy_);  
 			if (upIndex < parentNode.numkeyValues()) {
-				followSibNode.load(parentNode.getChild(txn, upIndex + 1));
+				followSibNode.load(parentNode.getChild(txn, upIndex + 1), false);
 			}
 			if (followSibNode.getBaseOId() != UNDEF_OID &&
 				followSibNode.numkeyValues() > nodeMinSize_) {
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), node.getSelfOId());
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), followSibNode.getSelfOId());
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), parentNode.getSelfOId());
+				node.setDirty();
+				followSibNode.setDirty();
+				parentNode.setDirty();
 				BNode<K, V> *dirtyNode = &node;
 				BNode<K, V> *dirtyFollowSibNode = &followSibNode;
 				BNode<K, V> *dirtyParentNode = &parentNode;
@@ -2007,12 +2051,9 @@ void BtreeMap::merge(TransactionContext &txn, BNode<K, V> &node,
 			}
 			else if (preSibNode.getBaseOId() != UNDEF_OID &&
 					 preSibNode.numkeyValues() == nodeMinSize_) {
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), node.getSelfOId());
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), preSibNode.getSelfOId());
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), parentNode.getSelfOId());
+				node.setDirty();
+				preSibNode.setDirty();
+				parentNode.setDirty();
 				BNode<K, V> *dirtyNode = &node;
 				BNode<K, V> *dirtyPreSibNode = &preSibNode;
 				BNode<K, V> *dirtyParentNode = &parentNode;
@@ -2051,12 +2092,9 @@ void BtreeMap::merge(TransactionContext &txn, BNode<K, V> &node,
 			}
 			else if (followSibNode.getBaseOId() != UNDEF_OID &&
 					 followSibNode.numkeyValues() == nodeMinSize_) {
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), node.getSelfOId());
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), followSibNode.getSelfOId());
-				getObjectManager()->setDirty(
-					txn.getPartitionId(), parentNode.getSelfOId());
+				node.setDirty();
+				followSibNode.setDirty();
+				parentNode.setDirty();
 				BNode<K, V> *dirtyNode = &node;
 				BNode<K, V> *dirtyFollowSibNode = &followSibNode;
 				BNode<K, V> *dirtyParentNode = &parentNode;
@@ -2146,8 +2184,8 @@ bool BtreeMap::insertInternal(
 			BNode<K, V> dirtyNewNode(
 				txn, *getObjectManager(), allocateStrategy_);
 			OId newNodeOId;
-			dirtyNewNode.allocate<BNodeImage<K, V> >(getNormalNodeSize<K, V>(getElemSize<K, V>()),
-				allocateStrategy_, newNodeOId, OBJECT_TYPE_BTREE_MAP);
+			dirtyNewNode.template allocate<BNodeImage<K, V> >(getNormalNodeSize<K, V>(getElemSize<K, V>()),
+				newNodeOId, OBJECT_TYPE_BTREE_MAP);
 			dirtyNewNode.initialize(
 				txn, newNodeOId, true, nodeMaxSize_, elemSize_);
 
@@ -2165,8 +2203,8 @@ bool BtreeMap::insertInternal(
 			BNode<K, V> dirtyNode1(txn, *getObjectManager(),
 				allocateStrategy_);  
 			{
-				dirtyNode1.load(getTailNodeOId());
-				if (cmpInput(txn, *getObjectManager(), val,
+				dirtyNode1.load(getTailNodeOId(), false);
+				if (cmpInput(txn, *getObjectManager(), allocateStrategy_, val,
 						dirtyNode1.getKeyValue(dirtyNode1.numkeyValues() - 1), setting) >
 					0) {
 					loc = dirtyNode1.numkeyValues();
@@ -2180,8 +2218,7 @@ bool BtreeMap::insertInternal(
 				}
 			}
 
-			getObjectManager()->setDirty(
-				txn.getPartitionId(), dirtyNode1.getSelfOId());
+			dirtyNode1.setDirty();
 			for (int32_t i = dirtyNode1.numkeyValues(); i > loc; --i) {
 				dirtyNode1.setKeyValue(i, dirtyNode1.getKeyValue(i - 1));
 			}
@@ -2238,8 +2275,7 @@ bool BtreeMap::removeInternal(
 			return false;
 		}
 
-		getObjectManager()->setDirty(
-			txn.getPartitionId(), dirtyUpdateNode.getSelfOId());
+		dirtyUpdateNode.setDirty();
 
 		if (!dirtyUpdateNode.isLeaf()) {
 			BNode<K, V> dirtyUpdateChildNode(txn, *getObjectManager(),
@@ -2248,12 +2284,11 @@ bool BtreeMap::removeInternal(
 
 			while (!dirtyUpdateChildNode.isLeaf()) {
 				dirtyUpdateChildNode.load(dirtyUpdateChildNode.getChild(
-					txn, dirtyUpdateChildNode.numkeyValues()));
+					txn, dirtyUpdateChildNode.numkeyValues()), true);
 			}
-			getObjectManager()->setDirty(
-				txn.getPartitionId(), dirtyUpdateChildNode.getSelfOId());
+			dirtyUpdateChildNode.setDirty();
 
-			dirtyUpdateNode.freeVal(txn, loc);
+			dirtyUpdateNode.freeVal(loc);
 			dirtyUpdateNode.setKeyValue(loc,
 				dirtyUpdateChildNode.getKeyValue(
 					dirtyUpdateChildNode.numkeyValues() - 1));  
@@ -2262,7 +2297,7 @@ bool BtreeMap::removeInternal(
 			dirtyUpdateNode.copyReference(dirtyUpdateChildNode);
 		}
 		else {
-			dirtyUpdateNode.freeVal(txn, loc);
+			dirtyUpdateNode.freeVal(loc);
 		}
 		if (dirtyUpdateNode.isRoot()) {
 			dirtyUpdateNode.removeVal(loc);
@@ -2290,8 +2325,8 @@ bool BtreeMap::removeInternal(
 			BNode<K, V> dirtyNewNode(
 				txn, *getObjectManager(), allocateStrategy_);
 			OId newNodeOId;
-			dirtyNewNode.allocate<BNodeImage<K, V> >(getInitialNodeSize<K, V>(getElemSize<K, V>()),
-				allocateStrategy_, newNodeOId, OBJECT_TYPE_BTREE_MAP);
+			dirtyNewNode.template allocate<BNodeImage<K, V> >(getInitialNodeSize<K, V>(getElemSize<K, V>()),
+				newNodeOId, OBJECT_TYPE_BTREE_MAP);
 			dirtyNewNode.initialize(txn, dirtyNewNode.getBaseOId(), true,
 				getInitialItemSizeThreshold<K, V>(), elemSize_);
 
@@ -2366,9 +2401,7 @@ bool BtreeMap::updateInternal(
 	if (!findNode<P, K, V>(txn, val, dirtyOrgNode, orgLoc, cmpInput, setting)) {
 		return false;
 	}
-	getObjectManager()->setDirty(
-		txn.getPartitionId(), dirtyOrgNode.getSelfOId());
-
+	dirtyOrgNode.setDirty();
 	dirtyOrgNode.setValue(orgLoc, newValue);
 
 	return true;
@@ -2493,18 +2526,18 @@ int32_t BtreeMap::find(TransactionContext &txn, SearchContext &sc,
 	}
 	else {
 		if (outputOrder != ORDER_DESCENDING) {
-			isSuspend = getAllByAscending<K, V, R>(
-				txn, sc.getLimit(), idList, suspendLimit, suspendKeyValue);
+			isSuspend = getAllByAscending<P, K, V, R>(
+				txn, sc.getLimit(), idList, suspendLimit, suspendKeyValue, setting);
 		}
 		else {
-			isSuspend = getAllByDescending<K, V, R>(
-				txn, sc.getLimit(), idList, suspendLimit, suspendKeyValue);
+			isSuspend = getAllByDescending<P, K, V, R>(
+				txn, sc.getLimit(), idList, suspendLimit, suspendKeyValue, setting);
 		}
 	}
 	if (isSuspend) {
 		typedef typename MapKeyTraits<K>::TYPE T;
 		sc.setSuspended(true);
-		sc.setSuspendPoint<T, V>(txn, *getObjectManager(), getFuncInfo(),
+		sc.setSuspendPoint<T, V>(txn, *getObjectManager(), allocateStrategy_, getFuncInfo(),
 			suspendKeyValue.key_, suspendKeyValue.value_);
 	}
 	else {
@@ -2543,7 +2576,7 @@ bool BtreeMap::findLess(TransactionContext &txn, KeyValue<P, V> &keyValue, int32
 	}
 	while (true) {
 		KeyValue<K, V> currentVal = node.getKeyValue(loc);
-		if (cmpFuncRight(txn, *getObjectManager(), currentVal, keyValue, 
+		if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, currentVal, keyValue,
 			setting) <	isIncluded) {
 			if (!isComposite<P>() || isMatch(txn, *getObjectManager(), currentVal, setting))
 			pushResultList<K, V, R>(currentVal, result);
@@ -2555,7 +2588,7 @@ bool BtreeMap::findLess(TransactionContext &txn, KeyValue<P, V> &keyValue, int32
 			break;
 		}
 		if (result.size() >= suspendLimit) {
-			if (cmpFuncRight(txn, *getObjectManager(), node.getKeyValue(loc),
+			if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, node.getKeyValue(loc),
 					keyValue, setting) < isIncluded) {
 				isSuspend = true;
 				suspendKeyValue = node.getKeyValue(loc);
@@ -2600,7 +2633,7 @@ bool BtreeMap::findLessByDescending(
 	else {
 		while (isIncluded) {
 			if (cmpFuncLeft(
-					txn, *getObjectManager(), keyValue, node.getKeyValue(loc), setting) < 0) {
+					txn, *getObjectManager(), allocateStrategy_, keyValue, node.getKeyValue(loc), setting) < 0) {
 				break;
 			}
 			if (!nextPos(txn, node, loc)) {
@@ -2615,7 +2648,7 @@ bool BtreeMap::findLessByDescending(
 				pushResultList<K, V, R>(currentVal, result);
 			}
 			else {
-				if (cmpFuncRight(txn, *getObjectManager(), currentVal, keyValue, setting) <
+				if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, currentVal, keyValue, setting) <
 					isIncluded) {
 					if (!isComposite<P>() || isMatch(txn, *getObjectManager(), currentVal, setting))
 					pushResultList<K, V, R>(currentVal, result);
@@ -2671,7 +2704,7 @@ bool BtreeMap::findGreater(
 		}
 		else {
 			while (isIncluded) {
-				if (cmpFuncLeft(txn, *getObjectManager(), keyValue,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, keyValue,
 						node.getKeyValue(loc), setting) > 0) {
 					break;
 				}
@@ -2688,7 +2721,7 @@ bool BtreeMap::findGreater(
 				pushResultList<K, V, R>(currentVal, result);
 			}
 			else {
-				if (cmpFuncLeft(txn, *getObjectManager(), keyValue, currentVal,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, keyValue, currentVal,
 					setting) < isIncluded) {
 					if (!isComposite<P>() || isMatch(txn, *getObjectManager(), currentVal, setting))
 					pushResultList<K, V, R>(currentVal, result);
@@ -2724,14 +2757,14 @@ bool BtreeMap::findGreaterByDescending(
 		return isSuspend;
 	}
 	else {
-		node.load(getTailNodeOId());
+		node.load(getTailNodeOId(), false);
 		loc = node.numkeyValues() - 1;
 	}
 	if (getBtreeMapType() == TYPE_UNIQUE_RANGE_KEY) {
 		int32_t ret, prevRet = -1;
 		while (true) {
 			KeyValue<K, V> currentVal = node.getKeyValue(loc);
-			ret = cmpFuncLeft(txn, *getObjectManager(), keyValue, currentVal, 
+			ret = cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, keyValue, currentVal,
 				setting);
 			if (ret < isIncluded) {
 				pushResultList<K, V, R>(currentVal, result);
@@ -2756,7 +2789,7 @@ bool BtreeMap::findGreaterByDescending(
 	else {
 		while (true) {
 			KeyValue<K, V> currentVal = node.getKeyValue(loc);
-			if (cmpFuncLeft(txn, *getObjectManager(), keyValue, currentVal,
+			if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, keyValue, currentVal,
 				setting) < isIncluded) {
 				if (!isComposite<P>() || isMatch(txn, *getObjectManager(), currentVal, setting))
 				pushResultList<K, V, R>(node.getKeyValue(loc), result);
@@ -2768,7 +2801,7 @@ bool BtreeMap::findGreaterByDescending(
 				break;
 			}
 			if (result.size() >= suspendLimit) {
-				if (cmpFuncLeft(txn, *getObjectManager(), keyValue,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, keyValue,
 						node.getKeyValue(loc), setting) < isIncluded) {
 					isSuspend = true;
 					suspendKeyValue = node.getKeyValue(loc);
@@ -2803,7 +2836,7 @@ bool BtreeMap::findRange(
 		setting.setCompareNum(setting.getLessCompareNum());
 		while (true) {
 			KeyValue<K, V> currentVal = node.getKeyValue(loc);
-			if (cmpFuncRight(txn, *getObjectManager(), currentVal, endKeyValue, 
+			if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, currentVal, endKeyValue,
 					setting) < isEndIncluded) {
 				pushResultList<K, V, R>(currentVal, result);
 			}
@@ -2828,7 +2861,7 @@ bool BtreeMap::findRange(
 		else {
 			setting.setCompareNum(setting.getGreaterCompareNum());
 			while (isStartIncluded) {
-				if (cmpFuncLeft(txn, *getObjectManager(), startKeyValue,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, startKeyValue,
 						node.getKeyValue(loc), setting) > 0) {
 					break;
 				}
@@ -2842,7 +2875,7 @@ bool BtreeMap::findRange(
 			KeyValue<K, V> currentVal = node.getKeyValue(loc);
 			if (start) {
 				setting.setCompareNum(setting.getLessCompareNum());
-				if (cmpFuncRight(txn, *getObjectManager(), currentVal, endKeyValue,
+				if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, currentVal, endKeyValue,
 						setting) < isEndIncluded) {
 					if (!isComposite<P>() || 
 						isMatch(txn, *getObjectManager(), currentVal, setting))
@@ -2854,10 +2887,10 @@ bool BtreeMap::findRange(
 			}
 			else {
 				setting.setCompareNum(setting.getGreaterCompareNum());
-				if (cmpFuncLeft(txn, *getObjectManager(), startKeyValue, currentVal,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, startKeyValue, currentVal,
 						setting) < isStartIncluded) {
 					setting.setCompareNum(setting.getLessCompareNum());
-					if (cmpFuncRight(txn, *getObjectManager(), currentVal,
+					if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, currentVal,
 							endKeyValue, setting) < isEndIncluded) {
 						if (!isComposite<P>() || 
 							isMatch(txn, *getObjectManager(), currentVal, setting))
@@ -2875,7 +2908,7 @@ bool BtreeMap::findRange(
 			}
 			if (result.size() >= suspendLimit) {
 				setting.setCompareNum(setting.getLessCompareNum());
-				if (cmpFuncRight(txn, *getObjectManager(), node.getKeyValue(loc),
+				if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, node.getKeyValue(loc),
 						endKeyValue, setting) < isEndIncluded) {
 					isSuspend = true;
 					suspendKeyValue = node.getKeyValue(loc);
@@ -2913,7 +2946,7 @@ bool BtreeMap::findRangeByDescending(
 			if (start) {
 				setting.setCompareNum(setting.getGreaterCompareNum());
 				ret =
-					cmpFuncLeft(txn, *getObjectManager(), startKeyValue, currentVal, setting);
+					cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, startKeyValue, currentVal, setting);
 				if (ret < isStartIncluded) {
 					if (!isComposite<P>() || 
 						isMatch(txn, *getObjectManager(), currentVal, setting))
@@ -2931,11 +2964,11 @@ bool BtreeMap::findRangeByDescending(
 			}
 			else {
 				setting.setCompareNum(setting.getLessCompareNum());
-				if (cmpFuncRight(txn, *getObjectManager(), currentVal, endKeyValue, 
+				if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, currentVal, endKeyValue,
 						setting) < isEndIncluded) {
 					setting.setCompareNum(setting.getGreaterCompareNum());
 					ret =
-						cmpFuncLeft(txn, *getObjectManager(), startKeyValue, currentVal, setting);
+						cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, startKeyValue, currentVal, setting);
 					if (ret < isStartIncluded) {
 						if (!isComposite<P>() || 
 							isMatch(txn, *getObjectManager(), currentVal, setting))
@@ -2971,7 +3004,7 @@ bool BtreeMap::findRangeByDescending(
 		else {
 			setting.setCompareNum(setting.getLessCompareNum());
 			while (isEndIncluded) {
-				if (cmpFuncLeft(txn, *getObjectManager(), endKeyValue,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, endKeyValue,
 						node.getKeyValue(loc), setting) < 0) {
 					break;
 				}
@@ -2985,7 +3018,7 @@ bool BtreeMap::findRangeByDescending(
 			KeyValue<K, V> currentVal = node.getKeyValue(loc);
 			if (start) {
 				setting.setCompareNum(setting.getGreaterCompareNum());
-				if (cmpFuncLeft(txn, *getObjectManager(), startKeyValue, currentVal,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, startKeyValue, currentVal,
 						setting) < isStartIncluded) {
 					if (!isComposite<P>() || 
 						isMatch(txn, *getObjectManager(), currentVal, setting))
@@ -2997,10 +3030,10 @@ bool BtreeMap::findRangeByDescending(
 			}
 			else {
 				setting.setCompareNum(setting.getLessCompareNum());
-				if (cmpFuncRight(txn, *getObjectManager(), currentVal, endKeyValue,
+				if (cmpFuncRight(txn, *getObjectManager(), allocateStrategy_, currentVal, endKeyValue,
 						setting) < isEndIncluded) {
 					setting.setCompareNum(setting.getGreaterCompareNum());
-					if (cmpFuncLeft(txn, *getObjectManager(), startKeyValue, currentVal,
+					if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, startKeyValue, currentVal,
 							setting) < isStartIncluded) {
 						if (!isComposite<P>() || 
 							isMatch(txn, *getObjectManager(), currentVal, setting))
@@ -3017,7 +3050,7 @@ bool BtreeMap::findRangeByDescending(
 			}
 			if (result.size() >= suspendLimit) {
 				setting.setCompareNum(setting.getGreaterCompareNum());
-				if (cmpFuncLeft(txn, *getObjectManager(), startKeyValue,
+				if (cmpFuncLeft(txn, *getObjectManager(), allocateStrategy_, startKeyValue,
 						node.getKeyValue(loc), setting) < isStartIncluded) {
 					isSuspend = true;
 					suspendKeyValue = node.getKeyValue(loc);
@@ -3035,7 +3068,7 @@ inline std::string BtreeMap::BNode<StringKey, OId>::dump(
 	util::NormalOStringStream out;
 	out << "(@@Node@@)";
 	for (int32_t i = 0; i < numkeyValues(); ++i) {
-		StringCursor obj(txn, *getObjectManager(), getKeyValue(i).key_.oId_);
+		StringCursor obj(*getObjectManager(), allocateStrategy_, getKeyValue(i).key_.oId_);
 		util::NormalString tmp(
 			reinterpret_cast<const char *>(obj.str()), obj.stringLength());
 		out << "[" << tmp << "," << getKeyValue(i).value_ << "], ";
@@ -3049,10 +3082,25 @@ inline std::string BtreeMap::BNode<FullContainerKeyAddr, OId>::dump(
 	util::NormalOStringStream out;
 	out << "(@@Node@@)";
 	for (int32_t i = 0; i < numkeyValues(); ++i) {
-		StringCursor obj(txn, *getObjectManager(), getKeyValue(i).key_.oId_);
+		StringCursor obj(*getObjectManager(), allocateStrategy_, getKeyValue(i).key_.oId_);
 		util::NormalString tmp(
 			reinterpret_cast<const char *>(obj.str()), obj.stringLength());
 		out << "[" << tmp << "," << getKeyValue(i).value_ << "], ";
+	}
+	return out.str();
+}
+
+template <>
+inline std::string BtreeMap::BNode<FullContainerKeyAddr, KeyDataStoreValue>::dump(
+	TransactionContext& txn) {
+	util::NormalOStringStream out;
+	out << "(@@Node@@)";
+	for (int32_t i = 0; i < numkeyValues(); ++i) {
+		FullContainerKeyCursor obj(*getObjectManager(),
+			allocateStrategy_, getKeyValue(i).key_.oId_);
+		util::String str(txn.getDefaultAllocator());
+		obj.getKey().toString(txn.getDefaultAllocator(), str);
+		out << "[" << str.c_str() << "," << getKeyValue(i).value_ << "], ";
 	}
 	return out.str();
 }
@@ -3068,7 +3116,7 @@ int32_t BtreeMap::initialize(TransactionContext &txn, ColumnType columnType,
 	btreeMapType_ = btreeMapType;
 
 	BaseObject::allocate<BNodeImage<K, V> >(getInitialNodeSize<K, V>(sizeof(KeyValue<K, V>)),
-		allocateStrategy_, getBaseOId(), OBJECT_TYPE_BTREE_MAP);
+		getBaseOId(), OBJECT_TYPE_BTREE_MAP);
 	BNode<K, V> rootNode(this, allocateStrategy_);
 	rootNode.initialize(txn, getBaseOId(), true,
 		getInitialItemSizeThreshold<K, V>(), elemSize_);
@@ -3085,6 +3133,12 @@ inline int32_t BtreeMap::insert
 	FullContainerKeyObject convertKey(&key);
 	return insertInternal<FullContainerKeyObject, FullContainerKeyAddr, OId>(txn, convertKey, value, isCaseSensitive);
 }
+template <>
+inline int32_t BtreeMap::insert
+	(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& value, bool isCaseSensitive) {
+	FullContainerKeyObject convertKey(&key);
+	return insertInternal<FullContainerKeyObject, FullContainerKeyAddr, KeyDataStoreValue>(txn, convertKey, value, isCaseSensitive);
+}
 template <typename K, typename V>
 inline int32_t BtreeMap::insert(TransactionContext &txn, K &key, V &value, bool isCaseSensitive) {
 	return insertInternal<K, K, V>(txn, key, value, isCaseSensitive);
@@ -3093,6 +3147,11 @@ template <>
 inline int32_t BtreeMap::remove(TransactionContext &txn, FullContainerKeyCursor &key, OId &value, bool isCaseSensitive) {
 	FullContainerKeyObject convertKey(&key);
 	return removeInternal<FullContainerKeyObject, FullContainerKeyAddr, OId>(txn, convertKey, value, isCaseSensitive);
+}
+template <>
+inline int32_t BtreeMap::remove(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& value, bool isCaseSensitive) {
+	FullContainerKeyObject convertKey(&key);
+	return removeInternal<FullContainerKeyObject, FullContainerKeyAddr, KeyDataStoreValue>(txn, convertKey, value, isCaseSensitive);
 }
 template <typename K, typename V>
 inline int32_t BtreeMap::remove(TransactionContext &txn, K &key, V &value, bool isCaseSensitive) {
@@ -3103,6 +3162,13 @@ inline int32_t BtreeMap::update(TransactionContext &txn, FullContainerKeyCursor 
 	FullContainerKeyObject convertKey(&key);
 	return updateInternal<FullContainerKeyObject, FullContainerKeyAddr, OId>(txn, convertKey, oldValue, newValue, isCaseSensitive);
 }
+
+template <>
+inline int32_t BtreeMap::update(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& oldValue, KeyDataStoreValue& newValue, bool isCaseSensitive) {
+	FullContainerKeyObject convertKey(&key);
+	return updateInternal<FullContainerKeyObject, FullContainerKeyAddr, KeyDataStoreValue>(txn, convertKey, oldValue, newValue, isCaseSensitive);
+}
+
 template <typename K, typename V>
 inline int32_t BtreeMap::update(
 	TransactionContext &txn, K &key, V &oldValue, V &newValue, bool isCaseSensitive) {
@@ -3117,6 +3183,24 @@ inline int32_t BtreeMap::search<FullContainerKeyCursor, OId, OId>(TransactionCon
 	}
 	Setting setting(getKeyType(), isCaseSensitive, getFuncInfo());
 	return find<FullContainerKeyObject, FullContainerKeyAddr, OId, KEY_COMPONENT>(txn, convertKey, retVal, setting);
+}
+
+
+template <>
+inline int32_t BtreeMap::search<FullContainerKeyCursor, KeyDataStoreValue, KeyDataStoreValue>(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& retVal, bool isCaseSensitive) {
+	FullContainerKeyObject convertKey(&key);
+	if (isEmpty()) {
+		return GS_FAIL;
+	}
+	Setting setting(getKeyType(), isCaseSensitive, getFuncInfo());
+	return find<FullContainerKeyObject, FullContainerKeyAddr, KeyDataStoreValue, KEY_COMPONENT>(txn, convertKey, retVal, setting);
+}
+
+template <>
+inline std::string BtreeMap::dump<FullContainerKeyAddr, KeyDataStoreValue>(TransactionContext& txn) {
+	util::NormalOStringStream out;
+	print<FullContainerKeyAddr, KeyDataStoreValue>(txn, out, getRootOId());
+	return out.str();
 }
 
 template <typename K, typename V, typename R>
@@ -3141,6 +3225,20 @@ inline int32_t BtreeMap::search<FullContainerKeyCursor, OId, OId>(TransactionCon
 		return find<FullContainerKeyObject, FullContainerKeyAddr, OId, OId, KEY_VALUE_COMPONENT>(txn, sc, idList, outputOrder);
 	} else {
 		return find<FullContainerKeyObject, FullContainerKeyAddr, OId, OId, KEY_COMPONENT>(txn, sc, idList, outputOrder);
+	}
+}
+
+template <>
+inline int32_t BtreeMap::search<FullContainerKeyCursor, KeyDataStoreValue, KeyDataStoreValue>(TransactionContext& txn, SearchContext& sc,
+	util::XArray<KeyDataStoreValue>& idList, OutputOrder outputOrder) {
+	if (isEmpty()) {
+		return GS_FAIL;
+	}
+	if (sc.getSuspendValue() != NULL) {
+		return find<FullContainerKeyObject, FullContainerKeyAddr, KeyDataStoreValue, KeyDataStoreValue, KEY_VALUE_COMPONENT>(txn, sc, idList, outputOrder);
+	}
+	else {
+		return find<FullContainerKeyObject, FullContainerKeyAddr, KeyDataStoreValue, KeyDataStoreValue, KEY_COMPONENT>(txn, sc, idList, outputOrder);
 	}
 }
 
@@ -3196,6 +3294,30 @@ int32_t BtreeMap::search<FullContainerKeyCursor, OId, OId>(TransactionContext &t
 template <>
 int32_t BtreeMap::search<FullContainerKeyCursor, OId, OId>(TransactionContext &txn, SearchContext &sc, util::XArray<OId> &idList, OutputOrder outputOrder);
 
+template <>
+int32_t BtreeMap::initialize<FullContainerKeyCursor, KeyDataStoreValue>(TransactionContext& txn, ColumnType columnType,
+	bool isUnique, BtreeMapType btreeMapType, uint32_t elemSize);
+template <>
+int32_t BtreeMap::insert< FullContainerKeyCursor, KeyDataStoreValue>
+(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& value, bool isCaseSensitive);
+
+template <>
+int32_t BtreeMap::remove<FullContainerKeyCursor, KeyDataStoreValue>
+(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& value, bool isCaseSensitive);
+
+template <>
+int32_t BtreeMap::update<FullContainerKeyCursor, KeyDataStoreValue>
+(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& oldValue, KeyDataStoreValue& newValue, bool isCaseSensitive);
+
+template <>
+int32_t BtreeMap::search<FullContainerKeyCursor, KeyDataStoreValue, KeyDataStoreValue>(TransactionContext& txn, FullContainerKeyCursor& key, KeyDataStoreValue& retVal, bool isCaseSensitive);
+
+template <>
+int32_t BtreeMap::search<FullContainerKeyCursor, KeyDataStoreValue, KeyDataStoreValue>(TransactionContext& txn, SearchContext& sc, util::XArray<KeyDataStoreValue>& idList, OutputOrder outputOrder);
+
+template <>
+std::string BtreeMap::dump<FullContainerKeyCursor, KeyDataStoreValue>(TransactionContext& txn);
+
 template <typename K, typename V>
 int32_t BtreeMap::getInitialItemSizeThreshold() {
 	return INITIAL_DEFAULT_ITEM_SIZE_THRESHOLD;
@@ -3203,44 +3325,43 @@ int32_t BtreeMap::getInitialItemSizeThreshold() {
 template <>
 int32_t BtreeMap::getInitialItemSizeThreshold<TransactionId, MvccRowImage>();
 
-
 inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-	ObjectManager &objectManager, const StringObject &e1,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const StringObject &e1,
 	const StringKey &e2, Setting &) {
 	StringCursor *obj1 = reinterpret_cast<StringCursor *>(e1.ptr_);
-	StringCursor obj2(txn, objectManager, e2.oId_);
+	StringCursor obj2(objectManager, strategy, e2.oId_);
 	return compareStringString(txn, obj1->str(), obj1->stringLength(),
 		obj2.str(), obj2.stringLength());
 }
 
 inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-	ObjectManager &objectManager, const StringKey &e1,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const StringKey &e1,
 	const StringObject &e2, Setting &) {
-	StringCursor obj1(txn, objectManager, e1.oId_);
+	StringCursor obj1(objectManager, strategy, e1.oId_);
 	StringCursor *obj2 = reinterpret_cast<StringCursor *>(e2.ptr_);
 	return compareStringString(txn, obj1.str(), obj1.stringLength(),
 		obj2->str(), obj2->stringLength());
 }
 
 inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-	ObjectManager &objectManager, const FullContainerKeyObject &e1,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const FullContainerKeyObject &e1,
 	const FullContainerKeyAddr &e2, Setting &setting) {
 	const FullContainerKeyCursor *obj1 = reinterpret_cast<const FullContainerKeyCursor *>(e1.ptr_);
-	FullContainerKeyCursor obj2(txn, objectManager, e2.oId_);
+	FullContainerKeyCursor obj2(objectManager, strategy, e2.oId_);
 	return FullContainerKey::compareTo(txn, obj1->getKeyBody(), obj2.getKeyBody(), setting.isCaseSensitive());
 }
 
 inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-	ObjectManager &objectManager, const FullContainerKeyAddr &e1,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const FullContainerKeyAddr &e1,
 	const FullContainerKeyObject &e2, Setting &setting) {
-	FullContainerKeyCursor obj1(txn, objectManager, e1.oId_);
+	FullContainerKeyCursor obj1(objectManager, strategy, e1.oId_);
 	const FullContainerKeyCursor *obj2 = reinterpret_cast<const FullContainerKeyCursor *>(e2.ptr_);
 
 	return FullContainerKey::compareTo(txn, obj1.getKeyBody(), obj2->getKeyBody(), setting.isCaseSensitive());
 }
 
 template <typename K>
-inline int32_t BtreeMap::keyCmp(TransactionContext &txn, ObjectManager &objectManager,
+inline int32_t BtreeMap::keyCmp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	const K &e1, const K &e2, Setting &) {
 	UTIL_STATIC_ASSERT((!util::IsSame<K, StringKey>::VALUE));
 	UTIL_STATIC_ASSERT((!util::IsSame<K, StringObject>::VALUE));
@@ -3257,10 +3378,10 @@ inline int32_t BtreeMap::keyCmp(TransactionContext &txn, ObjectManager &objectMa
 
 template <>
 inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-	ObjectManager &objectManager, const StringKey &e1,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const StringKey &e1,
 	const StringKey &e2, Setting &) {
-	StringCursor obj1(txn, objectManager, e1.oId_);
-	StringCursor obj2(txn, objectManager, e2.oId_);
+	StringCursor obj1(objectManager, strategy, e1.oId_);
+	StringCursor obj2(objectManager, strategy, e2.oId_);
 	return compareStringString(
 		txn, obj1.str(), obj1.stringLength(), obj2.str(), obj2.stringLength());
 }
@@ -3268,17 +3389,17 @@ inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
 
 template <>
 inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-	ObjectManager &objectManager, const FullContainerKeyAddr &e1,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const FullContainerKeyAddr &e1,
 	const FullContainerKeyAddr &e2, Setting &setting) {
 
-	FullContainerKeyCursor obj1(txn, objectManager, e1.oId_);
-	FullContainerKeyCursor obj2(txn, objectManager, e2.oId_);
+	FullContainerKeyCursor obj1(objectManager, strategy, e1.oId_);
+	FullContainerKeyCursor obj2(objectManager, strategy, e2.oId_);
 
 	return FullContainerKey::compareTo(txn, obj1.getKeyBody(), obj2.getKeyBody(), setting.isCaseSensitive());
 }
 
 template <>
-inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManager &,
+inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManagerV4 &, AllocateStrategy &,
 	const double &e1, const double &e2, Setting &) {
 	if (util::isNaN(e1)) {
 		if (util::isNaN(e2)) {
@@ -3297,7 +3418,7 @@ inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManager &,
 }
 
 template <>
-inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManager &,
+inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManagerV4 &, AllocateStrategy &,
 	const float &e1, const float &e2, Setting &) {
 	if (util::isNaN(e1)) {
 		if (util::isNaN(e2)) {
@@ -3318,7 +3439,7 @@ inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManager &,
 
 
 template <typename S>
-inline bool BtreeMap::compositeInfoMatch(TransactionContext &txn, ObjectManager &objectManager,
+bool BtreeMap::compositeInfoMatch(TransactionContext &txn, ObjectManagerV4 &objectManager,
 	const S *e, BaseIndex::Setting &setting) {
 	UNUSED_VARIABLE(txn);
 	UNUSED_VARIABLE(objectManager);
@@ -3328,35 +3449,35 @@ inline bool BtreeMap::compositeInfoMatch(TransactionContext &txn, ObjectManager 
 }
 
 template <>
-inline int32_t BtreeMap::keyCmp(TransactionContext &txn, ObjectManager &objectManager,
+inline int32_t BtreeMap::keyCmp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	const CompositeInfoObject &e1, const CompositeInfoObject &e2, Setting &setting) {
-	return compositeInfoCmp(txn, objectManager, &e1, &e2, setting);
+	return compositeInfoCmp(txn, objectManager, strategy, &e1, &e2, setting);
 }
 
 	template <>
-	inline bool BtreeMap::compositeInfoMatch(TransactionContext &txn, ObjectManager &objectManager,
+	bool BtreeMap::compositeInfoMatch(TransactionContext &txn, ObjectManagerV4 &objectManager,
 		const CompositeInfoObject *e, BaseIndex::Setting &setting);
 
 
 	template <>
 	inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-		ObjectManager &objectManager, const StringKey &e1,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const StringKey &e1,
 		const StringKey &e2, BaseIndex::Setting &);
 	template <>
 	inline int32_t BtreeMap::keyCmp(TransactionContext &txn,
-		ObjectManager &objectManager, const FullContainerKeyAddr &e1,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, const FullContainerKeyAddr &e1,
 		const FullContainerKeyAddr &e2, BaseIndex::Setting &setting);
 
 	template <>
-	inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManager &,
+	inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManagerV4 &, AllocateStrategy &,
 		const double &e1, const double &e2, BaseIndex::Setting &);
 
 	template <>
-	inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManager &,
+	inline int32_t BtreeMap::keyCmp(TransactionContext &, ObjectManagerV4 &, AllocateStrategy &,
 		const float &e1, const float &e2, BaseIndex::Setting &);
 
 	template <>
-	inline int32_t BtreeMap::keyCmp(TransactionContext &txn, ObjectManager &objectManager,
+	inline int32_t BtreeMap::keyCmp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		const CompositeInfoObject &e1, const CompositeInfoObject &e2, BaseIndex::Setting &setting);
 
 #endif  

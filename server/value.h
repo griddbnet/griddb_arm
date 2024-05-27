@@ -65,17 +65,22 @@ private:
 		float float_;
 		double double_;
 		Timestamp timestamp_;
+		MicroTimestamp microTimestamp_;
+		NanoTimestamp nanoTimestamp_;
 		Object object_;  
 	};
 	Member data_;
-	static const uint8_t defalutFixedValue_[8];
-	static const uint8_t defalutStringValue_[1];
-	static const uint8_t defalutFixedArrayValue_[2];
-	static const uint8_t defalutStringArrayValue_[13];
-	static const uint8_t defalutBlobValue_[2];
-	static const uint8_t defalutGeometryValue_[7];
+	static const uint8_t defaultFixedValue_[8];
+	static const uint8_t defaultStringValue_[1];
+	static const uint8_t defaultFixedArrayValue_[2];
+	static const uint8_t defaultStringArrayValue_[13];
+	static const uint8_t defaultBlobValue_[2];
+	static const uint8_t defaultGeometryValue_[7];
 
 public:
+	class Pool;
+	typedef util::XArray<uint8_t> Buffer;
+
 	Value() : type_(COLUMN_TYPE_STRING) {
 		data_.object_.set(NULL, false);
 	}
@@ -99,6 +104,14 @@ public:
 	}
 	explicit Value(double d) : type_(COLUMN_TYPE_DOUBLE) {
 		data_.double_ = d;
+	}
+	explicit Value(const MicroTimestamp &ts) :
+			type_(COLUMN_TYPE_MICRO_TIMESTAMP) {
+		data_.microTimestamp_ = ts;
+	}
+	explicit Value(const NanoTimestamp &ts) :
+			type_(COLUMN_TYPE_NANO_TIMESTAMP) {
+		data_.nanoTimestamp_ = ts;
 	}
 	/*!
 		@brief Set string value
@@ -170,45 +183,64 @@ public:
 		@brief Set string value
 		@note convert to RowMessage/RowObject string format
 	*/
-	inline void set(util::StackAllocator &alloc, char *s) {
-		type_ = COLUMN_TYPE_STRING;
-		uint32_t strSize = static_cast<uint32_t>(strlen(s));
-		uint64_t encodedSize = ValueProcessor::encodeVarSize(strSize);
-		uint32_t sizeLen = ValueProcessor::getEncodedVarSize(strSize);
-		char *target =
-			reinterpret_cast<char *>(alloc.allocate(sizeLen + strSize));
-		memcpy(target, &encodedSize, sizeLen);
-		memcpy(target + sizeLen, s, strSize);
-		data_.object_.set(target, false);
+	inline void set(util::StackAllocator &alloc, const char8_t *s) {
+		const uint32_t strSize = static_cast<uint32_t>(strlen(s));
+		setString(alloc, s, strSize);
 	}
+
 	/*!
 		@brief Set string value
 		@note convert to RowMessage/RowObject string format
 	*/
-	inline void set(util::StackAllocator &alloc, char *s,
-		uint32_t strSize) {  
+	inline void set(
+			util::StackAllocator &alloc, const char8_t *s, uint32_t strSize) {
+		setString(alloc, s, strSize);
+	}
+
+	template<typename A>
+	inline void setString(A &alloc, const char8_t *s, uint32_t strSize) {
 		type_ = COLUMN_TYPE_STRING;
-		uint64_t encodedSize = ValueProcessor::encodeVarSize(strSize);
-		uint32_t sizeLen = ValueProcessor::getEncodedVarSize(strSize);
-		char *target =
-			reinterpret_cast<char *>(alloc.allocate(sizeLen + strSize));
+		const uint64_t encodedSize = ValueProcessor::encodeVarSize(strSize);
+		const uint32_t sizeLen = ValueProcessor::getEncodedVarSize(strSize);
+		char8_t *target =
+				static_cast<char8_t*>(allocateBuffer(alloc, sizeLen + strSize));
 		memcpy(target, &encodedSize, sizeLen);
 		memcpy(target + sizeLen, s, strSize);
 		data_.object_.set(target, false);
 	}
+
 	inline void setTimestamp(Timestamp i) {
 		type_ = COLUMN_TYPE_TIMESTAMP;
 		data_.timestamp_ = i;
 	}
+	inline void setMicroTimestamp(const MicroTimestamp &i) {
+		type_ = COLUMN_TYPE_MICRO_TIMESTAMP;
+		data_.microTimestamp_ = i;
+	}
+	inline void setNanoTimestamp(const NanoTimestamp &i) {
+		type_ = COLUMN_TYPE_NANO_TIMESTAMP;
+		data_.nanoTimestamp_ = i;
+	}
 
-	void copy(TransactionContext &txn, ObjectManager &objectManager,
+	void copy(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		const Value &srcValue);
+
+	void copyFixedValue(const Value &srcValue) {
+		const ColumnType srcType = srcValue.type_;
+		type_ = srcType;
+
+		assert(ValueProcessor::isSimple(srcType));
+		const size_t fixedSize = FixedSizeOfColumnType[srcType];
+
+		assert(srcValue.size() == fixedSize);
+		memcpy(&data_, &srcValue.data_, fixedSize);
+	}
 
 
 	/*!
 		@brief Get value pointer
 		@note string and geometry type return head of string and head of
-	   geometry-bainary
+	   geometry-binary
 	*/
 	UTIL_FORCEINLINE const uint8_t *data() const {
 		switch (type_) {
@@ -220,6 +252,8 @@ public:
 		case COLUMN_TYPE_FLOAT:
 		case COLUMN_TYPE_DOUBLE:
 		case COLUMN_TYPE_TIMESTAMP:
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+		case COLUMN_TYPE_NANO_TIMESTAMP:
 		case COLUMN_TYPE_OID:
 			return reinterpret_cast<const uint8_t *>(&data_);
 			break;
@@ -267,7 +301,7 @@ public:
 	}
 	/*!
 		@brief Get value size
-		@note string and geometry type return string-length and geometry-bainary
+		@note string and geometry type return string-length and geometry-binary
 	   length
 	*/
 	UTIL_FORCEINLINE uint32_t size() const {
@@ -281,6 +315,8 @@ public:
 		case COLUMN_TYPE_FLOAT:
 		case COLUMN_TYPE_DOUBLE:
 		case COLUMN_TYPE_TIMESTAMP:
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+		case COLUMN_TYPE_NANO_TIMESTAMP:
 		case COLUMN_TYPE_OID:
 			size = FixedSizeOfColumnType[type_];
 			break;
@@ -314,9 +350,12 @@ public:
 		case COLUMN_TYPE_TIMESTAMP_ARRAY: {
 			if (data_.object_.value_ != NULL) {
 				const ArrayObject arrayObject(reinterpret_cast<uint8_t *>(
-					const_cast<void *>(data_.object_.value_)));
-				size = arrayObject.getObjectSize(arrayObject.getArrayLength(),
-					FixedSizeOfColumnType[ValueProcessor::getSimpleColumnType(type_)]);
+						const_cast<void *>(data_.object_.value_)));
+				const ColumnType elemType =
+						ValueProcessor::getArrayElementType(type_);
+				size = arrayObject.getObjectSize(
+						arrayObject.getArrayLength(),
+						FixedSizeOfColumnType[elemType]);
 			}
 		} break;
 		case COLUMN_TYPE_NULL:
@@ -343,6 +382,8 @@ public:
 		case COLUMN_TYPE_FLOAT:
 		case COLUMN_TYPE_DOUBLE:
 		case COLUMN_TYPE_TIMESTAMP:
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+		case COLUMN_TYPE_NANO_TIMESTAMP:
 		case COLUMN_TYPE_OID:
 			return reinterpret_cast<const uint8_t *>(&data_);
 			break;
@@ -389,6 +430,8 @@ public:
 		case COLUMN_TYPE_FLOAT:
 		case COLUMN_TYPE_DOUBLE:
 		case COLUMN_TYPE_TIMESTAMP:
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+		case COLUMN_TYPE_NANO_TIMESTAMP:
 		case COLUMN_TYPE_OID:
 			memset(&data_, 0, FixedSizeOfColumnType[type_]);
 			break;
@@ -495,12 +538,21 @@ public:
 		return ValueProcessor::getTimestamp(type_, data());
 	}
 
+	MicroTimestamp getMicroTimestamp() const {
+		return ValueProcessor::getMicroTimestamp(type_, data());
+	}
+
+	NanoTimestamp getNanoTimestamp() const {
+		return ValueProcessor::getNanoTimestamp(type_, data());
+	}
+
+
 
 	/*!
 		@brief Get array length
 	*/
 	uint32_t getArrayLength(
-		TransactionContext &txn, ObjectManager &objectManager) const {
+		TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) const {
 		if ((!isArray()) || (data_.object_.value_ == NULL)) return 0;
 		switch (type_) {
 		case COLUMN_TYPE_STRING_ARRAY: {
@@ -512,7 +564,7 @@ public:
 			const OId *oId = reinterpret_cast<const OId *>(addr);
 			if (*oId != UNDEF_OID) {
 				VariableArrayCursor arrayCursor(
-					txn, objectManager, *oId, OBJECT_READ_ONLY);
+					objectManager, strategy, *oId, OBJECT_READ_ONLY);
 				return arrayCursor.getArrayLength();
 			}
 			else {
@@ -541,7 +593,7 @@ public:
 			break;
 		}
 	}
-	void getArrayElement(TransactionContext &txn, ObjectManager &objectManager,
+	void getArrayElement(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		uint32_t i, const uint8_t *&data, uint32_t &size) const;
 
 
@@ -549,13 +601,12 @@ public:
 		const;  
 
 
-	void get(TransactionContext &txn, ObjectManager &objectManager,
-		MessageRowStore *messageRowStore,
+	void get(TransactionContext &txn, ObjectManagerV4 &objectManager,
+		AllocateStrategy &strategy, MessageRowStore *messageRowStore,
 		ColumnId columnId);  
 
-	void archive(TransactionContext &txn, ObjectManager &objectManager, ArchiveHandler *handler) const;
 	void dump(
-		TransactionContext &txn, ObjectManager &objectManager, 
+		TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		util::NormalOStringStream &stream, bool forExport = false) const;
 
 public:
@@ -604,21 +655,21 @@ public:
 
 	static const void *getDefaultFixedValue(ColumnType type) {
 		UNUSED_VARIABLE(type);
-		return defalutFixedValue_;
+		return defaultFixedValue_;
 	}
 	static const void *getDefaultVariableValue(ColumnType type) {
 		switch (type) {
 		case COLUMN_TYPE_STRING:
-			return defalutStringValue_;
+			return defaultStringValue_;
 			break;
 		case COLUMN_TYPE_GEOMETRY:
-			return defalutGeometryValue_;
+			return defaultGeometryValue_;
 			break;
 		case COLUMN_TYPE_BLOB:
-			return defalutBlobValue_;
+			return defaultBlobValue_;
 			break;
 		case COLUMN_TYPE_STRING_ARRAY:
-			return defalutStringArrayValue_;
+			return defaultStringArrayValue_;
 			break;
 		case COLUMN_TYPE_BOOL_ARRAY:
 		case COLUMN_TYPE_BYTE_ARRAY:
@@ -628,7 +679,7 @@ public:
 		case COLUMN_TYPE_FLOAT_ARRAY:
 		case COLUMN_TYPE_DOUBLE_ARRAY:
 		case COLUMN_TYPE_TIMESTAMP_ARRAY:
-			return defalutFixedArrayValue_;
+			return defaultFixedArrayValue_;
 			break;
 		default:
 			GS_THROW_SYSTEM_ERROR(GS_ERROR_DS_TYPE_INVALID, "");
@@ -636,6 +687,33 @@ public:
 		}
 		return NULL;
 	}
+
+	static void* allocateBuffer(Buffer &buffer, size_t size) {
+		buffer.resize(size);
+		return buffer.data();
+	}
+
+	static void* allocateBuffer(util::StackAllocator &alloc, size_t size) {
+		return alloc.allocate(size);
+	}
+};
+
+class Value::Pool {
+public:
+	explicit Pool(util::StackAllocator &alloc);
+
+	void clear();
+	Value& newValue(Buffer *&buffer);
+
+private:
+	typedef std::pair<Value*, Buffer*> Entry;
+
+	Pool(const Pool&);
+	Pool operator=(const Pool&);
+
+	util::StackAllocator &alloc_;
+	util::Vector<Entry> entryList_;
+	size_t nextPos_;
 };
 
 /*!
@@ -643,8 +721,8 @@ public:
 */
 class ContainerValue {
 public:
-	ContainerValue(PartitionId pId, ObjectManager &objectManager)
-		: baseObj_(pId, objectManager) {}
+	ContainerValue(ObjectManagerV4 &objectManager, AllocateStrategy &strategy)
+		: baseObj_(objectManager, strategy) {}
 	BaseObject &getBaseObject() {
 		return baseObj_;
 	}
@@ -677,13 +755,18 @@ typedef bool (*Operator)(TransactionContext &txn, uint8_t const *p,
 	uint32_t size1, uint8_t const *q, uint32_t size2);
 typedef int32_t (*Comparator)(TransactionContext &txn, uint8_t const *p,
 	uint32_t size1, uint8_t const *q, uint32_t size2);
-typedef bool (*Operator)(TransactionContext &txn, uint8_t const *p,
-	uint32_t size1, uint8_t const *q, uint32_t size2);
 
-typedef void (*Calculator1)(
-	TransactionContext &txn, uint8_t const *p, uint32_t size1, Value &value);
-typedef void (*Calculator2)(TransactionContext &txn, uint8_t const *p,
-	uint32_t size1, uint8_t const *q, uint32_t size2, Value &value);
+typedef void (*Calculator)(
+		TransactionContext &txn, uint8_t const *p,
+		uint32_t size1, uint8_t const *q, uint32_t size2, Value &value);
+
+typedef Operator ValueOperatorList[COLUMN_TYPE_PRIMITIVE_COUNT];
+typedef Comparator ValueComparatorList[COLUMN_TYPE_PRIMITIVE_COUNT];
+typedef Calculator ValueCalculatorList[COLUMN_TYPE_PRIMITIVE_COUNT];
+
+typedef ValueOperatorList ValueOperatorTable[COLUMN_TYPE_PRIMITIVE_COUNT];
+typedef ValueComparatorList ValueComparatorTable[COLUMN_TYPE_PRIMITIVE_COUNT];
+typedef ValueCalculatorList ValueCalculatorTable[COLUMN_TYPE_PRIMITIVE_COUNT];
 
 /*!
 *	@brief Represents the type of Operation
@@ -716,8 +799,7 @@ public:
 		NOTBETWEEN,
 		NONE,
 		IS_NULL,
-		IS_NOT_NULL
-		,
+		IS_NOT_NULL,
 		GEOM_OP
 	};
 
@@ -774,6 +856,5 @@ public:
 		return false;
 	}
 };
-
 
 #endif

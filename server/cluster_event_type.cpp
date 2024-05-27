@@ -21,11 +21,16 @@
 #include "data_type.h"
 #include "cluster_event_type.h"
 
+std::set<EventType> EventTypeUtility::CATEGORY_EVENT_TYPES = { V_1_1_STATEMENT_START,
+	CONNECT, GET_USERS, PUT_LARGE_CONTAINER, SQL_EXECUTE_QUERY, REPLICATION_LOG , TXN_COLLECT_TIMEOUT_RESOURCE,
+	AUTHENTICATION, CS_HEARTBEAT, TXN_SHORTTERM_SYNC_REQUEST , SYC_SHORTTERM_SYNC_LOG , PARTITION_GROUP_START,
+	SYS_EVENT_SIMULATE_FAILURE, SQL_NOTIFY_CLIENT, RECV_NOTIFY_MASTER, EVENT_TYPE_MAX };
+
 #define CASE_EVENT(eventType) \
 	case eventType:           \
 		return #eventType
 
-const char8_t* getEventTypeName(EventType eventType) {
+const char8_t* EventTypeUtility::getEventTypeName(EventType eventType) {
 	switch (eventType) {
 		CASE_EVENT(CONNECT);
 		CASE_EVENT(DISCONNECT);
@@ -141,6 +146,7 @@ const char8_t* getEventTypeName(EventType eventType) {
 		CASE_EVENT(TXN_SYNC_CHECK_END);
 
 		CASE_EVENT(TXN_LONGTERM_SYNC_PREPARE_ACK); 
+		CASE_EVENT(TXN_LONGTERM_SYNC_RECOVERY_ACK);
 
 		CASE_EVENT(SYC_SHORTTERM_SYNC_LOG);
 		CASE_EVENT(SYC_LONGTERM_SYNC_LOG);
@@ -152,7 +158,7 @@ const char8_t* getEventTypeName(EventType eventType) {
 		CASE_EVENT(ADJUST_STORE_MEMORY_PERIODICALLY);
 		CASE_EVENT(PARTITION_GROUP_START);
 		CASE_EVENT(PARTITION_START);
-		CASE_EVENT(COPY_CHUNK);
+		CASE_EVENT(EXECUTE_CP);
 		CASE_EVENT(PARTITION_END);
 		CASE_EVENT(PARTITION_GROUP_END);
 		CASE_EVENT(WRITE_LOG_PERIODICALLY);
@@ -167,8 +173,23 @@ const char8_t* getEventTypeName(EventType eventType) {
 		CASE_EVENT(UPDATE_CONTAINER_STATUS);
 		CASE_EVENT(CREATE_LARGE_INDEX);
 		CASE_EVENT(DROP_LARGE_INDEX);
+		CASE_EVENT(UPDATE_MULTIPLE_ROWS_BY_ID_SET);
+		CASE_EVENT(REMOVE_MULTIPLE_ROWS_BY_ID_SET);
+
 	default:
 		break;
 	}
 	return "UNDEF_EVENT_TYPE";
 }
+
+EventType EventTypeUtility::getCategoryEventType(EventType eventType) {
+	if (eventType <= UNDEF_EVENT_TYPE || eventType >= EVENT_TYPE_MAX) {
+		return UNDEF_EVENT_TYPE;
+	}
+	auto itr = CATEGORY_EVENT_TYPES.upper_bound(eventType);
+	if (itr != CATEGORY_EVENT_TYPES.end()) {
+		return *(--itr);
+	}
+	return UNDEF_EVENT_TYPE;
+}
+

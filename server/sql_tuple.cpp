@@ -22,7 +22,6 @@
 UTIL_TRACER_DECLARE(TUPLE_LIST);
 const LocalTempStore::BlockId TupleList::UNDEF_BLOCKID = LocalTempStore::UNDEF_BLOCKID;
 const LocalTempStore::BlockId TupleList::Reader::UNDEF_BLOCKID = LocalTempStore::UNDEF_BLOCKID;
-const uint32_t TupleList::Writer::CONTIGUOUS_BLOCK_THRESHOLD = 10;
 const size_t TupleList::Info::COLUMN_COUNT_LIMIT = 65000;
 
 
@@ -393,6 +392,11 @@ void TupleList::Body::append(const LocalTempStore::Block &block) {
 	store_->getBufferManager().addAssignment(block.getBlockId()); 
 
 	appendBlockId(block.getBlockId());
+	LocalTempStore::Block *blockPtr = const_cast<LocalTempStore::Block *>(&block);
+	blockPtr->setGroupId(groupId_);
+	uint64_t activeCount = (tupleBlockIdList_.size() > activeTopBlockNth_) ?
+			tupleBlockIdList_.size() - activeTopBlockNth_ : 0;
+	store_->setActiveBlockCount(groupId_, activeCount);
 }
 
 
@@ -556,7 +560,7 @@ TupleList::TupleList(LocalTempStore &store, const ResourceId &resourceId, const 
 		util::LockGuard<util::Mutex> guard(body->getLock());
 		if (!body->detached()) {
 			GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_OPERATION_NOT_SUPPORTED,
-					"Specified resourceId is not datached: ResourceId=" << resourceId);
+					"Specified resourceId is not detached: ResourceId=" << resourceId);
 		}
 		body_ = body;
 		body_->setDetached(false);
@@ -615,7 +619,7 @@ TupleList& TupleList::operator=(const TupleList &another) {
 
 LocalTempStore::ResourceId TupleList::detach() {
 	if (body_) {
-		util::LockGuard<util::Mutex>(body_->getLock());
+		util::LockGuard<util::Mutex> guard(body_->getLock());
 		if (body_->detached()) { 
 			GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_OPERATION_NOT_SUPPORTED,
 					"Already detached");
@@ -779,6 +783,7 @@ void TupleList::append(const LocalTempStore::Block &block) {
 	body_->append(block);
 	addAllocatedBlockCount();
 	setValidBlockCount(getAllocatedBlockCount());
+	getStore().incrementAppendBlockCount(getGroupId());
 }
 
 LocalTempStore::BlockId TupleList::getBlockId(uint64_t pos) {
@@ -975,7 +980,7 @@ bool TupleList::Info::isNullable() const {
 
 bool TupleList::Info::hasVarType() const {
 	for (size_t column = 0; column < columnCount_; ++column) {
-		if (!TupleColumnTypeUtils::isFixed(columnTypeList_[column])) {
+		if (!TupleColumnTypeUtils::isSomeFixed(columnTypeList_[column])) {
 			return true;
 		}
 	}
@@ -1001,6 +1006,16 @@ size_t TupleList::Info::getNullBitOffset() const {
 	}
 	return offset;
 }
+
+
+NanoTimestamp TupleNanoTimestamp::makeEmptyValue() {
+	NanoTimestamp ts;
+	ts.assign(0, 0);
+	return ts;
+}
+
+
+const NanoTimestamp TupleNanoTimestamp::Constants::EMPTY_VALUE = makeEmptyValue();
 
 
 TupleList::BlockReader::BlockReader()
@@ -1044,7 +1059,7 @@ TupleList::BlockReader::BlockReader(
 	}
 	if (tupleList_->getActiveTopBlockNth() != image.activeTopBlockNth_) { 
 		GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_BLOCKREADER_CREATE_FAILED,
-			"Attach failed. TupleList status has chaged. "
+			"Attach failed. TupleList status has changed. "
 			"(activeTopBlockNth: detached=" << image.activeTopBlockNth_ <<
 			", current=" << tupleList.getActiveTopBlockNth() << ")");
 	} 
@@ -1166,6 +1181,7 @@ bool TupleList::BlockReader::next(Block &tupleBlock) {
 			}
 			tupleBlock = nextBlock;
 			++currentBlockNth_;
+			tupleList_->getStore().incrementReadBlockCount(tupleList_->getGroupId());
 		}
 	}
 	return true;
@@ -1351,19 +1367,19 @@ TupleList::Reader::Reader(TupleList &tupleList, const TupleList::Reader::Image &
 
 	if (image.resourceId_ != tupleList_->getResourceId()) { 
 		GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_READER_CREATE_FAILED,
-			"Attach failed. TupleList status has chaged. "
+			"Attach failed. TupleList status has changed. "
 			"(ResourceId: detached=" << image.resourceId_ <<
 			", current=" << tupleList_->getResourceId() << ")");
 	}
 	if (image.blockCount_ > tupleList_->getBlockCount()) {
 		GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_READER_CREATE_FAILED,
-			"Attach failed. TupleList status has chaged. "
+			"Attach failed. TupleList status has changed. "
 			"(blockCount: detached=" << image.blockCount_ <<
 			", current=" << tupleList_->getBlockCount() << ")");
 	}
 	if (tupleList.getActiveTopBlockNth() != image.activeTopBlockNth_) {
 		GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_READER_CREATE_FAILED,
-			"Attach failed. TupleList status has chaged. "
+			"Attach failed. TupleList status has changed. "
 			"(activeTopBlockNth: detached=" << image.activeTopBlockNth_ <<
 			", current=" << tupleList.getActiveTopBlockNth() << ")");
 	} 
@@ -1522,6 +1538,7 @@ bool TupleList::Reader::latchHeadBlock() {
 		fixedEndAddr_ = fixedAddr_ 
 				+ TupleList::tupleCount(blockAddr) * fixedPartSize_;
 
+		tupleList_->getStore().incrementReadBlockCount(tupleList_->getGroupId());
 		return true;
 	}
 	else {
@@ -1597,6 +1614,7 @@ void TupleList::Reader::positionWithLatch(BlockId newBlockNth) {
 
 	currentBlockNth_ = newBlockNth;
 	assert(newBlock.getBlockId() == tupleList_->getBlockId(newBlockNth));
+	tupleList_->getStore().incrementReadBlockCount(tupleList_->getGroupId());
 	fixedEndAddr_ = static_cast<const uint8_t*>(newBlock.data())
 			+ TupleList::BLOCK_HEADER_SIZE
 			+ TupleList::tupleCount(newBlock) * fixedPartSize_;
@@ -1700,6 +1718,7 @@ void TupleList::Reader::nextBlock(int32_t contiguousBlockCount) {
 		}
 		blockInfoArray_[nextBaseOffset].block_ = nextTopBlock;
 		blockInfoArray_[nextBaseOffset].addr_ = nextTopBlock.data();
+		tupleList_->getStore().incrementReadBlockCount(tupleList_->getGroupId());
 	}
 	else {
 		nextContiguousBlockCount = TupleList::contiguousBlockCount(nextTopAddr);
@@ -1879,6 +1898,7 @@ const uint8_t* TupleList::Reader::createSingleVarValue(uint64_t baseBlockNth, ui
 		blockInfoArray_[baseOffset + blockCount].addr_ = targetBlock.data();
 
 		varTop = static_cast<const uint8_t*>(targetBlock.data()) + offset;
+		tupleList_->getStore().incrementReadBlockCount(tupleList_->getGroupId());
 	}
 	else {
 		varTop = addr + offset;
@@ -1927,6 +1947,7 @@ TupleValue TupleList::Reader::createMultiVarValue(
 			blockInfoArray_[baseOffset + blockCount].addr_ = targetBlock.data();
 
 			varTop = static_cast<const uint8_t*>(targetBlock.data()) + offset;
+			tupleList_->getStore().incrementReadBlockCount(tupleList_->getGroupId());
 		}
 		else {
 			varTop = addr + offset;
@@ -1950,7 +1971,80 @@ TupleValue TupleList::Reader::createMultiVarValue(
 	return TupleValue(topVarData, type);
 }
 
+bool TupleList::Reader::existsDetail() {
+#ifndef NDEBUG
+	if (!tupleList_) {
+		GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_IS_NOT_EXIST,
+			"TupleList is not exist(or already closed).");
+	}
+#endif
+	assert(!isDetached_);
+	if (isDetached_) {
+		return false;
+	}
+	if (!fixedAddr_) {
+		if (tupleList_->getBlockCount() > 0) {
+			if (!latchHeadBlock()) {
+				return false;
+			}
+		}
+		else {
+			return false;
+		}
+	}
+	assert(fixedAddr_);
+	assert(getCurrentBlockAddr());
+	if (fixedAddr_ < fixedEndAddr_) {
+		return true;
+	}
+	else {
+		const uint8_t* blockAddr = getCurrentBlockAddr();
+		fixedEndAddr_ = blockAddr + TupleList::BLOCK_HEADER_SIZE
+				+ TupleList::tupleCount(blockAddr) * fixedPartSize_;
 
+		if (fixedAddr_ < fixedEndAddr_) {
+			return true;
+		}
+		const int32_t contiguousBlockCount = TupleList::contiguousBlockCount(blockAddr);
+		assert(contiguousBlockCount >= 0);
+		if (currentBlockNth_ + contiguousBlockCount + 1 < tupleList_->getBlockCount()) {
+			nextBlock(contiguousBlockCount);
+			return (fixedAddr_ < fixedEndAddr_);
+		}
+		else {
+			return false;
+		}
+	}
+}
+
+bool TupleList::Reader::nextDetail() {
+	{
+		{
+			if (!exists()) { 
+				return false;
+			}
+			assert(fixedAddr_);
+		}
+		if ((fixedAddr_ + fixedPartSize_) < fixedEndAddr_) {
+			fixedAddr_ += fixedPartSize_;
+			return false;
+		}
+		else {
+			fixedAddr_ += fixedPartSize_;
+			const int32_t contiguousBlockCount = TupleList::contiguousBlockCount(
+					getCurrentBlockAddr());
+			assert(contiguousBlockCount >= 0);
+			if (currentBlockNth_ + contiguousBlockCount + 1 < tupleList_->getBlockCount()) {
+				nextBlock(contiguousBlockCount);
+				return false;
+			}
+			else {
+				return false;
+			}
+		}
+	}
+	return true;
+}
 
 TupleList::Writer::Writer()
 : tupleList_(NULL), fixedAddr_(NULL), varTopAddr_(NULL), varTailAddr_(NULL)
@@ -1998,13 +2092,13 @@ TupleList::Writer::Writer(TupleList &tupleList, const TupleList::Writer::Image &
 	initialize(tupleList);
 	if (image.resourceId_ != tupleList_->getResourceId()) {  
 		GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_WRITER_CREATE_FAILED,
-			"Attach failed. TupleList status has chaged. "
+			"Attach failed. TupleList status has changed. "
 			"(ResourceId: detached=" << image.resourceId_ <<
 			", current=" << tupleList_->getResourceId() << ")");
 	}
 	if (image.blockCount_ != tupleList_->getAllocatedBlockCount()) {
 		GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_WRITER_CREATE_FAILED,
-			"Attach failed. TupleList status has chaged. "
+			"Attach failed. TupleList status has changed. "
 			"(blockCount: detached=" << image.blockCount_ <<
 			", current=" << tupleList_->getAllocatedBlockCount() << ")");
 	}  
@@ -2021,13 +2115,13 @@ TupleList::Writer::Writer(TupleList &tupleList, const TupleList::Writer::Image &
 
 		if (image.tupleCount_ != TupleBlockHeader::getTupleCount(block_.data())) {  
 			GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_WRITER_CREATE_FAILED,
-				"Attach failed. TupleList status has chaged. "
+				"Attach failed. TupleList status has changed. "
 				"(tupleCount: detached=" << image.tupleCount_ <<
 				", current=" << TupleBlockHeader::getTupleCount(block_.data()) << ")");
 		}
 		if (image.contiguousBlockCount_ != static_cast<uint32_t>(contiguousBlockNum)) {
 			GS_THROW_USER_ERROR(GS_ERROR_LTS_TUPLELIST_WRITER_CREATE_FAILED,
-				"Attach failed. TupleList status has chaged. "
+				"Attach failed. TupleList status has changed. "
 				"(contiguousBlockCount: detached=" <<
 				image.contiguousBlockCount_ <<
 				", current=" << contiguousBlockNum << ")");
@@ -2132,6 +2226,20 @@ void TupleList::Writer::setBlockHandler(WriterHandler &handler) {
 	tupleList_->writerHandler_ = &handler;
 }
 
+void TupleList::Writer::nextDetail() {
+	{
+		if (!fixedAddr_ && tupleList_->getAllocatedBlockCount() > 0) {
+			setupFirstAppend();
+			if ((fixedAddr_ + fixedPartSize_ >= varTopAddr_)
+				|| (contiguousBlockCount_ > CONTIGUOUS_BLOCK_THRESHOLD)) {
+				nextBlock();
+			}
+		}
+		else {
+			nextBlock();
+		}
+	}
+}
 
 void TupleList::Writer::setVarContext(TupleValue::VarContext &context) {
 	cxt_ = &context;
@@ -2637,6 +2745,10 @@ const char8_t* TupleList::TupleColumnTypeCoder::operator()(TupleColumnType type)
 		return off + (a ? "NULLABLE_DOUBLE_ARRAY" : "NULLABLE_DOUBLE");
 	case TYPE_TIMESTAMP:
 		return off + (a ? "NULLABLE_TIMESTAMP_ARRAY" : "NULLABLE_TIMESTAMP");
+	case TYPE_MICRO_TIMESTAMP:
+		return off + (a ? "NULLABLE_TIMESTAMP_ARRAY(6)" : "NULLABLE_TIMESTAMP(6)");
+	case TYPE_NANO_TIMESTAMP:
+		return off + (a ? "NULLABLE_TIMESTAMP_ARRAY(9)" : "NULLABLE_TIMESTAMP(9)");
 	case TYPE_BOOL:
 		return off + (a ? "NULLABLE_BOOL_ARRAY" : "NULLABLE_BOOL");
 	case TYPE_STRING:
@@ -2681,6 +2793,8 @@ bool TupleList::TupleColumnTypeCoder::operator()(
 		Entry("FLOAT", TYPE_FLOAT),
 		Entry("DOUBLE", TYPE_DOUBLE),
 		Entry("TIMESTAMP", TYPE_TIMESTAMP),
+		Entry("TIMESTAMP(6)", TYPE_MICRO_TIMESTAMP),
+		Entry("TIMESTAMP(9)", TYPE_NANO_TIMESTAMP),
 		Entry("BOOL", TYPE_BOOL),
 		Entry("STRING", TYPE_STRING),
 		Entry("GEOMETRY", TYPE_GEOMETRY),
@@ -2795,7 +2909,7 @@ void TupleValue::VarContext::clear() {
 void TupleValue::VarContext::destroyValue(TupleValue &value) {
 	TupleValueVarUtils::VarData *varData;
 	assert(!TupleColumnTypeUtils::isAny(value.getType()));
-	if (TupleColumnTypeUtils::isSingleVar(value.getType())) {
+	if (TupleColumnTypeUtils::isSingleVarOrLarge(value.getType())) {
 		uint8_t *body = static_cast<uint8_t*>(value.getRawData()) - 1;
 		if (*body != TupleValueTempStoreVarUtils::LTS_VAR_DATA_SINGLE_VAR) {
 			assert(false);
@@ -2843,6 +2957,24 @@ void TupleValue::VarContext::moveValueToParent(
 		assert(1 + encodeSize == headerSize);
 		memcpy(addr + encodeSize, value.varData(), size);
 		value.data_.varData_ = addr;
+	}
+	else if (TupleColumnTypeUtils::isLargeFixed(value.getType())) {
+		const uint8_t dataType = TupleValueTempStoreVarUtils::LTS_VAR_DATA_SINGLE_VAR;
+
+		const size_t size = TupleColumnTypeUtils::getFixedSize(value.getType());
+		const TupleValueVarUtils::VarDataType type =
+				TupleValueVarUtils::VAR_DATA_TEMP_STORE;
+
+		const size_t headerSize = sizeof(dataType);
+		varData = allocate(type, headerSize + size);
+		assert(varData->getBodySize(getBaseVarContext()) >= headerSize + size);
+
+		void *addr = varData->getBody();
+		*static_cast<uint8_t*>(addr) = dataType;
+		addr = static_cast<uint8_t*>(addr) + headerSize;
+
+		memcpy(addr, value.getRawData(), size);
+		value.data_.rawData_ = addr;
 	}
 	else if (TupleColumnTypeUtils::isLob(value.getType())) {
 		for (;;) {
@@ -2933,7 +3065,7 @@ uint32_t TupleValue::SingleVarBuilder::append(uint32_t maxSize) {
 
 
 TupleValue TupleValue::SingleVarBuilder::build() {
-	return TupleValue(lastData_, TupleList::TYPE_STRING);
+	return TupleValue(TupleString(lastData_));
 }
 
 
@@ -2974,7 +3106,7 @@ uint32_t TupleValue::StackAllocSingleVarBuilder::append(uint32_t maxSize) {
 
 
 TupleValue TupleValue::StackAllocSingleVarBuilder::build() {
-	return TupleValue(lastData_, TupleList::TYPE_STRING);
+	return TupleValue(TupleString(lastData_));
 }
 
 
@@ -3585,9 +3717,6 @@ uint64_t TupleValueTempStoreVarUtils::TempStoreLobReader::getPartCount() {
 	}
 }
 
-TupleString::operator TupleValue() const {
-	return TupleValue(data_, TupleList::TYPE_STRING);
-}
 
 
 
@@ -3825,6 +3954,51 @@ TupleValue TupleValue::StackAllocLobBuilder::build() {
 	return TupleValue(topVarData_, TupleList::TYPE_BLOB);
 }
 
+TupleValue::NanoTimestampBuilder::NanoTimestampBuilder(VarContext &cxt) :
+		cxt_(cxt),
+		pos_(0) {
+}
+
+void TupleValue::NanoTimestampBuilder::append(const void *data, size_t size) {
+	if (size > sizeof(NanoTimestamp) ||
+			pos_ + size > sizeof(NanoTimestamp)) {
+		GS_THROW_USER_ERROR(GS_ERROR_LTS_TYPE_NOT_MATCH,
+				"Internal error by unexpected value size");
+	}
+	memcpy(data_ + pos_, data, size);
+	pos_ += size;
+}
+
+void TupleValue::NanoTimestampBuilder::setValue(const NanoTimestamp &ts) {
+	memcpy(data_, &ts, sizeof(ts));
+	pos_ = sizeof(ts);
+}
+
+const NanoTimestamp* TupleValue::NanoTimestampBuilder::build() {
+	const uint32_t valueSize = sizeof(NanoTimestamp);
+	if (pos_ != valueSize) {
+		GS_THROW_USER_ERROR(GS_ERROR_LTS_TYPE_NOT_MATCH,
+				"Internal error by state");
+	}
+
+	const uint8_t dataType = TupleValueTempStoreVarUtils::LTS_VAR_DATA_SINGLE_VAR;
+
+	const uint32_t headerSize = sizeof(dataType);
+	const uint32_t totalSize = headerSize + valueSize;
+
+	const TupleValueVarUtils::VarDataType type =
+			TupleValueVarUtils::VAR_DATA_TEMP_STORE;
+	TupleValueVarUtils::VarData *varData = cxt_.allocate(type, totalSize);
+	assert(varData->getBodySize(cxt_.getBaseVarContext()) >= totalSize);
+
+	void *addr = varData->getBody();
+	*static_cast<uint8_t*>(addr) = dataType;
+	addr = static_cast<uint8_t*>(addr) + headerSize;
+
+	memcpy(addr, data_, valueSize);
+	return static_cast<const NanoTimestamp*>(addr);
+}
+
 
 TupleList::Body::AccessorManager::AccessorManager(TupleList::Body *body)
 : tupleListBody_(body)
@@ -3926,7 +4100,7 @@ void TupleList::Body::AccessorManager::setReaderTopNth(size_t id, uint64_t block
 		}
 		if (accessTopMin_ < min) {
 			tupleListBody_->setActiveTopBlockNth(min);
-			tupleListBody_->invalidateBlockId(accessTopMin_, min - 1);
+			tupleListBody_->invalidateBlockId(accessTopMin_, min);
 			accessTopMin_ = min;
 		}
 	}

@@ -22,11 +22,13 @@
 #define SERVICE_ADDRESS_H_
 
 #include "util/container.h"
-#include "util/net.h"
+#include "socket_wrapper.h"
 
 namespace picojson {
 class value;
 } 
+
+class HttpRequest;
 
 class ServiceAddressResolver {
 public:
@@ -35,6 +37,12 @@ public:
 
 		const char8_t *providerURL_;
 		int addressFamily_;
+		SocketFactory *plainSocketFactory_;
+		SocketFactory *secureSocketFactory_;
+
+		uint32_t hostCheckMillis_;
+
+		bool hostCheckImmediately_;
 	};
 
 	typedef util::StdAllocator<void, void> Allocator;
@@ -45,11 +53,14 @@ public:
 
 	const Config& getConfig() const;
 
-	static void checkConfig(const Allocator &alloc, const Config &config);
+	static void checkConfig(
+			const Allocator &alloc, const Config &config, bool &secure);
 
 	void initializeType(const ServiceAddressResolver &another);
 
 	void initializeType(uint32_t type, const char8_t *name);
+
+	void setExecutor(util::ExecutorService &executor);
 
 	uint32_t getTypeCount() const;
 
@@ -83,11 +94,10 @@ public:
 	util::IOPollHandler* getIOPollHandler();
 	util::IOPollEvent getIOPollEvent();
 
-	util::SocketAddress makeSocketAddress(const char8_t *host, int64_t port);
-
 private:
 	struct Entry;
 	struct EntryLess;
+	struct HostTable;
 	struct ProviderContext;
 
 	typedef util::BasicString< char8_t, std::char_traits<char8_t>,
@@ -102,7 +112,10 @@ private:
 	typedef std::multiset<
 			util::SocketAddress, std::set<util::SocketAddress>::key_compare,
 			util::StdAllocator<util::SocketAddress, void> > AddressSet;
+
 	typedef std::vector<Entry, util::StdAllocator<Entry, void> > EntryList;
+
+	typedef util::SocketAddress::AssignByHostCommand AssignByHostCommand;
 
 	friend std::ostream& operator<<(
 			std::ostream &s, const ProviderContext &cxt);
@@ -110,8 +123,22 @@ private:
 	static const char8_t JSON_KEY_ADDRESS[];
 	static const char8_t JSON_KEY_PORT[];
 
+	static SocketFactory DEFAULT_SOCKET_FACTORY;
+
 	ServiceAddressResolver(const ServiceAddressResolver&);
 	ServiceAddressResolver& operator=(const ServiceAddressResolver&);
+
+	util::SocketAddress makeSocketAddress(
+			const u8string &host, int64_t port, HostTable &hostTable,
+			bool hostCheckOnly);
+
+	static util::SocketAddress makeRequestAddress(
+			const HttpRequest &request, HostTable &hostTable,
+			bool hostCheckOnly);
+
+	void importDetailFrom(
+			const picojson::value &value, HostTable &hostTable,
+			bool hostCheckOnly, bool strict);
 
 	void initializeRaw();
 
@@ -126,6 +153,10 @@ private:
 			const EntryList &list2, bool normalized2);
 
 	static void normalizeEntries(EntryList *entryList);
+
+	void createSocket(AbstractSocket &socket) const;
+	static util::IOPollEvent resolvePollEvent(
+			AbstractSocket &socket, util::IOPollEvent base);
 
 	Allocator alloc_;
 	Config config_;
@@ -142,6 +173,7 @@ private:
 	std::pair<bool, bool> updated_;
 	bool changed_;
 	bool normalized_;
+	bool secure_;
 
 	ProviderContext *providerCxt_;
 };

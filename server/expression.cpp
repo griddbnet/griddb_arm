@@ -219,13 +219,22 @@ bool Expr::isColumn() const {
  */
 bool Expr::isTimestamp() const {
 	if (type_ != VALUE) return false;
-	if (value_ == NULL) {
-		GS_THROW_USER_ERROR(GS_ERROR_TQ_CRITICAL_LOGIC_ERROR,
-			"Internal logic error: value == NULL");
-	}
+	return (resolveValueType() == COLUMN_TYPE_TIMESTAMP);
+}
 
-	ColumnType t = value_->getType();
-	return (t == COLUMN_TYPE_TIMESTAMP);
+bool Expr::isMicroTimestamp() const {
+	if (type_ != VALUE) return false;
+	return (resolveValueType() == COLUMN_TYPE_MICRO_TIMESTAMP);
+}
+
+bool Expr::isNanoTimestamp() const {
+	if (type_ != VALUE) return false;
+	return (resolveValueType() == COLUMN_TYPE_NANO_TIMESTAMP);
+}
+
+bool Expr::isTimestampFamily() const {
+	if (type_ != VALUE) return false;
+	return ValueProcessor::isTimestampFamily(resolveValueType());
 }
 
 /*!
@@ -317,6 +326,17 @@ Expr::Type Expr::getType() {
 	return type_;
 }
 
+ColumnType Expr::resolveValueType() const {
+	assert(type_ == VALUE);
+
+	if (value_ == NULL) {
+		GS_THROW_USER_ERROR(GS_ERROR_TQ_CRITICAL_LOGIC_ERROR,
+			"Internal logic error: value == NULL");
+	}
+
+	return value_->getType();
+}
+
 /*!
  * @brief Return the value of the expression
  * @return The expression value as a Double
@@ -369,6 +389,25 @@ const char *Expr::stringifyValue<double, double>(TransactionContext &txn) {
 }
 #endif
 
+template<typename T>
+const char8_t* Expr::stringifyTimestamp(TransactionContext &txn) {
+	util::DateTime::ZonedOption option = util::DateTime::ZonedOption::create(
+			TRIM_MILLISECONDS, txn.getTimeZone());
+	option.asLocalTimeZone_ = USE_LOCAL_TIMEZONE;
+
+	const size_t maxSize = util::DateTime::MAX_FORMAT_SIZE;
+	char8_t *str =static_cast<char8_t*>(
+			txn.getDefaultAllocator().allocate(maxSize + 1));
+
+	const util::DateTime::Formatter formatter =
+			ValueProcessor::getTimestampFormatter(
+					*reinterpret_cast<const T*>(value_->data()), option);
+	const size_t size = formatter(str, maxSize);
+	str[size] = '\0';
+
+	return str;
+}
+
 /*!
  * @brief Return the value of the expression
  * @return The expression value as a string
@@ -415,15 +454,12 @@ const char *Expr::getValueAsString(TransactionContext &txn) {
 			return stringifyValue<float, float>(txn);
 		case COLUMN_TYPE_DOUBLE:
 			return stringifyValue<double, double>(txn);
-		case COLUMN_TYPE_TIMESTAMP: {
-			const util::DateTime *d =
-				reinterpret_cast<const util::DateTime *>(value_->data());
-			util::NormalOStringStream os;
-			util::DateTime::ZonedOption zonedOption = util::DateTime::ZonedOption::create(TRIM_MILLISECONDS, txn.getTimeZone());
-			zonedOption.asLocalTimeZone_ = USE_LOCAL_TIMEZONE;
-			d->format(os, zonedOption);
-			return os2char(txn, os);
-		}
+		case COLUMN_TYPE_TIMESTAMP:
+			return stringifyTimestamp<Timestamp>(txn);
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+			return stringifyTimestamp<MicroTimestamp>(txn);
+		case COLUMN_TYPE_NANO_TIMESTAMP:
+			return stringifyTimestamp<NanoTimestamp>(txn);
 		case COLUMN_TYPE_GEOMETRY: {
 			Geometry *geom = geomCache_;
 			return geom->getString(txn);
@@ -510,10 +546,10 @@ const ExprList &Expr::getArgList() {
  * @return The expression of the element
  */
 Expr *Expr::getArrayElement(
-	TransactionContext &txn, ObjectManager &objectManager, size_t idx) {
+	TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy, size_t idx) {
 	if (type_ == VALUE) {
 		assert(value_ != NULL);
-		if (idx >= value_->getArrayLength(txn, objectManager)) {
+		if (idx >= value_->getArrayLength(txn, objectManager, strategy)) {
 			GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_ARRAY_OUT_OF_RANGE,
 				"Specified index is out of range.");
 		}
@@ -521,7 +557,7 @@ Expr *Expr::getArrayElement(
 		const uint8_t *data;
 		uint32_t size;
 		value_->getArrayElement(
-			txn, objectManager, static_cast<uint32_t>(idx), data, size);
+			txn, objectManager, strategy, static_cast<uint32_t>(idx), data, size);
 		switch (value_->getType()) {
 		case COLUMN_TYPE_STRING_ARRAY:
 			return Expr::newStringValue(
@@ -570,10 +606,10 @@ Expr *Expr::getArrayElement(
  * @return The length of array
  */
 size_t Expr::getArrayLength(
-	TransactionContext &txn, ObjectManager &objectManager) const {
+	TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) const {
 	if (type_ == VALUE) {
 		assert(value_ != NULL);
-		return value_->getArrayLength(txn, objectManager);
+		return value_->getArrayLength(txn, objectManager, strategy);
 	}
 	else if (type_ == EXPRARRAY && arglist_ != NULL) {
 		return arglist_->size();
@@ -598,12 +634,36 @@ Timestamp Expr::getTimeStamp() {
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_CRITICAL_LOGIC_ERROR,
 			"Internal logic error: expression is null");
 	}
-	if (value_->getType() == COLUMN_TYPE_TIMESTAMP) {
-		return *reinterpret_cast<const Timestamp *>(value_->data());
+
+	try {
+		return ValueProcessor::getTimestamp(value_->getType(), value_->data());
+	}
+	catch (UserException &e) {
+		GS_RETHROW_USER_ERROR_CODED(
+				GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE, e,
+				"Invalid datatypes: argument is not a timestamp value");
+	}
+}
+
+NanoTimestamp Expr::getNanoTimestamp() {
+	if (value_ == NULL) {
+		GS_THROW_USER_ERROR(GS_ERROR_TQ_CRITICAL_LOGIC_ERROR,
+			"Internal logic error: value == NULL");
+	}
+	if (isNullValue()) {
+		GS_THROW_USER_ERROR(GS_ERROR_TQ_CRITICAL_LOGIC_ERROR,
+			"Internal logic error: expression is null");
 	}
 
-	GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE,
-		"Invalid datatypes: argument is not a timestamp value");
+	try {
+		return ValueProcessor::getNanoTimestamp(
+				value_->getType(), value_->data());
+	}
+	catch (UserException &e) {
+		GS_RETHROW_USER_ERROR_CODED(
+				GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE, e,
+				"Invalid datatypes: argument is not a timestamp value");
+	}
 }
 
 /*!
@@ -612,7 +672,7 @@ Timestamp Expr::getTimeStamp() {
  * @param txn Object manager
  * @return Duplicated expression
  */
-Expr *Expr::dup(TransactionContext &txn, ObjectManager &objectManager) {
+Expr *Expr::dup(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
 	Expr *e = NULL;
 	if (type_ == NULLVALUE) {
 		e = Expr::newNullValue(txn);
@@ -658,6 +718,14 @@ Expr *Expr::dup(TransactionContext &txn, ObjectManager &objectManager) {
 				e = Expr::newTimestampValue(
 					*reinterpret_cast<const Timestamp *>(value_->data()), txn);
 				break;
+			case COLUMN_TYPE_MICRO_TIMESTAMP:
+				e = Expr::newTimestampValue(
+					*reinterpret_cast<const MicroTimestamp *>(value_->data()), txn);
+				break;
+			case COLUMN_TYPE_NANO_TIMESTAMP:
+				e = Expr::newTimestampValue(
+					*reinterpret_cast<const NanoTimestamp *>(value_->data()), txn);
+				break;
 			case COLUMN_TYPE_GEOMETRY: {
 				Geometry *geom = getGeometry();
 				e = Expr::newGeometryValue(geom, txn);
@@ -670,7 +738,7 @@ Expr *Expr::dup(TransactionContext &txn, ObjectManager &objectManager) {
 		else {  
 			Value *av;
 			av = QP_NEW Value();
-			av->copy(txn, objectManager, *value_);
+			av->copy(txn, objectManager, strategy, *value_);
 
 			e = Expr::newArrayValue(av, txn);
 		}
@@ -699,7 +767,7 @@ Expr *Expr::dup(TransactionContext &txn, ObjectManager &objectManager) {
 			for (ExprList::const_iterator it = arglist_->begin();
 				 it != arglist_->end(); it++) {
 				e->arglist_->insert(
-					e->arglist_->end(), (*it)->dup(txn, objectManager));
+					e->arglist_->end(), (*it)->dup(txn, objectManager, strategy));
 			}
 		}
 	}
@@ -810,13 +878,25 @@ Expr::Expr(double v, TransactionContext &txn) {
 	value_ = QP_NEW Value(v);
 }
 
+Expr::Expr(const MicroTimestamp &v, TransactionContext &txn) {
+	Init();
+	type_ = VALUE;
+	value_ = QP_NEW Value(v);
+}
+
+Expr::Expr(const NanoTimestamp &v, TransactionContext &txn) {
+	Init();
+	type_ = VALUE;
+	value_ = QP_NEW Value(v);
+}
+
 /*!
  * @brief ctor
  *
  * @param s String value
  * @param txn The transaction context
  * @param isLabel The string is a expression label
- * @param needUnescape add escape charactor
+ * @param needUnescape add escape character
 */
 Expr::Expr(
 	const char *s, TransactionContext &txn, bool isLabel, bool needUnescape) {
@@ -852,7 +932,7 @@ Expr::Expr(
  * @param len String length
  * @param txn The transaction context
  * @param isLabel The string is a expression label
- * @param needUnescape add escape charactor
+ * @param needUnescape add escape character
  */
 Expr::Expr(const char *s, size_t len, TransactionContext &txn, bool isLabel,
 	bool needUnescape) {
@@ -1034,7 +1114,7 @@ Expr::Expr(Geometry *geom, TransactionContext &txn) {
  * @param txn Object manager
  */
 Expr::Expr(
-	ExprList *args, TransactionContext &txn, ObjectManager &objectManager) {
+	ExprList *args, TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
 	Init();
 	type_ = EXPRARRAY;
 	arglist_ = QP_NEW ExprList(txn.getDefaultAllocator());
@@ -1062,7 +1142,7 @@ Expr::Expr(
 					GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE,
 					"Array cannot be constructed with multiple types");
 			}
-			arglist_->push_back((*it)->dup(txn, objectManager));
+			arglist_->push_back((*it)->dup(txn, objectManager, strategy));
 			it++;
 		}
 	}
@@ -1118,7 +1198,7 @@ Expr::~Expr() {
 }
 
 /*!
- * @brief Create new expression to evaluated expresion.
+ * @brief Create new expression to evaluated expression.
  *
  * @param txn The transaction context
  * @param txn Object manager
@@ -1128,7 +1208,7 @@ Expr::~Expr() {
  *
  * @return Evaluation result as expression.
  */
-Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
+Expr *Expr::eval(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	ContainerRowWrapper *column_values, FunctionMap *function_map,
 	EvalMode mode) {
 	switch (type_) {
@@ -1136,64 +1216,64 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 		if (value_->getType() == COLUMN_TYPE_GEOMETRY) {
 			Geometry *g = getGeometry();
 			Expr *p =
-				Expr::newGeometryValue(g->assign(txn, objectManager,
+				Expr::newGeometryValue(g->assign(txn, objectManager, strategy,
 										   column_values, function_map, mode),
 					txn);
 			return p;
 		}
-		return this->dup(txn, objectManager);
+		return this->dup(txn, objectManager, strategy);
 	case NULLVALUE:
 		return Expr::newNullValue(txn);
 	case EXPR:
 		{
 			switch (this->op_) {
 			case ADD:
-				return evalSubBinOp(txn, objectManager, CalculatorTable::addTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, CalculatorTable::addTable_, column_values,
 					function_map, "+", mode);
 			case SUB:
-				return evalSubBinOp(txn, objectManager, CalculatorTable::subTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, CalculatorTable::subTable_, column_values,
 					function_map, "-", mode);
 			case MUL:
-				return evalSubBinOp(txn, objectManager, CalculatorTable::mulTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, CalculatorTable::mulTable_, column_values,
 					function_map, "*", mode);
 			case DIV:
-				return evalSubBinOp(txn, objectManager, CalculatorTable::divTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, CalculatorTable::divTable_, column_values,
 					function_map, "/", mode);
 			case REM:
-				return evalSubBinOp(txn, objectManager, CalculatorTable::modTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, CalculatorTable::modTable_, column_values,
 					function_map, "%", mode);
 			case NE:
-				return evalSubBinOp(txn, objectManager, ComparatorTable::neTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, ComparatorTable::neTable_, column_values,
 					function_map, "<>", mode);
 			case EQ:
-				return evalSubBinOp(txn, objectManager, ComparatorTable::eqTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, ComparatorTable::eqTable_, column_values,
 					function_map, "=", mode);
 			case LT:
-				return evalSubBinOp(txn, objectManager, ComparatorTable::ltTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, ComparatorTable::ltTable_, column_values,
 					function_map, "<", mode);
 			case LE:
-				return evalSubBinOp(txn, objectManager, ComparatorTable::leTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, ComparatorTable::leTable_, column_values,
 					function_map, "<=", mode);
 			case GT:
-				return evalSubBinOp(txn, objectManager, ComparatorTable::gtTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, ComparatorTable::gtTable_, column_values,
 					function_map, ">", mode);
 			case GE:
-				return evalSubBinOp(txn, objectManager, ComparatorTable::geTable_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, ComparatorTable::geTable_, column_values,
 					function_map, ">=", mode);
 
 			case PLUS:
-				return evalSubUnaryOpBaseZero(txn, objectManager, CalculatorTable::addTable_,
+				return evalSubUnaryOpBaseZero(txn, objectManager, strategy, CalculatorTable::addTable_,
 					column_values, function_map, "+", mode);
 			case MINUS:
 			case BITMINUS:
-				return evalSubUnaryOpBaseZero(txn, objectManager, CalculatorTable::subTable_,
+				return evalSubUnaryOpBaseZero(txn, objectManager, strategy, CalculatorTable::subTable_,
 					column_values, function_map, "-", mode);
 			case IS:
-				return evalSubBinOp(txn, objectManager, this->op_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, this->op_, column_values,
 					function_map, "IS", mode);
 
 			case ISNOT:
-				return evalSubBinOp(txn, objectManager, this->op_, column_values,
+				return evalSubBinOp(txn, objectManager, strategy, this->op_, column_values,
 					function_map, "ISNOT", mode);
 
 			default:
@@ -1211,7 +1291,7 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 				for (ExprList::const_iterator it2 = arglist_->begin();
 					 it2 != arglist_->end(); it2++) {
 					Expr *e = (*it2)->eval(
-						txn, objectManager, column_values, function_map, mode);
+						txn, objectManager, strategy, column_values, function_map, mode);
 					if (e->isString()) {
 						os << '\'' << e->getValueAsString(txn) << "',";
 					}
@@ -1235,11 +1315,11 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 			ExprList argsAfterEval(txn.getDefaultAllocator());
 			try {
 				ret = (*func)(*arglist_, column_values, function_map, mode, txn,
-					objectManager, argsAfterEval);
+					objectManager, strategy, argsAfterEval);
 			}
 			catch (util::Exception &) {
 				if (mode == EVAL_MODE_CONTRACT) {
-					Expr *e = this->dup(txn, objectManager);
+					Expr *e = this->dup(txn, objectManager, strategy);
 					if (e->arglist_ != NULL) {
 						for (size_t i = 0; i < argsAfterEval.size(); i++) {
 							QP_DELETE((*e->arglist_)[i]);
@@ -1269,7 +1349,7 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 			case EVAL_MODE_PRINT:
 				return Expr::newExprLabel(getValueAsString(txn), txn);
 			case EVAL_MODE_CONTRACT:
-				return this->dup(txn, objectManager);
+				return this->dup(txn, objectManager, strategy);
 			default:
 				GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE,
 					(util::String(
@@ -1287,7 +1367,7 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 			case EVAL_MODE_PRINT:
 				return Expr::newExprLabel(getValueAsString(txn), txn);
 			case EVAL_MODE_CONTRACT:
-				return this->dup(txn, objectManager);
+				return this->dup(txn, objectManager, strategy);
 			default:
 				GS_THROW_USER_ERROR(GS_ERROR_TQ_INVALID_NAME,
 					(util::String(
@@ -1335,6 +1415,12 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 			case COLUMN_TYPE_TIMESTAMP:
 				return Expr::newTimestampValue(
 					*reinterpret_cast<const Timestamp *>(v->data()), txn);
+			case COLUMN_TYPE_MICRO_TIMESTAMP:
+				return Expr::newTimestampValue(
+					*reinterpret_cast<const MicroTimestamp *>(v->data()), txn);
+			case COLUMN_TYPE_NANO_TIMESTAMP:
+				return Expr::newTimestampValue(
+					*reinterpret_cast<const NanoTimestamp *>(v->data()), txn);
 			default:
 				break;  
 			}
@@ -1371,12 +1457,12 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 		if (arglist_ != NULL) {
 			for (ExprList::const_iterator it2 = arglist_->begin();
 				 it2 != arglist_->end(); it2++) {
-				args.insert(args.end(), (*it2)->eval(txn, objectManager,
+				args.insert(args.end(), (*it2)->eval(txn, objectManager, strategy,
 											column_values, function_map, mode));
 			}
 		}
 
-		Expr *ret = Expr::newExprArray(args, txn, objectManager);
+		Expr *ret = Expr::newExprArray(args, txn, objectManager, strategy);
 
 		for (ExprList::const_iterator it2 = args.begin(); it2 != args.end();
 			 it2++) {
@@ -1401,7 +1487,7 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
 				for (ExprList::const_iterator it2 = arglist_->begin();
 					 it2 != arglist_->end(); it2++) {
 					Expr *e = (*it2)->eval(
-						txn, objectManager, column_values, function_map, mode);
+						txn, objectManager, strategy, column_values, function_map, mode);
 					if (e->isString()) {
 						os << '\'' << e->getValueAsString(txn) << "',";
 					}
@@ -1439,22 +1525,26 @@ Expr *Expr::eval(TransactionContext &txn, ObjectManager &objectManager,
  *
  * @return Evaluated expression
  */
-Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
-	const Operator opTable[][11], ContainerRowWrapper *column_values,
-	FunctionMap *function_map, const char *mark, EvalMode mode) {
+Expr *Expr::evalSubBinOp(
+		TransactionContext &txn, ObjectManagerV4 &objectManager,
+		AllocateStrategy &strategy, const ValueOperatorTable &opTable,
+		ContainerRowWrapper *column_values, FunctionMap *function_map,
+		const char *mark, EvalMode mode) {
 	Expr *x1, *x2;
 
 	assert(arglist_ && (*arglist_)[0] && (*arglist_)[1]);
 
 	x1 = (*arglist_)[0]->eval(
-		txn, objectManager, column_values, function_map, mode);
+		txn, objectManager, strategy, column_values, function_map, mode);
 	x2 = (*arglist_)[1]->eval(
-		txn, objectManager, column_values, function_map, mode);
+		txn, objectManager, strategy, column_values, function_map, mode);
 
 	if (x1->isValueOrColumn() && x2->isValueOrColumn() &&
-		(ValueProcessor::isArray(x1->getColumnType()) || 
-		ValueProcessor::isArray(x2->getColumnType()) ||
-		opTable[x1->getColumnType()][x2->getColumnType()] == NULL)) {
+			(ValueProcessor::isArray(x1->getColumnType()) ||
+			ValueProcessor::isArray(x2->getColumnType()) ||
+			ComparatorTable::findOperator(
+					opTable,
+					x1->getColumnType(), x2->getColumnType()) == NULL)) {
 		ColumnType colType1 = x1->getColumnType();
 		ColumnType colType2 = x2->getColumnType();
 
@@ -1471,9 +1561,11 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
 		return Expr::newNullValue(txn);
 	}
 	if (!x1->isValue() || !x2->isValue() ||
-		ValueProcessor::isArray(x1->value_->getType()) || 
-		ValueProcessor::isArray(x2->value_->getType()) ||
-		opTable[x1->value_->getType()][x2->value_->getType()] == NULL) {
+			ValueProcessor::isArray(x1->value_->getType()) ||
+			ValueProcessor::isArray(x2->value_->getType()) ||
+			ComparatorTable::findOperator(
+					opTable,
+					x1->value_->getType(), x2->value_->getType()) == NULL) {
 		switch (mode) {
 		case EVAL_MODE_PRINT: {
 			util::String x("(", QP_ALLOCATOR);  
@@ -1487,7 +1579,7 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
 			return ret;
 		}
 		case EVAL_MODE_CONTRACT: {
-			Expr *ret = this->dup(txn, objectManager);
+			Expr *ret = this->dup(txn, objectManager, strategy);
 			QP_DELETE((*ret->arglist_)[0]);
 			QP_DELETE((*ret->arglist_)[1]);
 			(*ret->arglist_)[0] = x1;
@@ -1502,9 +1594,11 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
 		}
 	}
 
-	bool d = opTable[x1->value_->getType()][x2->value_->getType()](txn,
-		x1->value_->data(), x1->value_->size(), x2->value_->data(),
-		x2->value_->size());
+	bool d = ComparatorTable::getOperator(
+			opTable, x1->value_->getType(), x2->value_->getType())(
+			txn,
+			x1->value_->data(), x1->value_->size(),
+			x2->value_->data(), x2->value_->size());
 	QP_DELETE(x1);
 	QP_DELETE(x2);
 
@@ -1524,21 +1618,25 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
  *
  * @return Evaluated expression
  */
-Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
-	const Calculator opTable[][11], ContainerRowWrapper *column_values,
-	FunctionMap *function_map, const char *mark, EvalMode mode) {
+Expr *Expr::evalSubBinOp(
+		TransactionContext &txn, ObjectManagerV4 &objectManager,
+		AllocateStrategy &strategy, const ValueCalculatorTable &opTable,
+		ContainerRowWrapper *column_values, FunctionMap *function_map,
+		const char *mark, EvalMode mode) {
 	Expr *x1, *x2;
 
 	assert(arglist_ && (*arglist_)[0] && (*arglist_)[1]);
 	x1 = (*arglist_)[0]->eval(
-		txn, objectManager, column_values, function_map, mode);
+		txn, objectManager, strategy, column_values, function_map, mode);
 	x2 = (*arglist_)[1]->eval(
-		txn, objectManager, column_values, function_map, mode);
+		txn, objectManager, strategy, column_values, function_map, mode);
 
 	if (x1->isValueOrColumn() && x2->isValueOrColumn() &&
-		(ValueProcessor::isArray(x1->getColumnType()) || 
-		ValueProcessor::isArray(x2->getColumnType()) ||
-		opTable[x1->getColumnType()][x2->getColumnType()] == NULL)) {
+			(ValueProcessor::isArray(x1->getColumnType()) ||
+			ValueProcessor::isArray(x2->getColumnType()) ||
+			CalculatorTable::findCalculator(
+					opTable,
+					x1->getColumnType(), x2->getColumnType()) == NULL)) {
 		ColumnType colType1 = x1->getColumnType();
 		ColumnType colType2 = x2->getColumnType();
 
@@ -1569,7 +1667,7 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
 			return ret;
 		}
 		case EVAL_MODE_CONTRACT: {
-			Expr *ret = this->dup(txn, objectManager);
+			Expr *ret = this->dup(txn, objectManager, strategy);
 			QP_DELETE((*ret->arglist_)[0]);
 			QP_DELETE((*ret->arglist_)[1]);
 			(*ret->arglist_)[0] = x1;
@@ -1587,9 +1685,12 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
 	Expr *ret = NULL;
 	ret = Expr::newNumericValue(0, txn);
 
-	opTable[x1->value_->getType()][x2->value_->getType()](txn,
-		x1->value_->data(), x1->value_->size(), x2->value_->data(),
-		x2->value_->size(), *ret->value_);
+	CalculatorTable::getCalculator(
+			opTable, x1->value_->getType(), x2->value_->getType())(
+			txn,
+			x1->value_->data(), x1->value_->size(),
+			x2->value_->data(), x2->value_->size(),
+			*ret->value_);
 
 	QP_DELETE(x1);
 	QP_DELETE(x2);
@@ -1610,7 +1711,7 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
  *
  * @return Evaluated expression
  */
-Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
+Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	const Operation opType, ContainerRowWrapper *column_values,
 	FunctionMap *function_map, const char *mark, EvalMode mode) {
 	Expr *x1, *x2;
@@ -1618,9 +1719,9 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
 	assert(arglist_ && (*arglist_)[0] && (*arglist_)[1]);
 
 	x1 = (*arglist_)[0]->eval(
-		txn, objectManager, column_values, function_map, mode);
+		txn, objectManager, strategy, column_values, function_map, mode);
 	x2 = (*arglist_)[1]->eval(
-		txn, objectManager, column_values, function_map, mode);
+		txn, objectManager, strategy, column_values, function_map, mode);
 
 	if (!x2->isNullValue()) {
 		QP_SAFE_DELETE(x1);
@@ -1652,7 +1753,7 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
 				return ret;
 			}
 			case EVAL_MODE_CONTRACT: {
-				Expr *ret = this->dup(txn, objectManager);
+				Expr *ret = this->dup(txn, objectManager, strategy);
 				QP_DELETE((*ret->arglist_)[0]);
 				QP_DELETE((*ret->arglist_)[1]);
 				(*ret->arglist_)[0] = x1;
@@ -1690,14 +1791,15 @@ Expr *Expr::evalSubBinOp(TransactionContext &txn, ObjectManager &objectManager,
  *
  * @return Evaluated expression
  */
-Expr *Expr::evalSubUnaryOpBaseZero(TransactionContext &txn,
-	ObjectManager &objectManager, const Calculator opTable[][11],
-	ContainerRowWrapper *column_values, FunctionMap *function_map,
-	const char *mark, EvalMode mode) {
+Expr *Expr::evalSubUnaryOpBaseZero(
+		TransactionContext &txn, ObjectManagerV4 &objectManager,
+		AllocateStrategy &strategy, const ValueCalculatorTable &opTable,
+		ContainerRowWrapper *column_values, FunctionMap *function_map,
+		const char *mark, EvalMode mode) {
 	Expr *x;
 	assert(arglist_ && (*arglist_)[0]);
 	x = (*arglist_)[0]->eval(
-		txn, objectManager, column_values, function_map, mode);
+		txn, objectManager, strategy, column_values, function_map, mode);
 	Expr *ret = Expr::newNumericValue(0, txn);
 
 	if (x->isNullValue()) {
@@ -1729,8 +1831,9 @@ Expr *Expr::evalSubUnaryOpBaseZero(TransactionContext &txn,
 		return ret2;
 	}
 	else {
-		if (!x->isNumeric() ||
-			opTable[ret->value_->getType()][x->value_->getType()] == NULL) {
+		if (!x->isNumeric() || CalculatorTable::findCalculator(
+				opTable,
+				ret->value_->getType(), x->value_->getType()) == NULL) {
 			QP_SAFE_DELETE(ret);
 			switch (mode) {
 			case EVAL_MODE_PRINT: {
@@ -1743,7 +1846,7 @@ Expr *Expr::evalSubUnaryOpBaseZero(TransactionContext &txn,
 				return ret;
 			}
 			case EVAL_MODE_CONTRACT: {
-				ret = this->dup(txn, objectManager);
+				ret = this->dup(txn, objectManager, strategy);
 				QP_DELETE((*ret->arglist_)[0]);
 				(*ret->arglist_)[0] = x;
 				return ret;
@@ -1756,8 +1859,10 @@ Expr *Expr::evalSubUnaryOpBaseZero(TransactionContext &txn,
 		}
 	}
 
-	opTable[ret->value_->getType()][x->value_->getType()](
-		txn, ret->value_->data(), 0, x->value_->data(), 0, *ret->value_);
+	CalculatorTable::getCalculator(
+			opTable, ret->value_->getType(), x->value_->getType())(
+			txn, ret->value_->data(), 0, x->value_->data(),
+			0, *ret->value_);
 	QP_DELETE(x);
 
 	return ret;
@@ -1821,9 +1926,11 @@ bool Expr::operator==(Expr &e) {
 		if (vt != e.value_->getType()) {
 			return false;
 		}
-		if (ComparatorTable::eqTable_[vt][vt]) {
+		const Operator op = ComparatorTable::findOperator(
+				ComparatorTable::eqTable_, vt, vt);
+		if (op) {
 			int a;
-			return ComparatorTable::eqTable_[vt][vt]((TransactionContext &)a, value_->data(),
+			return op((TransactionContext &)a, value_->data(),
 				value_->size(), e.value_->data(), value_->size());
 		}
 		else {
@@ -1952,9 +2059,9 @@ bool Expr::isAntinomy(Expr *testExpr) {
  * @return a contracted expression
  */
 Expr *Expr::transposeExpr(
-	TransactionContext &txn, ObjectManager &objectManager) {
+	TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
 	if (type_ != EXPR) {
-		return dup(txn, objectManager);  
+		return dup(txn, objectManager, strategy);  
 	}
 	switch (op_) {
 	case NE:
@@ -1965,7 +2072,7 @@ Expr *Expr::transposeExpr(
 	case GE: {
 	}
 	default:
-		return dup(txn, objectManager);  
+		return dup(txn, objectManager, strategy);  
 	}
 }
 
@@ -2018,9 +2125,13 @@ const ColumnInfo *Expr::getColumnInfo() {
  *
  * @return list of TermCondition
  */
-TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
-	Query &queryObj, bool notFlag) {
+TermCondition *Expr::toCondition(
+		TransactionContext &txn, MapType mapType, Query &queryObj,
+		bool notFlag, bool &semiFiltering) {
 	UNUSED_VARIABLE(queryObj);
+
+	semiFiltering = false;
+
 	TermCondition c;
 	Operation op = op_;  
 	bool isValueCastableToKey =
@@ -2117,7 +2228,6 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 				break;
 			}
 		}
-
 		switch (columnType) {
 		case COLUMN_TYPE_STRING:
 			isValueCastableToKey = (c.valueType_ == COLUMN_TYPE_STRING &&
@@ -2131,7 +2241,7 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 			double d;
 			isValueCastableToKey = (
 				mapType != MAP_TYPE_SPATIAL &&
-				c.valueType_ <= COLUMN_TYPE_LONG && c.valueType_ >= COLUMN_TYPE_BYTE);
+				ValueProcessor::isInteger(c.valueType_));
 			if (isValueCastableToKey && columnType < c.valueType_) {
 				isValueCastableToKey =
 					checkValueRange(columnType, c.valueType_, static_cast<const uint8_t *>(c.value_), i64, d);
@@ -2142,10 +2252,9 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 		case COLUMN_TYPE_DOUBLE: {
 			isValueCastableToKey = (
 				mapType != MAP_TYPE_SPATIAL &&
-				c.valueType_ <= COLUMN_TYPE_DOUBLE &&
-				c.valueType_ >= COLUMN_TYPE_BYTE);
-			if (isValueCastableToKey && (c.valueType_ <= COLUMN_TYPE_LONG ||
-											c.valueType_ == COLUMN_TYPE_DOUBLE)) {
+				ValueProcessor::isNumerical(c.valueType_));
+			if (isValueCastableToKey && (ValueProcessor::isInteger(c.valueType_) ||
+					c.valueType_ == COLUMN_TYPE_DOUBLE)) {
 				double d;
 				int64_t i64;
 				if (checkValueRange(columnType, c.valueType_, c.value_, i64, d)) {
@@ -2179,8 +2288,52 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 		}
 		case COLUMN_TYPE_TIMESTAMP:
 			isValueCastableToKey = (
-				mapType != MAP_TYPE_SPATIAL &&
-				c.valueType_ == COLUMN_TYPE_TIMESTAMP);
+					mapType != MAP_TYPE_SPATIAL &&
+					ValueProcessor::isTimestampFamily(c.valueType_));
+			if (isValueCastableToKey && c.valueType_ != columnType) {
+				Value condValue;
+				condValue.set(c.value_, c.valueType_);
+
+				const Timestamp ts = condValue.getTimestamp();
+				indexValue = reinterpret_cast<uint8_t*>(QP_NEW Timestamp(ts));
+				indexValueSize = sizeof(ts);
+
+				const NanoTimestamp orgTs = condValue.getNanoTimestamp();
+				semiFiltering = (ValueProcessor::compareTimestamp(
+						orgTs, ValueProcessor::getNanoTimestamp(ts)) != 0);
+			}
+			break;
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+			isValueCastableToKey = (
+					mapType != MAP_TYPE_SPATIAL &&
+					ValueProcessor::isTimestampFamily(c.valueType_));
+			if (isValueCastableToKey && c.valueType_ != columnType) {
+				Value condValue;
+				condValue.set(c.value_, c.valueType_);
+
+				const MicroTimestamp ts = condValue.getMicroTimestamp();
+				indexValue = reinterpret_cast<uint8_t*>(
+						QP_NEW MicroTimestamp(ts));
+				indexValueSize = sizeof(ts);
+
+				const NanoTimestamp orgTs = condValue.getNanoTimestamp();
+				semiFiltering = (ValueProcessor::compareTimestamp(
+						orgTs, ValueProcessor::getNanoTimestamp(ts)) != 0);
+			}
+			break;
+		case COLUMN_TYPE_NANO_TIMESTAMP:
+			isValueCastableToKey = (
+					mapType != MAP_TYPE_SPATIAL &&
+					ValueProcessor::isTimestampFamily(c.valueType_));
+			if (isValueCastableToKey && c.valueType_ != columnType) {
+				Value condValue;
+				condValue.set(c.value_, c.valueType_);
+
+				NanoTimestamp ts = condValue.getNanoTimestamp();
+				indexValue = reinterpret_cast<uint8_t*>(
+						QP_NEW NanoTimestamp(ts));
+				indexValueSize = sizeof(ts);
+			}
 			break;
 		default:
 			isValueCastableToKey = false;
@@ -2196,36 +2349,26 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 			}
 		}
 		ColumnType valueType = c.valueType_;
+		c.opType_ = static_cast<DSExpression::Operation>(op);
 
+		Operator condOp;
 		switch (op) {
-		case NE:
-			c.operator_ = ComparatorTable::neTable_[columnType][valueType];
-			break;
-		case EQ:
-			c.operator_ = ComparatorTable::eqTable_[columnType][valueType];
-			break;
-		case LT:
-			c.operator_ = ComparatorTable::ltTable_[columnType][valueType];
-			break;
-		case LE:
-			c.operator_ = ComparatorTable::leTable_[columnType][valueType];
-			break;
-		case GT:
-			c.operator_ = ComparatorTable::gtTable_[columnType][valueType];
-			break;
-		case GE:
-			c.operator_ = ComparatorTable::geTable_[columnType][valueType];
-			break;
 		case IS:
-			c.operator_ = ComparatorTable::isNull_;
+			condOp = ComparatorTable::isNull_;
 			break;
 		case ISNOT:
-			c.operator_ = ComparatorTable::isNotNull_;
+			condOp = ComparatorTable::isNotNull_;
 			break;
 		default:
-			return NULL;  
+			condOp = ComparatorTable::findOperator(
+					c.opType_, columnType, valueType);
+			break;
 		}
-		c.opType_ = static_cast<DSExpression::Operation>(op);
+		if (condOp == NULL) {
+			return NULL; 
+		}
+		ComparatorTable::getOperator(c.opType_, columnType, valueType);
+		c.operator_ = condOp;
 	}
 	else if (type_ == COLUMN) {
 		if (columnType_ != COLUMN_TYPE_BOOL) {
@@ -2236,7 +2379,6 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 		c = TermCondition(COLUMN_TYPE_BOOL, COLUMN_TYPE_BOOL, 
 			DSExpression::EQ, columnId_, (QP_NEW bool((notFlag) ? false : true)),
 			sizeof(bool));
-
 	}
 	else if (type_ == FUNCTION) {
 		if (notFlag) {
@@ -2257,8 +2399,8 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 				if (r1 == NULL) {
 					return NULL;
 				} else {
-					RtreeMap::SearchContext::GeomeryCondition *geomCond = 
-						QP_NEW RtreeMap::SearchContext::GeomeryCondition();
+					RtreeMap::SearchContext::GeometryCondition *geomCond = 
+						QP_NEW RtreeMap::SearchContext::GeometryCondition();
 					geomCond->relation_ = static_cast<uint32_t>(op_g);
 					if (geomCond->relation_ == GEOMETRY_QSF_INTERSECT) {
 						geomCond->pkey_ = *reinterpret_cast<const TrPv3Key *>(r1);
@@ -2273,7 +2415,7 @@ TermCondition *Expr::toCondition(TransactionContext &txn, MapType mapType,
 
 					c = TermCondition(COLUMN_TYPE_BOOL, COLUMN_TYPE_BOOL, 
 						DSExpression::GEOM_OP, indexColumnId, geomCond,
-						sizeof(RtreeMap::SearchContext::GeomeryCondition));
+						sizeof(RtreeMap::SearchContext::GeometryCondition));
 				}
 			}
 			break;
@@ -2294,7 +2436,8 @@ void Expr::getIndexBitmapAndInfo(TransactionContext &txn,
 	ColumnInfo *&columnInfo, Operation &detectedOp, bool notFlag) {
 #define TOBITMAP(x) (1 << (x))
 
-	ObjectManager &objectManager = *(container.getObjectManager());
+	ObjectManagerV4 &objectManager = *(container.getObjectManager());
+	AllocateStrategy &strategy = container.getRowAllocateStrategy();
 	if (type_ == EXPR) {
 		assert(arglist_ != NULL);
 		for (uint32_t i = 0; i < arglist_->size(); i++) {
@@ -2338,14 +2481,14 @@ void Expr::getIndexBitmapAndInfo(TransactionContext &txn,
 		}
 		switch (op) {
 		case EQ:
-			mapBitmap &= (TOBITMAP(MAP_TYPE_HASH) | TOBITMAP(MAP_TYPE_BTREE));
+			mapBitmap &= TOBITMAP(MAP_TYPE_BTREE);
 			if (mapBitmap != 0) {
 				detectedOp = EQ;
 				if (queryObj.doExplain()) {
 					Expr *e = this->eval(
-						txn, objectManager, NULL, NULL, EVAL_MODE_PRINT);
+						txn, objectManager, strategy, NULL, NULL, EVAL_MODE_PRINT);
 					queryObj.addExplain(1, "INDEX_ENABLE", "INDEX_TYPE",
-						"BTREE, HASH", e->getValueAsString(txn));
+						"BTREE", e->getValueAsString(txn));
 					QP_SAFE_DELETE(e);
 				}
 			}
@@ -2359,7 +2502,7 @@ void Expr::getIndexBitmapAndInfo(TransactionContext &txn,
 				detectedOp = op;
 				if (queryObj.doExplain()) {
 					Expr *e =
-						eval(txn, objectManager, NULL, NULL, EVAL_MODE_PRINT);
+						eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_PRINT);
 					queryObj.addExplain(1, "INDEX_ENABLE", "INDEX_TYPE",
 						"BTREE", e->getValueAsString(txn));
 					QP_SAFE_DELETE(e);
@@ -2369,12 +2512,12 @@ void Expr::getIndexBitmapAndInfo(TransactionContext &txn,
 		case IS:
 		case ISNOT:
 			if ((*arglist_)[0]->isColumn()) {
-				mapBitmap &= (TOBITMAP(MAP_TYPE_HASH) | TOBITMAP(MAP_TYPE_BTREE) | TOBITMAP(MAP_TYPE_SPATIAL));
+				mapBitmap &= (TOBITMAP(MAP_TYPE_BTREE) | TOBITMAP(MAP_TYPE_SPATIAL));
 				if (mapBitmap != 0) {
 					detectedOp = op;
 					if (queryObj.doExplain()) {
 						Expr *e =
-							eval(txn, objectManager, NULL, NULL, EVAL_MODE_PRINT);
+							eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_PRINT);
 						queryObj.addExplain(1, "INDEX_ENABLE", "INDEX_TYPE",
 							"BTREE", e->getValueAsString(txn));
 						QP_SAFE_DELETE(e);
@@ -2442,13 +2585,6 @@ void Expr::getIndexBitmapAndInfo(TransactionContext &txn,
 					1, "INDEX_FOUND", "INDEX_TYPE", "BTREE", label_);
 			}
 		}
-		if (container.hasIndex(indexBit, MAP_TYPE_HASH)) {
-			mapBitmap |= TOBITMAP(MAP_TYPE_HASH);
-			if (queryObj.doExplain()) {
-				queryObj.addExplain(
-					1, "INDEX_FOUND", "INDEX_TYPE", "HASH", label_);
-			}
-		}
 		if (container.hasIndex(indexBit, MAP_TYPE_SPATIAL)) {
 			mapBitmap |= TOBITMAP(MAP_TYPE_SPATIAL);
 			if (queryObj.doExplain()) {
@@ -2463,7 +2599,7 @@ void Expr::getIndexBitmapAndInfo(TransactionContext &txn,
 	if (columnInfo != NULL && mapBitmap == 0) {
 		if (queryObj.doExplain()) {
 			const char *columnName =
-				columnInfo->getColumnName(txn, objectManager);
+				columnInfo->getColumnName(txn, objectManager, container.getMetaAllocateStrategy());
 			if (columnInfo->isKey()) {
 				queryObj.addExplain(
 					1, "INDEX_FOUND", "INDEX_TYPE", "ROWKEY", columnName);
@@ -2600,19 +2736,19 @@ Expr *Expr::newColumnNode(const char *upperName, TransactionContext &txn,
 		MetaContainer *metaContainer =
 				Query::getMetaContainer(collection, timeSeries);
 		if (metaContainer != NULL) {
-			ObjectManager &objectManager = *(metaContainer->getObjectManager());
+			ObjectManagerV4 &objectManager = *(metaContainer->getObjectManager());
 			metaContainer->getColumnInfo(
 				txn, objectManager, tmpCName, columnId, cInfo, isQuoted);
 		}
 		else if (collection != NULL) {
-			ObjectManager &objectManager = *(collection->getObjectManager());
+			ObjectManagerV4 &objectManager = *(collection->getObjectManager());
 			collection->getColumnInfo(
-				txn, objectManager, tmpCName, columnId, cInfo, isQuoted);
+				txn, objectManager, collection->getMetaAllocateStrategy(), tmpCName, columnId, cInfo, isQuoted);
 		}
 		else if (timeSeries != NULL) {
-			ObjectManager &objectManager = *(timeSeries->getObjectManager());
+			ObjectManagerV4 &objectManager = *(timeSeries->getObjectManager());
 			timeSeries->getColumnInfo(
-				txn, objectManager, tmpCName, columnId, cInfo, isQuoted);
+				txn, objectManager, timeSeries->getMetaAllocateStrategy(), tmpCName, columnId, cInfo, isQuoted);
 		}
 		else {
 			/* DO NOTHING */
@@ -2765,7 +2901,7 @@ bool Expr::aggregate(TransactionContext &txn, Collection &collection,
 		aggColumnType = (*arglist_)[0]->columnInfo_->getColumnType();
 		if (!agg->isAcceptable(aggColumnType)) {
 			GS_THROW_USER_ERROR(GS_ERROR_TQ_COLUMN_CANNOT_AGGREGATE,
-				"Invalid column for aggregation");
+				"Invalid column for aggregation " << (int) aggColumnType);
 		}
 	}
 	else {
@@ -2780,7 +2916,7 @@ bool Expr::aggregate(TransactionContext &txn, Collection &collection,
 		return true;
 	}
 	else {
-		ObjectManager &objectManager = *(collection.getObjectManager());
+		ObjectManagerV4 &objectManager = *(collection.getObjectManager());
 		agg->reset(aggColumnType);
 
 		BaseContainer::RowArray rowArray(txn, &collection);  
@@ -2789,7 +2925,7 @@ bool Expr::aggregate(TransactionContext &txn, Collection &collection,
 			rowArray.load(txn, resultRowIdList[i], &collection,
 				OBJECT_READ_ONLY);  
 			BaseContainer::RowArray::Row row(rowArray.getRow(), &rowArray);  
-			ContainerValue v(txn.getPartitionId(), objectManager);
+			ContainerValue v(objectManager, collection.getRowAllocateStrategy());
 			row.getField(txn, *aggColumnInfo, v);
 			if (!v.getValue().isNullValue()) {
 				agg->putValue(txn, v.getValue());
@@ -2836,14 +2972,14 @@ bool Expr::aggregate(TransactionContext &txn, TimeSeries &timeSeries,
 		return true;
 	}
 	else {
-		ObjectManager &objectManager = *(timeSeries.getObjectManager());
+		ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
 
 		BaseContainer::RowArray rowArray(txn, &timeSeries);		  
 		ColumnInfo &keyColumnInfo = timeSeries.getColumnInfo(0);  
 		ColumnInfo &aggColumnInfo = timeSeries.getColumnInfo(aggColumnId);  
 		for (uint32_t i = 0; i < resultRowIdList.size(); i++) {
-			ContainerValue k(txn.getPartitionId(), objectManager);
-			ContainerValue v(txn.getPartitionId(), objectManager);
+			ContainerValue k(objectManager, timeSeries.getRowAllocateStrategy());
+			ContainerValue v(objectManager, timeSeries.getRowAllocateStrategy());
 			rowArray.load(txn, resultRowIdList[i], &timeSeries,
 				OBJECT_READ_ONLY);  
 			BaseContainer::RowArray::Row row(rowArray.getRow(), &rowArray);  
@@ -2973,10 +3109,10 @@ void Expr::unescape(util::String &str, char escape) {
 	}
 }
 
-SortExpr *SortExpr::dup(TransactionContext &txn, ObjectManager &objectManager) {
+SortExpr *SortExpr::dup(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
 	SortExpr *dest = QP_NEW SortExpr;
 	dest->order = order;
 	dest->nullsLast = nullsLast;
-	dest->expr = expr->dup(txn, objectManager);
+	dest->expr = expr->dup(txn, objectManager, strategy);
 	return dest;
 }

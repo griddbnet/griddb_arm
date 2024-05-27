@@ -41,7 +41,10 @@ struct DQLProcs {
 	class ProcRegistrar;
 	class ProcRegistrarTable;
 
+	class ProcResourceSet;
 	class ExtProcContext;
+
+	class ProcSimulator;
 
 	class OptionInput;
 	class OptionOutput;
@@ -84,6 +87,13 @@ public:
 
 	virtual void exportTo(Context &cxt, const OutOption &option) const;
 
+	static void transcodeProfilerSpecific(
+			util::StackAllocator &alloc, const TypeInfo &typeInfo,
+			util::AbstractObjectInStream &in,
+			util::AbstractObjectOutStream &out);
+
+	static bool isDQL(SQLType::Id type);
+
 	static const DQLProcs::ProcRegistrarTable& getRegistrarTable();
 
 private:
@@ -93,43 +103,83 @@ private:
 	typedef SQLOps::OpStoreId OpStoreId;
 	typedef SQLOps::OpCursor OpCursor;
 	typedef SQLOps::OpStore OpStore;
+	typedef SQLOps::OpCode OpCode;
+	typedef SQLOps::OpAllocatorManager OpAllocatorManager;
+
+	typedef util::AllocVector<TupleList::TupleColumnType> AllocTupleInfo;
+	typedef util::AllocVector<AllocTupleInfo> AllocTupleInfoList;
+	typedef util::AllocXArray<uint8_t> OptionImage;
+
+	struct InfoEntry {
+		InfoEntry(const util::StdAllocator<void, void> &alloc);
+
+		util::LocalUniquePtr<TupleList::Group> storeGroup_;
+		OptionImage optionImage_;
+		AllocTupleInfoList inputInfo_;
+		AllocTupleInfo outputInfo_;
+	};
 
 	static const ProcRegistrar REGISTRAR_LIST[];
 	static const ProcRegistrarTable REGISTRAR_TABLE;
 
-	OpStore::Entry& getInputEntry(InputId inputId);
-	OpStore::Entry* findInputEntry(InputId inputId);
-
-	static void appendBlock(OpStore::Entry &entry, const Block &block);
+	OpStore::Entry& getInputEntry(Context &cxt, InputId inputId);
+	OpStore::Entry* findInputEntry(Context &cxt, InputId inputId);
 
 	OpCursor::Source getCursorSource(Context &cxt);
+	OpCursor::Source getCursorSourceForNext(Context &cxt);
+	OpCursor::Source getCursorSourceDetail(Context &cxt, bool forNext);
+
+	OpStore& prepareStore(Context &cxt);
+	SQLOps::ExtOpContext& getExtOpContext(Context &cxt);
+
+	void loadOption(
+			SQLValues::ValueContext &valueCxt, const OptionImage &image,
+			DQLProcs::Option &option) const;
+
+	static SQLValues::ValueContext::Source getValueContextSource(
+			util::StackAllocator &alloc, SQLValues::VarAllocator &varAlloc,
+			TupleList::Group &storeGroup,
+			util::LocalUniquePtr<SQLValues::VarContext> &varCxt);
 
 	const OpStoreId& getStoreRootId() const;
 
 	static const SQLOps::OpCode& getRootCode(
 			OpStore &store, const OpStoreId &rootId);
 
+	static void setUpConfig(
+			OpStore &store, const SQLProcessorConfig *config, bool merged);
 	static void setUpRoot(
 			OpStore &store, OpStore::Entry &rootEntry,
-			const DQLProcs::Option &option, const TupleInfoList &inputInfo);
+			const DQLProcs::Option &option,
+			const AllocTupleInfoList &inputInfo);
 	static void setUpInput(
 			const SQLOps::OpCode &code, size_t inputCount,
 			InputId &inputIdOffset);
 
 	static SQLOps::OpCode createOpCode(
 			util::StackAllocator &alloc, const DQLProcs::Option &option,
-			const TupleInfoList &inputInfo);
+			const AllocTupleInfoList &inputInfo);
 	static void getOutputInfo(
 			const SQLOps::OpCode &code, TupleInfo &outputInfo);
 
-	util::StdAllocator<void, void> alloc_;
-	util::LocalUniquePtr<TupleList::Group> storeGroup_;
-	OpStore store_;
+	static bool isProfilerRequested(const Profiler &profiler);
+	static bool matchProfilerResultType(const Profiler &profiler, bool asStream);
+
+	util::AllocUniquePtr<InfoEntry> infoEntry_;
+	util::LocalUniquePtr<OpAllocatorManager> allocManager_;
+	util::LocalUniquePtr<OpStore> store_;
 	OpStoreId storeRootId_;
 	InputId inputIdOffset_;
-	util::AllocUniquePtr<DQLProcs::Option> option_;
 	util::AllocUniquePtr<DQLProcs::ExtProcContext> extCxt_;
+
 	Profiler profiler_;
+	util::AllocUniquePtr<DQLProcs::ProcSimulator> simulator_;
+};
+
+struct SQLOpUtils::AnalysisPartialInfo {
+	UTIL_OBJECT_CODER_MEMBERS(globalStatus_);
+
+	SQLProcessorConfig::PartialStatus globalStatus_;
 };
 
 class DQLProcs::ProcRegistrar {
@@ -165,6 +215,24 @@ private:
 	size_t size_;
 };
 
+class DQLProcs::ProcResourceSet : public ResourceSet {
+public:
+	ProcResourceSet();
+
+	void setBase(SQLContext &baseCxt);
+
+	virtual SQLService* getSQLService() const;
+	virtual TransactionManager* getTransactionManager() const;
+	virtual TransactionService* getTransactionService() const;
+	virtual ClusterService* getClusterService() const;
+	virtual PartitionTable* getPartitionTable() const;
+	virtual PartitionList* getPartitionList() const;
+	virtual const DataStoreConfig* getDataStoreConfig() const;
+
+private:
+	SQLContext *baseCxt_;
+};
+
 class DQLProcs::ExtProcContext : public SQLOps::ExtOpContext {
 public:
 	ExtProcContext();
@@ -187,12 +255,59 @@ public:
 
 	virtual bool isOnTransactionService();
 	virtual double getStoreMemoryAgingSwapRate();
-	virtual void getConfig(SQLOps::OpConfig &config);
+	virtual bool isAdministrator();
+
+	virtual uint32_t getTotalWorkerId();
 
 private:
 	SQLContext& getBase();
 
 	SQLContext *baseCxt_;
+	ProcResourceSet resourceSet_;
+};
+class DQLProcs::ProcSimulator {
+private:
+	typedef SQLProcessorConfig::Manager Manager;
+	typedef SQLOps::OpSimulator OpSimulator;
+
+public:
+	explicit ProcSimulator(Manager &manager);
+	~ProcSimulator();
+
+	SQLOps::OpSimulator* getOpSimulator();
+
+	uint32_t checkPartialMonitor(bool forNext);
+	SQLOpUtils::AnalysisPartialInfo* getPartialProfile();
+
+	static SQLOps::OpSimulator* tryCreate(
+			SQLProcessor::Context &cxt, Manager &manager,
+			util::AllocUniquePtr<ProcSimulator> &simulator,
+			SQLType::Id type, const SQLOps::OpPlan &plan);
+
+	static Manager::SimulationEntry toBaseEntry(const OpSimulator::Entry &src);
+	static OpSimulator::Entry toOpEntry(const Manager::SimulationEntry &src);
+
+private:
+	struct PartialInfo {
+		PartialInfo();
+
+		Manager::PartialId id_;
+		SQLOpUtils::AnalysisPartialInfo profile_;
+		bool pretendSuspendLast_;
+	};
+
+	static bool tryCreateOpSimulator(
+			SQLProcessor::Context &cxt, Manager &manager,
+			util::AllocUniquePtr<ProcSimulator> &simulator,
+			SQLType::Id type, const SQLOps::OpPlan &plan);
+	static bool tryCreatePartialMonitor(
+			SQLProcessor::Context &cxt, Manager &manager,
+			util::AllocUniquePtr<ProcSimulator> &simulator,
+			SQLType::Id type, const SQLOps::OpPlan &plan);
+
+	util::LocalUniquePtr<SQLOps::OpSimulator> opSimulator_;
+	util::LocalUniquePtr<PartialInfo> partialInfo_;
+	Manager &manager_;
 };
 
 class DQLProcs::OptionInput {
@@ -276,6 +391,8 @@ public:
 
 	SQLOps::OpCode toCode(SQLOps::OpCodeBuilder &builder) const;
 
+	static bool isInputIgnorable(const SQLOps::OpCode &code);
+
 private:
 	typedef BasicSubOption<CommonOption> Common;
 
@@ -351,12 +468,13 @@ public:
 	UTIL_OBJECT_CODER_PARTIAL_OBJECT;
 
 	UTIL_OBJECT_CODER_MEMBERS(
-			columnList_, groupColumns_, nestLevel_);
+			columnList_, groupColumns_, nestLevel_, pred_);
 
 private:
 	Expression *columnList_;
 	ColumnPosList groupColumns_;
 	uint32_t nestLevel_;
+	Expression *pred_;
 };
 
 class DQLProcs::JoinOption {
@@ -416,34 +534,15 @@ public:
 	UTIL_OBJECT_CODER_ALLOC_CONSTRUCTOR;
 	UTIL_OBJECT_CODER_PARTIAL_OBJECT;
 
-	UTIL_OBJECT_CODER_MEMBERS(
-			UTIL_OBJECT_CODER_ENUM(
-					tableType_, SQLType::TABLE_CONTAINER, SQLType::Coder()),
-			UTIL_OBJECT_CODER_OPTIONAL(databaseVersionId_, 0),
-			UTIL_OBJECT_CODER_OPTIONAL(containerId_, 0U),
-			UTIL_OBJECT_CODER_OPTIONAL(schemaVersionId_, 0U),
-			UTIL_OBJECT_CODER_OPTIONAL(partitioningVersionId_, -1),
-			columnList_,
-			pred_,
-			UTIL_OBJECT_CODER_OPTIONAL(containerExpirable_, false),
-			UTIL_OBJECT_CODER_OPTIONAL(indexActivated_, false),
-			UTIL_OBJECT_CODER_OPTIONAL(multiIndexActivated_, false),
-			indexList_);
+	UTIL_OBJECT_CODER_MEMBERS(location_, columnList_, pred_);
 
 private:
-	SQLType::TableType tableType_;
-	int64_t databaseVersionId_;
+	static SQLOps::ContainerLocation getLocation(
+			util::StackAllocator &alloc, const ProcPlan::Node &node);
 
-	uint64_t containerId_;
-	uint32_t schemaVersionId_;
-	int64_t partitioningVersionId_;
-
+	SQLOps::ContainerLocation location_;
 	Expression *columnList_;
 	Expression *pred_;
-	bool containerExpirable_;
-	bool indexActivated_;
-	bool multiIndexActivated_;
-	util::Vector<int32_t> *indexList_;
 };
 
 class DQLProcs::SelectOption {

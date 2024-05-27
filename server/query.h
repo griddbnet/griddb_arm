@@ -126,7 +126,7 @@ public:
 	struct ExprAccessor;
 	struct BoolExprAccessor;
 
-	Query(TransactionContext &txn, ObjectManager &objectManager,
+	Query(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		const TQLInfo &tqlInfo, uint64_t limit = MAX_RESULT_SIZE,
 		QueryHookClass *hook = NULL);
 	virtual ~Query();
@@ -198,8 +198,8 @@ protected:
 		return txn_;
 	}
 
-	Query(TransactionContext &txn, ObjectManager &objectManager)
-		: tqlInfo_(TQLInfo()), txn_(txn), objectManager_(objectManager) {
+	Query(TransactionContext &txn, ObjectManagerV4&objectManager, AllocateStrategy &strategy)
+		: tqlInfo_(TQLInfo()), txn_(txn), objectManager_(objectManager), strategy_(strategy) {
 		isSetError_ = false;
 		isExplainExecute_ = true;
 		explainAllocNum_ = 0;
@@ -247,7 +247,7 @@ protected:
 			return NULL;
 		}
 	}
-	virtual Query *dup(TransactionContext &, ObjectManager &) {
+	virtual Query *dup(TransactionContext &, ObjectManagerV4 &, AllocateStrategy &) {
 		return NULL;
 	}
 	virtual void finishQuery(TransactionContext &txn, ResultSet &resultSet,
@@ -281,7 +281,7 @@ protected:
 
 		uint64_t limit = MAX_RESULT_SIZE;
 		if (pLimitExpr_ != NULL) {
-			int64_t tmp = pLimitExpr_->eval(txn_, objectManager_, NULL,
+			int64_t tmp = pLimitExpr_->eval(txn_, objectManager_, strategy_, NULL,
 							functionMap_, EVAL_MODE_NORMAL)
 							->getValueAsInt64();
 			if (tmp < 0) {
@@ -305,7 +305,7 @@ protected:
 		}
 		nOffset_ = 0;
 		if (e2 != NULL) {
-			int64_t tmp = e2->eval(txn_, objectManager_, NULL,
+			int64_t tmp = e2->eval(txn_, objectManager_, strategy_, NULL,
 							functionMap_, EVAL_MODE_NORMAL)
 							->getValueAsInt64();
 			if (tmp < 0) {
@@ -442,7 +442,7 @@ protected:
 			sizeof(OId);  
 		for (uint32_t i = 0; i < EXPLAIN_COLUMN_NUM; i++) {
 			explainColumnInfoList[i].initialize();
-			explainColumnInfoList[i].setType(explainColumnTypeList[i], false);
+			explainColumnInfoList[i].setType(explainColumnTypeList[i]);
 			if (explainColumnInfoList[i].isVariable()) {  
 				explainColumnInfoList[i].setOffset(variableColumnIndex);
 				++variableColumnIndex;
@@ -461,9 +461,9 @@ protected:
 		util::XArray<T> &resultRowIdList, util::XArray<T> &andRowIdArray) {
 		size_t currentResultSize = resultRowIdList.size();
 		size_t newResultSize = andRowIdArray.size();
-		const size_t sortThrethold = 100;
+		const size_t sortThreshold = 100;
 
-		if (currentResultSize + newResultSize > sortThrethold) {
+		if (currentResultSize + newResultSize > sortThreshold) {
 			util::XArray<T> tmp(txn.getDefaultAllocator());
 
 			switch (nResultSorted_) {
@@ -524,8 +524,9 @@ protected:
 	const char *
 		pFromCollectionName_;  
 	TransactionContext &txn_;  
-	ObjectManager
+	ObjectManagerV4
 		&objectManager_;  
+	AllocateStrategy &strategy_;
 	ParseState parseState_;  
 	static bool sIsTrace_;
 	int nResultSorted_;  
@@ -576,7 +577,7 @@ struct Query::BoolExprAccessor : public BoolExpr {
 
 /*!
  * @brief Callback member function by template.
- * Use like "cast_to_callback<Query, bool, &Query::ComparaterFunc>"
+ * Use like "cast_to_callback<Query, bool, &Query::ComparatorFunc>"
  *
  * @return
  */

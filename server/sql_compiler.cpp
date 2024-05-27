@@ -1,6 +1,6 @@
 ﻿/*
 	Copyright (c) 2017 TOSHIBA Digital Solutions Corporation
-
+	
 	This program is free software: you can redistribute it and/or modify
 	it under the terms of the GNU Affero General Public License as
 	published by the Free Software Foundation, either version 3 of the
@@ -14,33 +14,15 @@
 	You should have received a copy of the GNU Affero General Public License
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
-#include "sql_compiler.h"
+#include "sql_compiler_internal.h"
+
 #include "sql_processor.h" 
-#include "resource_set.h"
-#include "sql_execution_manager.h" 
+#include "sql_execution.h" 
 #include "meta_type.h"
 
 #include "json.h"
 #include "picojson.h"
 #include "sql_utils.h"
-
-UTIL_TRACER_DECLARE(SQL_HINT);
-
-#define SQL_COMPILER_THROW_ERROR(errorCode, exprPtr, message) \
-	do { \
-		/* TODO */ \
-		static_cast<void>(static_cast<const SyntaxTree::Expr*>(exprPtr)); \
-		GS_THROW_USER_ERROR(errorCode, message); \
-	} \
-	while (false)
-
-#define SQL_COMPILER_RETHROW_ERROR(cause, exprPtr, message) \
-	do { \
-		/* TODO */ \
-		static_cast<void>(static_cast<const SyntaxTree::Expr*>(exprPtr)); \
-		GS_RETHROW_USER_ERROR(cause, message); \
-	} \
-	while (false)
 
 SQLTableInfo::SQLTableInfo(util::StackAllocator &alloc) :
 		dbName_(alloc),
@@ -48,15 +30,14 @@ SQLTableInfo::SQLTableInfo(util::StackAllocator &alloc) :
 		hasRowKey_(false),
 		writable_(false),
 		isView_(false),
+		isExpirable_(false),
 		columnInfoList_(alloc),
 		partitioning_(NULL),
-		indexInfoList_(alloc),
-		compositeIndexInfoList_(alloc),
+		indexInfoList_(NULL),
+		basicIndexInfoList_(NULL),
 		nosqlColumnInfoList_(alloc),
 		nosqlColumnOptionList_(alloc),
-		sqlString_(alloc),  
-		isExpirable_(false),
-		approxSize_(0),
+		sqlString_(alloc),
 		cardinalityList_(alloc),
 		nullsStats_(alloc) {
 }
@@ -70,7 +51,8 @@ SQLTableInfo::IdInfo::IdInfo() :
 		schemaVersionId_(0),
 		subContainerId_(-1),
 		partitioningVersionId_(-1),
-		isNodeExpansion_(false) {
+		isNodeExpansion_(false),
+		approxSize_(-1) {
 }
 
 bool SQLTableInfo::IdInfo::isEmpty() const {
@@ -85,22 +67,23 @@ bool SQLTableInfo::IdInfo::operator==(const IdInfo &another) const {
 			containerId_ == another.containerId_ &&
 			schemaVersionId_ == another.schemaVersionId_ &&
 			subContainerId_ == another.subContainerId_ &&
-			partitioningVersionId_ == another.partitioningVersionId_;
+			partitioningVersionId_ == another.partitioningVersionId_ &&
+			approxSize_ == another.approxSize_;
 }
 
 SQLTableInfo::SubInfo::SubInfo() :
 		partitionId_(0),
 		containerId_(0),
 		schemaVersionId_(0),
-		indexInfoList_(NULL),
-		nodeAffinity_(-1) {
+		nodeAffinity_(-1),
+		approxSize_(-1) {
 }
 
 SQLTableInfo::PartitioningInfo::PartitioningInfo(util::StackAllocator &alloc) :
 		alloc_(alloc),
 		partitioningType_(0),
-		partitioningColumnId_(UNDEF_COLUMNID),
-		subPartitioningColumnId_(UNDEF_COLUMNID),
+		partitioningColumnId_(-1),
+		subPartitioningColumnId_(-1),
 		subInfoList_(alloc_),
 		tableName_(alloc),
 		isCaseSensitive_(false),
@@ -111,7 +94,8 @@ SQLTableInfo::PartitioningInfo::PartitioningInfo(util::StackAllocator &alloc) :
 		availableList_(alloc) {
 }
 
-void SQLTableInfo::PartitioningInfo::copy(SQLTableInfo::PartitioningInfo &partitioningInfo) {
+void SQLTableInfo::PartitioningInfo::copy(
+		const SQLTableInfo::PartitioningInfo &partitioningInfo) {
 	partitioningType_ = partitioningInfo.partitioningType_;
 	partitioningColumnId_ = partitioningInfo.partitioningColumnId_;
 	subPartitioningColumnId_ = partitioningInfo.subPartitioningColumnId_;
@@ -125,6 +109,39 @@ void SQLTableInfo::PartitioningInfo::copy(SQLTableInfo::PartitioningInfo &partit
 	intervalValue_ = partitioningInfo.intervalValue_;
 }
 
+SQLTableInfo::SQLIndexInfo::SQLIndexInfo(util::StackAllocator &alloc) :
+		columns_(alloc) {
+}
+
+SQLTableInfo::BasicIndexInfoList::BasicIndexInfoList(
+		util::StackAllocator &alloc) :
+		columns_(alloc) {
+}
+
+void SQLTableInfo::BasicIndexInfoList::assign(
+		util::StackAllocator &alloc, const IndexInfoList &src) {
+	util::Set<ColumnId> columnSet(alloc);
+	for (IndexInfoList::const_iterator it = src.begin(); it != src.end(); ++it) {
+		if (it->columns_.empty()) {
+			assert(false);
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
+		}
+		columnSet.insert(it->columns_.front());
+	}
+	columns_.assign(columnSet.begin(), columnSet.end());
+}
+
+const util::Vector<ColumnId>&
+SQLTableInfo::BasicIndexInfoList::getFirstColumns() const {
+	return columns_;
+}
+
+bool SQLTableInfo::BasicIndexInfoList::isIndexed(
+		ColumnId firstColumnId) const {
+	return std::binary_search(
+			columns_.begin(), columns_.end(), firstColumnId);
+}
+
 SQLTableInfoList::SQLTableInfoList(util::StackAllocator &alloc) :
 		list_(alloc),
 		defaultDBName_(NULL) {
@@ -134,6 +151,15 @@ const SQLTableInfo& SQLTableInfoList::add(const SQLTableInfo &info) {
 	const SQLTableInfo::Id id = static_cast<SQLTableInfo::Id>(list_.size());
 	list_.push_back(info);
 	list_.back().idInfo_.id_ = id;
+
+	if (info.indexInfoList_ != NULL) {
+		util::StackAllocator &alloc = getAllocator();
+		BasicIndexInfoList *basicIndexInfoList =
+				ALLOC_NEW(alloc) BasicIndexInfoList(alloc);
+		basicIndexInfoList->assign(alloc, *info.indexInfoList_);
+		list_.back().basicIndexInfoList_ = basicIndexInfoList;
+	}
+
 	return list_.back();
 }
 
@@ -193,17 +219,23 @@ const SQLTableInfo* SQLTableInfoList::prepareMeta(
 		const bool forCore = true;
 		SQLCompiler::Meta::getMetaColumnInfo(
 				alloc, coreIdInfo, forCore, info.columnInfoList_, -1);
-		info.partitioning_ =
-				ALLOC_NEW(alloc) SQLTableInfo::PartitioningInfo(alloc);
-		info.partitioning_->partitioningCount_ = partitionCount;
-		info.partitioning_->clusterPartitionCount_ = partitionCount;
 
-		SQLTableInfo::SubInfoList &subInfoList = info.partitioning_->subInfoList_;
-		subInfoList.resize(partitionCount);
-		for (uint32_t i = 0; i < partitionCount; i++) {
-			subInfoList[i].partitionId_ = i;
-			subInfoList[i].containerId_ = coreIdInfo.containerId_;
-			subInfoList[i].nodeAffinity_ = i;
+		{
+			SQLTableInfo::PartitioningInfo *partitioning =
+					ALLOC_NEW(alloc) SQLTableInfo::PartitioningInfo(alloc);
+
+			partitioning->partitioningCount_ = partitionCount;
+			partitioning->clusterPartitionCount_ = partitionCount;
+
+			SQLTableInfo::SubInfoList &subInfoList = partitioning->subInfoList_;
+			subInfoList.resize(partitionCount);
+			for (uint32_t i = 0; i < partitionCount; i++) {
+				subInfoList[i].partitionId_ = i;
+				subInfoList[i].containerId_ = coreIdInfo.containerId_;
+				subInfoList[i].nodeAffinity_ = i;
+			}
+
+			info.partitioning_ = partitioning;
 		}
 
 		return &add(info);
@@ -302,40 +334,24 @@ const SQLTableInfo* SQLTableInfoList::find(
 	return NULL;
 }
 
-util::StackAllocator& SQLTableInfoList::getAllocator() {
-	return *list_.get_allocator().base();
-}
-
-void SQLTableInfoList::applyStatisticalHint(SQLHintInfo &hintInfo) {
-	for (List::iterator it = list_.begin(); it != list_.end(); ++it) {
-		hintInfo.applyStatisticalHint(*it); 
-	}
-}
-
-const SQLTableInfo::IndexInfoList& SQLTableInfoList::getIndexInfoList(
+const SQLTableInfo::BasicIndexInfoList* SQLTableInfoList::getIndexInfoList(
 		const SQLTableInfo::IdInfo &idInfo) const {
 	const SQLTableInfo &tableInfo = resolve(idInfo.id_);
-	if (idInfo.subContainerId_ >= 0 && tableInfo.partitioning_ != NULL) {
-		const SQLTableInfo::SubInfo &subInfo =
-				tableInfo.partitioning_->subInfoList_[idInfo.subContainerId_];
-		if (subInfo.indexInfoList_ != NULL) {
-			return *subInfo.indexInfoList_;
-		}
-	}
+	return tableInfo.basicIndexInfoList_;
+}
 
-	return tableInfo.indexInfoList_;
+util::StackAllocator& SQLTableInfoList::getAllocator() {
+	return *list_.get_allocator().base();
 }
 
 SQLPreparedPlan::SQLPreparedPlan(util::StackAllocator &alloc) :
 		nodeList_(alloc),
 		parameterList_(alloc),
 		currentTimeRequired_(false),
-		bindList_(NULL),
 		hintInfo_(NULL) {
 }
 
 SQLPreparedPlan::~SQLPreparedPlan() {
-	ALLOC_DELETE(getAllocator(), hintInfo_);
 }
 
 util::StackAllocator& SQLPreparedPlan::getAllocator() const {
@@ -364,6 +380,22 @@ const SQLPreparedPlan::Node& SQLPreparedPlan::back() const {
 	return nodeList_.back();
 }
 
+bool SQLPreparedPlan::isDisabledNode(const Node &node) {
+	return (node.type_ == getDisabledNodeType());
+}
+
+bool SQLPreparedPlan::isDisabledExpr(const SyntaxTree::Expr &expr) {
+	return (expr.op_ == getDisabledExprType());
+}
+
+SQLType::Id SQLPreparedPlan::getDisabledNodeType() {
+	return SQLType::START_EXEC;
+}
+
+SQLType::Id SQLPreparedPlan::getDisabledExprType() {
+	return SQLType::START_EXPR;
+}
+
 void SQLPreparedPlan::removeEmptyNodes() {
 	util::StackAllocator &alloc = getAllocator();
 
@@ -373,7 +405,7 @@ void SQLPreparedPlan::removeEmptyNodes() {
 			nodeIt != nodeList_.end(); ++nodeIt) {
 		Node &node = *nodeIt;
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			idMap.push_back(SyntaxTree::UNDEF_INPUTID);
 		}
 		else {
@@ -391,7 +423,7 @@ void SQLPreparedPlan::removeEmptyNodes() {
 			nodeIt != nodeList_.end(); ++nodeIt) {
 		Node &node = *nodeIt;
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			continue;
 		}
 
@@ -420,7 +452,7 @@ void SQLPreparedPlan::removeEmptyColumns() {
 			nodeIt != nodeList_.end(); ++nodeIt) {
 		Node &node = *nodeIt;
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			allColumnMap.push_back(NULL);
 			continue;
 		}
@@ -431,7 +463,7 @@ void SQLPreparedPlan::removeEmptyColumns() {
 		ColumnId nextId = 0;
 		for (Node::ExprList::iterator it = node.outputList_.begin();
 				it != node.outputList_.end(); ++it) {
-			if (it->op_ == SQLType::START_EXPR) {
+			if (isDisabledExpr(*it)) {
 				columnMap->push_back(std::numeric_limits<ColumnId>::max());
 				found = true;
 			}
@@ -452,7 +484,7 @@ void SQLPreparedPlan::removeEmptyColumns() {
 			nodeIt != nodeList_.end(); ++nodeIt) {
 		Node &node = *nodeIt;
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			continue;
 		}
 
@@ -467,7 +499,7 @@ void SQLPreparedPlan::removeEmptyColumns() {
 
 		for (Node::ExprList::iterator it = node.outputList_.begin();
 				it != node.outputList_.end();) {
-			if (it->op_ == SQLType::START_EXPR) {
+			if (isDisabledExpr(*it)) {
 				it = node.outputList_.erase(it);
 			}
 			else {
@@ -485,7 +517,7 @@ void SQLPreparedPlan::validateReference(
 			nodeIt != nodeList_.end(); ++nodeIt) {
 		const Node &node = *nodeIt;
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			continue;
 		}
 
@@ -559,7 +591,7 @@ void SQLPreparedPlan::validateReference(
 					static_cast<Node::Id>(nodeIt - nodeList_.begin());
 			const bool visited = visitedList[nodeId];
 
-			if ((node.type_ == SQLType::START_EXEC) == !!visited) {
+			if (!isDisabledNode(node) == !visited) {
 				assert(false);
 				GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
 			}
@@ -570,10 +602,14 @@ void SQLPreparedPlan::validateReference(
 
 void SQLPreparedPlan::setUpHintInfo(
 		const SyntaxTree::ExprList* hintList, SQLTableInfoList &tableInfoList) {
+	static_cast<void>(tableInfoList); 
+
 	assert(hintInfo_ == NULL);
 	if (hintList) {
-		hintInfo_ = ALLOC_NEW(getAllocator()) SQLHintInfo(getAllocator());
-		hintInfo_->makeHintMap(hintList, tableInfoList);
+		util::StackAllocator &alloc = getAllocator();
+		SQLHintInfo *info =  ALLOC_NEW(alloc) SQLHintInfo(alloc);
+		info->makeHintMap(hintList);
+		hintInfo_ = info;
 	}
 }
 
@@ -629,6 +665,14 @@ const SQLPreparedPlan::Node::CommandOptionFlag
 const SQLPreparedPlan::Node::CommandOptionFlag
 		SQLPreparedPlan::Node::Config::CMD_OPT_WINDOW_SORTED = 1 << 7;
 
+const SQLPreparedPlan::Node::CommandOptionFlag
+		SQLPreparedPlan::Node::Config::CMD_OPT_GROUP_RANGE = 1 << 8;
+
+const SQLPreparedPlan::Node::CommandOptionFlag
+		SQLPreparedPlan::Node::Config::CMD_OPT_JOIN_DRIVING_NONE_LEFT = 1 << 9;
+const SQLPreparedPlan::Node::CommandOptionFlag
+		SQLPreparedPlan::Node::Config::CMD_OPT_JOIN_DRIVING_SOME = 1 << 10;
+
 SQLPreparedPlan::Node::Node(util::StackAllocator &alloc) :
 		id_(0),
 		type_(Type()),
@@ -648,7 +692,6 @@ SQLPreparedPlan::Node::Node(util::StackAllocator &alloc) :
 		updateSetList_(NULL),
 		createTableOpt_(NULL),
 		createIndexOpt_(NULL),
-		tqlPred_(NULL),
 		partitioningInfo_(NULL),
 		commandType_(SyntaxTree::CMD_NONE),
 		cmdOptionList_(NULL),
@@ -656,7 +699,8 @@ SQLPreparedPlan::Node::Node(util::StackAllocator &alloc) :
 		insertSetList_(NULL),
 		nosqlTypeList_(NULL),
 		nosqlColumnOptionList_(NULL),
-		optionParam_(NULL) {
+		profile_(NULL),
+		profileKey_(-1) {
 }
 
 util::StackAllocator& SQLPreparedPlan::Node::getAllocator() const {
@@ -677,13 +721,14 @@ void SQLPreparedPlan::Node::setName(
 		const util::String &table, const util::String *db, int64_t nsId) {
 	util::StackAllocator &alloc = getAllocator();
 
-	qName_ = ALLOC_NEW(alloc) SyntaxTree::QualifiedName(alloc);
-	qName_->table_ = ALLOC_NEW(alloc) util::String(table);
-	qName_->nsId_ = nsId;
-
+	QualifiedName *name = ALLOC_NEW(alloc) SyntaxTree::QualifiedName(alloc);
+	name->table_ = ALLOC_NEW(alloc) util::String(table);
+	name->nsId_ = nsId;
 	if (db != NULL) {
-		qName_->db_ = ALLOC_NEW(alloc) util::String(*db);
+		name->db_ = ALLOC_NEW(alloc) util::String(*db);
 	}
+
+	qName_ = name;
 }
 
 void SQLPreparedPlan::Node::getColumnNameList(
@@ -714,7 +759,7 @@ void SQLPreparedPlan::Node::remapColumnId(
 	for (ExprList::iterator it = exprList.begin(); it != exprList.end(); ++it) {
 		Expr *expr = &(*it);
 
-		if (expr->op_ == SQLType::START_EXPR) {
+		if (isDisabledExpr(*expr)) {
 			continue;
 		}
 
@@ -730,7 +775,7 @@ void SQLPreparedPlan::Node::remapColumnId(
 		const util::Vector<const util::Vector<ColumnId>*> &allColumnMap,
 		Expr *&expr) {
 	assert(expr != NULL);
-	assert(expr->op_ != SQLType::START_EXPR);
+	assert(!isDisabledExpr(*expr));
 	assert(tableIdInfo_.isEmpty());
 
 	if (expr->op_ != SQLType::EXPR_COLUMN &&
@@ -828,9 +873,9 @@ void SQLPreparedPlan::Node::validateReference(
 					it != outputList_.end(); ++it) {
 				if ((type_ == SQLType::EXEC_LIMIT || type_ == SQLType::EXEC_UNION) &&
 						inNode != NULL) {
-					if (it->op_ == SQLType::START_EXPR) {
-						if (inNode->outputList_[it - outputList_.begin()].op_ !=
-								SQLType::START_EXPR) {
+					if (isDisabledExpr(*it)) {
+						if (!isDisabledExpr(
+								inNode->outputList_[it - outputList_.begin()])) {
 							assert(false);
 							GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
 						}
@@ -844,7 +889,7 @@ void SQLPreparedPlan::Node::validateReference(
 					}
 				}
 
-				if (it->op_ == SQLType::START_EXPR) {
+				if (isDisabledExpr(*it)) {
 					continue;
 				}
 				validateReference(plan, tableInfoList, idRef, *it);
@@ -879,7 +924,7 @@ void SQLPreparedPlan::Node::validateReference(
 		const SQLPreparedPlan &plan, const SQLTableInfoList *tableInfoList,
 		const Id *idRef, const Expr &expr) const {
 
-	if (expr.op_ == SQLType::START_EXPR) {
+	if (isDisabledExpr(expr)) {
 		assert(false);
 		GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
 	}
@@ -911,7 +956,7 @@ void SQLPreparedPlan::Node::validateReference(
 
 		const Id id = (idRef == NULL ? inputList_[pos] : *idRef);
 		if (id >= plan.nodeList_.size() ||
-				plan.nodeList_[id].type_ == SQLType::START_EXEC) {
+				isDisabledNode(plan.nodeList_[id])) {
 			assert(false);
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
 		}
@@ -922,7 +967,7 @@ void SQLPreparedPlan::Node::validateReference(
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
 		}
 
-		if (node.outputList_[expr.columnId_].op_ == SQLType::START_EXPR) {
+		if (isDisabledExpr(node.outputList_[expr.columnId_])) {
 			assert(false);
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
 		}
@@ -953,6 +998,105 @@ const char8_t SQLCompiler::Meta::DRIVER_CLUSTER_INFO_NAME[] =
 	"#_driver_cluster_info";
 const char8_t SQLCompiler::Meta::DRIVER_TABLE_TYPES_NAME[] =
 	"#_driver_table_types";
+
+const util::NameCoderEntry<SQLPreparedPlan::Constants::StringConstant>
+SQLPreparedPlan::Constants::CONSTANT_LIST[] = {
+	UTIL_NAME_CODER_ENTRY(STR_REORDER_JOIN),
+	UTIL_NAME_CODER_ENTRY(STR_REVERSED_COST),
+
+	UTIL_NAME_CODER_ENTRY(STR_TREE_WEIGHT),
+	UTIL_NAME_CODER_ENTRY(STR_FILTERED_TREE_WEIGHT),
+	UTIL_NAME_CODER_ENTRY(STR_NODE_DEGREE),
+
+	UTIL_NAME_CODER_ENTRY(STR_FILTER),
+	UTIL_NAME_CODER_ENTRY(STR_FILTER_LEVEL),
+	UTIL_NAME_CODER_ENTRY(STR_FILTER_DEGREE),
+	UTIL_NAME_CODER_ENTRY(STR_FILTER_WEAKNESS),
+
+	UTIL_NAME_CODER_ENTRY(STR_EDGE),
+	UTIL_NAME_CODER_ENTRY(STR_EDGE_LEVEL),
+	UTIL_NAME_CODER_ENTRY(STR_EDGE_DEGREE),
+	UTIL_NAME_CODER_ENTRY(STR_EDGE_WEAKNESS),
+
+	UTIL_NAME_CODER_ENTRY(STR_HINT)
+};
+
+const util::NameCoder<
+		SQLPreparedPlan::Constants::StringConstant,
+		SQLPreparedPlan::Constants::END_STR>
+		SQLPreparedPlan::Constants::CONSTANT_CODER(CONSTANT_LIST, 1);
+
+SQLPreparedPlan::TotalProfile::TotalProfile() :
+		plan_(NULL) {
+}
+
+bool SQLPreparedPlan::TotalProfile::clearIfEmpty(TotalProfile *&profile) {
+	if (profile != NULL && Profile::clearIfEmpty(profile->plan_)) {
+		profile = NULL;
+	}
+	return (profile == NULL);
+}
+
+SQLPreparedPlan::Profile::Profile() :
+		optimization_(NULL) {
+}
+
+bool SQLPreparedPlan::Profile::clearIfEmpty(Profile *&profile) {
+	if (profile != NULL && OptProfile::clearIfEmpty(profile->optimization_)) {
+		profile = NULL;
+	}
+	return (profile == NULL);
+}
+
+SQLPreparedPlan::OptProfile::OptProfile() :
+		joinReordering_(NULL) {
+}
+
+bool SQLPreparedPlan::OptProfile::clearIfEmpty(OptProfile *&profile) {
+	if (profile != NULL && (
+			profile->joinReordering_ == NULL ||
+			profile->joinReordering_->empty())) {
+		profile = NULL;
+	}
+	return (profile == NULL);
+}
+
+SQLPreparedPlan::OptProfile::Join::Join() :
+		nodes_(NULL),
+		tree_(NULL),
+		candidates_(NULL),
+		reordered_(false),
+		tableCostAffected_(false),
+		costBased_(true),
+		profileKey_(-1) {
+}
+
+SQLPreparedPlan::OptProfile::JoinNode::JoinNode() :
+		ordinal_(-1),
+		qName_(NULL),
+		approxSize_(-1) {
+}
+
+SQLPreparedPlan::OptProfile::JoinTree::JoinTree() :
+		ordinal_(-1),
+		left_(NULL),
+		right_(NULL),
+		criterion_(Constants::END_STR),
+		cost_(NULL),
+		best_(NULL),
+		other_(NULL),
+		target_(NULL) {
+}
+
+SQLPreparedPlan::OptProfile::JoinCost::JoinCost() :
+		filterLevel_(0),
+		filterDegree_(0),
+		filterWeakness_(0),
+		edgeLevel_(0),
+		edgeDegree_(0),
+		edgeWeakness_(0),
+		approxSize_(-1) {
+}
 
 const util::NameCoderEntry<SQLCompiler::Meta::StringConstant>
 SQLCompiler::Meta::CONSTANT_LIST[] = {
@@ -1132,42 +1276,61 @@ const uint64_t SQLCompiler::JOIN_SCORE_MAX = UINT64_C(1) << 10;
 const uint64_t SQLCompiler::DEFAULT_MAX_INPUT_COUNT =
 		std::numeric_limits<uint64_t>::max();
 const uint64_t SQLCompiler::DEFAULT_MAX_EXPANSION_COUNT = 100;
+const SQLPlanningVersion SQLCompiler::LEGACY_JOIN_REORDERING_VERSION(5, 4);
 
 SQLCompiler::SQLCompiler(
 		TupleValue::VarContext &varCxt, const CompileOption *option) :
 		alloc_(varContextToAllocator(varCxt)),
 		varCxt_(varCxt),
-		tableInfoList_(NULL),
-		subqueryStack_(ALLOC_NEW(alloc_) SubqueryStack(alloc_)),
-		lastSrcId_(0),
-		pendingColumnList_(alloc_),
-		metaTableInfoIdList_(alloc_),
-		parameterTypeList_(NULL),
-		inputSql_(NULL),
-		subqueryLevel_(0),
-		planSizeLimitRatio_(5 * 100),
-		generatedScanCount_(std::numeric_limits<uint64_t>::max()),
-		expandedJoinCount_(0),
-		tableNarrowingList_(NULL),
-		compileOption_(option),
-		optimizationFlags_(ProfilerManager::getInstance().getOptimizationFlags()),
-		currentTimeRequired_(false),
-		isMetaDataQuery_(false),
-		indexScanEnabled_(false),
-		multiIndexScanEnabled_(true),
-		expansionLimitReached_(false),
-		predicatePushDownApplied_(false),
-		substrCompatible_(false),
-		varianceCompatible_(false),
-		experimentalFuncEnabled_(false),
-		recompileOnBindRequired_(false),
-		neverReduceExpr_(false),
-		profiler_(ProfilerManager::getInstance().tryCreateProfiler(alloc_)) {
-	indexScanEnabled_ = true;
+		init_(option),
+		tableInfoList_(init_ ?
+				init_->tableInfoList_ : emptyPtr<TableInfoList>()),
+		subqueryStack_(makeSubqueryStack(alloc_)),
+		lastSrcId_(init_ ? init_->lastSrcId_ : 0),
+		pendingColumnList_(init_ ?
+				init_->pendingColumnList_ : PendingColumnList(alloc_)),
+		metaTableInfoIdList_(init_ ?
+				init_->metaTableInfoIdList_ : TableInfoIdList(alloc_)),
+		parameterTypeList_(init_ ?
+				init_->parameterTypeList_ : emptyPtr<Plan::ValueTypeList>()),
+		inputSql_(init_ ? init_->inputSql_ : emptyPtr<const char8_t>()),
+		subqueryLevel_(init_ ? init_->subqueryLevel_ : 0),
+		explainType_(init_ ? init_->explainType_ : SyntaxTree::EXPLAIN_NONE),
+		queryStartTime_(init_ ? init_->queryStartTime_ : util::DateTime()),
+		planSizeLimitRatio_(init_ ? init_->planSizeLimitRatio_ : 5 * 100),
+		generatedScanCount_(init_ ?
+				init_->generatedScanCount_ :
+				std::numeric_limits<uint64_t>::max()),
+		expandedJoinCount_(init_ ? init_->expandedJoinCount_ : 0),
+		tableNarrowingList_(init_ ?
+				SQLCompiler::TableNarrowingList::tryDuplicate(
+						init_->tableNarrowingList_) :
+				emptyPtr<TableNarrowingList>()),
+		compileOption_(init_ ? init_->compileOption_ : option),
+		optimizationOption_(makeOptimizationOption(
+				alloc_, (init_ ?
+						*init_->optimizationOption_ :
+						OptimizationOption(&init_.profilerManager())))),
+		currentTimeRequired_(init_ ? init_->currentTimeRequired_ : false),
+		isMetaDataQuery_(init_ ? init_->isMetaDataQuery_ : false),
+		indexScanEnabled_(init_ ?
+				init_->indexScanEnabled_ : isIndexScanEnabledDefault()),
+		multiIndexScanEnabled_(init_ ? init_->multiIndexScanEnabled_ : true),
+		expansionLimitReached_(init_ ? init_->expansionLimitReached_ : false),
+		predicatePushDownApplied_(init_ ? init_->predicatePushDownApplied_ : false),
+		substrCompatible_(init_ ? init_->substrCompatible_ : false),
+		varianceCompatible_(init_ ? init_->varianceCompatible_ : false),
+		experimentalFuncEnabled_(init_ ? init_->experimentalFuncEnabled_ : false),
+		recompileOnBindRequired_(init_ ? init_->recompileOnBindRequired_ : false),
+		neverReduceExpr_(init_ ? init_->neverReduceExpr_ : false),
+		profiler_(init_ ?
+				SQLCompiler::Profiler::tryDuplicate(init_->profiler_) :
+				init_.profilerManager().tryCreateProfiler(alloc_)),
+		nextProfileKey_(init_ ? init_->nextProfileKey_ : -1),
+		initEnd_(init_) {
 }
 
 SQLCompiler::~SQLCompiler() {
-	ALLOC_DELETE(alloc_, subqueryStack_);
 }
 
 void SQLCompiler::setTableInfoList(const TableInfoList *infoList) {
@@ -1195,6 +1358,10 @@ void SQLCompiler::setExplainType(SyntaxTree::ExplainType explainType) {
 	explainType_ = explainType;
 }
 
+void SQLCompiler::setQueryStartTime(int64_t time) {
+	queryStartTime_ = util::DateTime(time);
+}
+
 void SQLCompiler::setPlanSizeLimitRatio(size_t ratio) {
 	planSizeLimitRatio_ = ratio;
 }
@@ -1207,7 +1374,8 @@ void SQLCompiler::setMultiIndexScanEnabled(bool enabled) {
 	multiIndexScanEnabled_ = enabled;
 }
 
-void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment  *control) {
+void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionControl *control) {
+
 	{
 		std::string value;
 
@@ -1225,7 +1393,7 @@ void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment
 			setMultiIndexScanEnabled((value == SQLPragma::VALUE_TRUE));
 		}
 		else {
-			setMultiIndexScanEnabled(control->getExecutionManager()->isMultiIndexScan());
+			setMultiIndexScanEnabled(control->getConfig().isMultiIndexScan());
 		}
 
 		if (control->getEnv(
@@ -1241,6 +1409,8 @@ void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment
 			experimentalFuncEnabled_ = (value == SQLPragma::VALUE_TRUE);
 		}
 	}
+
+	applyPlanningOption(plan);
 
 	switch (in.cmdType_) {
 	case SyntaxTree::CMD_SELECT:
@@ -1266,7 +1436,9 @@ void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment
 	case SyntaxTree::CMD_DROP_INDEX:
 	case SyntaxTree::CMD_ALTER_TABLE_DROP_PARTITION:  
 	case SyntaxTree::CMD_ALTER_TABLE_ADD_COLUMN:      
+	case SyntaxTree::CMD_ALTER_TABLE_RENAME_COLUMN:   
 	case SyntaxTree::CMD_CREATE_USER:
+	case SyntaxTree::CMD_CREATE_ROLE:
 	case SyntaxTree::CMD_DROP_USER:
 	case SyntaxTree::CMD_SET_PASSWORD:
 	case SyntaxTree::CMD_GRANT:
@@ -1293,12 +1465,14 @@ void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment
 				"Unsupported command: commandType=" << static_cast<uint32_t>(in.cmdType_));
 		break;
 	}
+
 	genResult(plan);
 
 
 	plan.validateReference(tableInfoList_);
 
-	if (optimizationFlags_ != 0) {
+	bool tableCostAffected = false;
+	if (optimizationOption_->isSomeEnabled()) {
 		OptimizationContext cxt(*this, plan);
 
 		{
@@ -1309,8 +1483,13 @@ void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment
 		makeJoinHintMap(plan);
 
 		{
+			OptimizationUnit unit(cxt, OPT_MAKE_SCAN_COST_HINTS);
+			unit(unit() && makeScanCostHints(plan));
+		}
+
+		{
 			OptimizationUnit unit(cxt, OPT_REORDER_JOIN);
-			unit(unit() && reorderJoin(plan));
+			unit(unit() && reorderJoin(plan, tableCostAffected));
 		}
 
 		applyJoinOption(plan);
@@ -1322,7 +1501,10 @@ void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment
 	}
 
 
-	genDistributedPlan(plan);
+	const bool costCheckOnly = false;
+	genDistributedPlan(plan, costCheckOnly);
+
+	finalizeScanCostHints(plan, tableCostAffected);
 
 	applyScanOption(plan);
 
@@ -1341,6 +1523,7 @@ void SQLCompiler::compile(const Select &in, Plan &plan, SQLConnectionEnvironment
 		profiler_->setTableInfoList(getTableInfoList());
 		ProfilerManager::getInstance().addProfiler(*profiler_);
 	}
+	relocateOptimizationProfile(plan);
 }
 
 bool SQLCompiler::isRecompileOnBindRequired() const {
@@ -1421,10 +1604,9 @@ int32_t SQLCompiler::compareStringWithCase(
 	}
 }
 
-void SQLCompiler::genDistributedPlan(Plan &plan) {
+void SQLCompiler::genDistributedPlan(Plan &plan, bool costCheckOnly) {
 	util::Vector<PlanNodeId> largeScanNodeIdList(alloc_);
 	SQLPreparedPlan::NodeList::iterator itr = plan.nodeList_.begin();
-
 	for (; itr != plan.nodeList_.end(); ++itr) {
 		if (itr->type_ == SQLType::EXEC_SCAN) {
 			SQLTableInfo::IdInfo &idInfo = itr->tableIdInfo_;
@@ -1443,6 +1625,9 @@ void SQLCompiler::genDistributedPlan(Plan &plan) {
 						}
 					}
 					if (found) {
+						if (costCheckOnly) {
+							continue;
+						}
 						int64_t subContainerId = static_cast<int64_t>(metaIdInfoItr->partitionId_);
 						itr->tableIdInfo_ = *metaIdInfoItr;
 						itr->outputList_[0] = genConstExpr(
@@ -1464,12 +1649,11 @@ void SQLCompiler::genDistributedPlan(Plan &plan) {
 		const SQLTableInfo::IdInfo &idInfo = tableInfo.idInfo_;
 		assert(tableInfo.partitioning_ != NULL);
 
-		const uint8_t partitioningType =
-				tableInfo.partitioning_->partitioningType_;
 		const bool containerExpirable = tableInfo.isExpirable_;
 		const SQLTableInfo::SubInfoList &subInfoList =
 				tableInfo.partitioning_->subInfoList_;
 
+		const SQLTableInfo::BasicIndexInfoList *indexInfoList;
 		bool uncovered;
 		util::Vector<uint32_t> subList(alloc_);
 		{
@@ -1489,21 +1673,33 @@ void SQLCompiler::genDistributedPlan(Plan &plan) {
 					&subList, parameterList, placeholderAffected);
 
 			recompileOnBindRequired_ |= placeholderAffected;
+			indexInfoList = orgNode.indexInfoList_;
 		}
 
 		if (subList.empty()) {
 			subList.push_back(0);
 		}
 
+		int64_t subApproxSize = -1;
 		util::Vector<PlanNodeId> subScanIdList(alloc_);
 		for (util::Vector<uint32_t>::iterator it = subList.begin();
 				it != subList.end(); ++it) {
 			const SQLTableInfo::SubInfo &subInfo = subInfoList[*it];
+			if (costCheckOnly) {
+				if (subInfo.approxSize_ >= 0) {
+					subApproxSize =
+							std::max<int64_t>(subApproxSize, 0) +
+							subInfo.approxSize_;
+				}
+				continue;
+			}
+
 			const int32_t subContainerId = static_cast<int32_t>(*it);
 
 			PlanNode &subScan = plan.append(SQLType::EXEC_SCAN);
 			const PlanNode &orgNode = *orgNodeRef; 
 			subScanIdList.push_back(subScan.id_);
+
 			SQLTableInfo::IdInfo subIdInfo = idInfo;
 			subIdInfo.partitionId_ = subInfo.partitionId_;
 			subIdInfo.containerId_ = subInfo.containerId_;
@@ -1512,14 +1708,9 @@ void SQLCompiler::genDistributedPlan(Plan &plan) {
 				subIdInfo.partitioningVersionId_ = idInfo.partitioningVersionId_;
 			}
 			subIdInfo.subContainerId_ = subContainerId;
+
 			subScan.tableIdInfo_ = subIdInfo;
-			if (subInfo.indexInfoList_ != NULL) {
-				subScan.indexInfoList_ = ALLOC_NEW(alloc_)
-						SQLTableInfo::IndexInfoList(
-								subInfo.indexInfoList_->begin(),
-								subInfo.indexInfoList_->end(),
-								alloc_);
-			}
+			subScan.indexInfoList_ = indexInfoList;
 			subScan.outputList_ = tableInfoToOutput(
 					plan, tableInfo, MODE_NORMAL_SELECT, subContainerId);
 			subScan.predList_.assign(
@@ -1527,6 +1718,13 @@ void SQLCompiler::genDistributedPlan(Plan &plan) {
 			if (containerExpirable) {
 				subScan.cmdOptionFlag_ |= PlanNode::Config::CMD_OPT_SCAN_EXPIRABLE;
 			}
+		}
+
+		if (costCheckOnly) {
+			if (subApproxSize >= 0) {
+				orgNodeRef->tableIdInfo_.approxSize_ = subApproxSize;
+			}
+			continue;
 		}
 
 		if (subList.size() == 1) {
@@ -1561,7 +1759,7 @@ void SQLCompiler::genUnionAllShallow(
 			}
 		}
 		else if (hintValueList.size() != 0) {
-			plan.hintInfo_->reportWarning("Invalid value for Hint(MaxDegreeOfTaskInpout)");
+			plan.hintInfo_->reportWarning("Invalid value for Hint(MaxDegreeOfTaskInput)");
 			upperLimit = 0;
 		}
 	}
@@ -1666,7 +1864,7 @@ void SQLCompiler::genSelect(
 	productedNodeId = UNDEF_PLAN_NODEID;
 	cxt.productedNodeId_ = UNDEF_PLAN_NODEID;
 
-	size_t windowExprCount = validateWindowFunctionOccurence(
+	validateWindowFunctionOccurrence(
 			select, cxt.genuineWindowExprCount_, cxt.pseudoWindowExprCount_);
 	if (select.from_) {
 		genFrom(select, cxt.whereExpr_, plan);
@@ -1707,7 +1905,7 @@ void SQLCompiler::genSelect(
 		SQLPreparedPlan::Node &node = plan.append(SQLType::EXEC_SELECT);
 		node.inputList_.push_back(inputId);
 		node.outputList_ = inputListToOutput(plan);
-	} 
+	}
 
 	if (!leaveInternalIdColumn) {
 		genLastOutput(cxt, plan);
@@ -1926,7 +2124,7 @@ void SQLCompiler::genUpdate(const Select &select, Plan &plan) {
 	}
 
 	Select updateSelect(alloc_);
-	SyntaxTree::ExprList *exprList = select.updateSetList_;
+	const ExprList *exprList = select.updateSetList_;
 	updateSelect.selectList_ = ALLOC_NEW(alloc_) SyntaxTree::ExprList(alloc_);
 
 	util::Map<util::String, Expr *> updateColumnMap(alloc_);
@@ -1937,7 +2135,7 @@ void SQLCompiler::genUpdate(const Select &select, Plan &plan) {
 	for (columnId = 0; columnId < tableInfo.columnInfoList_.size(); columnId++) {
 		util::String tmpKey(static_cast<const char*>(
 				tableInfo.columnInfoList_[columnId].second.c_str()), alloc_);
-		const util::String &key = SQLUtils::normalizeName(alloc_, tmpKey.c_str());
+		const util::String &key = normalizeName(alloc_, tmpKey.c_str());
 		realColumnSet.insert(key);
 	}
 
@@ -1956,7 +2154,7 @@ void SQLCompiler::genUpdate(const Select &select, Plan &plan) {
 		assert(columnExpr->qName_->name_);
 		const char *orgColumnName = columnExpr->qName_->name_->c_str();
 		util::String tmpKey(orgColumnName, alloc_);
-		const util::String &key = SQLUtils::normalizeName(alloc_, tmpKey.c_str());
+		const util::String &key = normalizeName(alloc_, tmpKey.c_str());
 		retVal = updateColumnMap.insert(std::make_pair(key, targetExpr));
 		if (!retVal.second) {
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -1972,7 +2170,7 @@ void SQLCompiler::genUpdate(const Select &select, Plan &plan) {
 	for (size_t columnId = 0; columnId < tableInfo.columnInfoList_.size(); columnId++) {
 		const char *orgColumnName = tableInfo.columnInfoList_[columnId].second.c_str();
 		util::String tmpKey(orgColumnName, alloc_);
-		const util::String &key = SQLUtils::normalizeName(alloc_, tmpKey.c_str());
+		const util::String &key = normalizeName(alloc_, tmpKey.c_str());
 		util::Map<util::String, Expr *>::iterator it = updateColumnMap.find(key);
 		if (it != updateColumnMap.end()) {
 			Expr *targetExpr = (*it).second;
@@ -1988,6 +2186,8 @@ void SQLCompiler::genUpdate(const Select &select, Plan &plan) {
 						"Virtual column='" << tableInfo.columnInfoList_[columnId].second.c_str()
 						<< "' must not be specifed in set statement");
 			}
+
+	
 			const SQLTableInfo::PartitioningInfo *partitioning =
 					tableInfo.partitioning_;
 			if (partitioning != NULL && columnId == partitioning->partitioningColumnId_) {
@@ -2051,7 +2251,7 @@ void SQLCompiler::genDelete(const Select &select, Plan &plan) {
 	}
 	size_t genuineWindowExprCount = 0;
 	size_t pseudoWindowExprCount = 0;
-	size_t windowExprCount = validateWindowFunctionOccurence(
+	size_t windowExprCount = validateWindowFunctionOccurrence(
 			select, genuineWindowExprCount, pseudoWindowExprCount);
 	if (windowExprCount > 0) {
 		GS_THROW_USER_ERROR(GS_ERROR_SQL_DDL_INVALID_PARAMETER,
@@ -2074,7 +2274,6 @@ void SQLCompiler::genDelete(const Select &select, Plan &plan) {
 	PlanExprList selectList(alloc_);
 	const Expr* whereExpr = deleteSelect.where_;
 	const size_t basePlanSize = plan.nodeList_.size();
-	PlanNodeId productedNodeId = UNDEF_PLAN_NODEID;
 	if (deleteSelect.from_) {
 		genFrom(deleteSelect, whereExpr, plan);
 	}
@@ -2106,15 +2305,21 @@ void SQLCompiler::genDelete(const Select &select, Plan &plan) {
 			select.targetName_->tableCaseSensitive_, tableInfo, deleteNode);
 }
 
-void SQLCompiler::validateCreateTableOption(SyntaxTree::CreateTableOption &option) {
+void SQLCompiler::validateCreateTableOption(
+		const SyntaxTree::CreateTableOption &option) {
 	if (option.columnInfoList_) {
-		SyntaxTree::ColumnInfoList::iterator itr = option.columnInfoList_->begin();
+		SyntaxTree::ColumnInfoList::const_iterator itr = option.columnInfoList_->begin();
 		for (; itr != option.columnInfoList_->end(); ++itr) {
+			if ((*itr)->isVirtual()) {
+				SQL_COMPILER_THROW_ERROR(
+					GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+					"Virtual column is allowed for virtual table");
+			}
 			if (!checkAcceptableTupleType((*itr)->type_)) {
 				SQL_COMPILER_THROW_ERROR(
 						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
 						"Target column type='" << ValueProcessor::getTypeName(
-						SQLUtils::convertTupleTypeToNoSQLType((*itr)->type_))
+						convertTupleTypeToNoSQLType((*itr)->type_))
 						<< "' is not specified in current version");
 			}
 		}
@@ -2126,32 +2331,23 @@ void SQLCompiler::validateCreateTableOption(SyntaxTree::CreateTableOption &optio
 	}
 }
 
-bool SQLCompiler::checkAcceptableTupleType(
-		TupleList::TupleColumnType type) {
-
-	switch (type & ~TupleList::TYPE_MASK_NULLABLE) {
-		
-		case TupleList::TYPE_BOOL :
-		case TupleList::TYPE_BYTE :
-		case TupleList::TYPE_SHORT:
-		case TupleList::TYPE_INTEGER :
-		case TupleList::TYPE_LONG :
-		case TupleList::TYPE_FLOAT :
-		case TupleList::TYPE_NUMERIC :
-		case TupleList::TYPE_DOUBLE :
-		case TupleList::TYPE_TIMESTAMP :
-		case TupleList::TYPE_NULL :
-		case TupleList::TYPE_STRING :
-		case TupleList::TYPE_BLOB :
-		case TupleList::TYPE_ANY: 
-			return true;
-		
-		default:
-			return false;
-	}	
+void SQLCompiler::validateScanOptionForVirtual(const PlanExprList &scanOptionList, bool isVirtual) {
+	PlanExprList::const_iterator itr = scanOptionList.begin();
+	if (!isVirtual && scanOptionList.size() > 0) {
+		SQL_COMPILER_THROW_ERROR(
+			GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+			"Scan option is allowed for virtual table");
+	}
+	for (; itr != scanOptionList.end(); ++itr) {
+		if (itr->op_ != SQLType::EXPR_CONSTANT
+			&& itr->op_ != SQLType::EXPR_PLACEHOLDER
+			&& itr->op_ != SQLType::EXPR_COLUMN) {
+			SQL_COMPILER_THROW_ERROR(
+					GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &(*itr),
+					"Invalid argument");
+		}
+	}
 }
-
-
 
 void SQLCompiler::validateCreateIndexOptionForVirtual(
 	SyntaxTree::QualifiedName &indexName, SyntaxTree::CreateIndexOption &option, Plan::ValueTypeList *typeList) {
@@ -2202,7 +2398,7 @@ void SQLCompiler::validateCreateIndexOptionForVirtual(
 		else {
 			SQL_COMPILER_THROW_ERROR(
 					GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
-					"VNN Index option must be contant value or placeholder");
+					"VNN Index option must be constant value or placeholder");
 		}
 	}
 }
@@ -2243,6 +2439,9 @@ void SQLCompiler::genDDL(const Select &select, Plan &plan) {
 	case SyntaxTree::CMD_ALTER_TABLE_ADD_COLUMN: 
 		node.qName_ = select.targetName_;
 		break;
+	case SyntaxTree::CMD_ALTER_TABLE_RENAME_COLUMN: 
+		node.qName_ = select.targetName_;
+		break;
 	default:
 		break;
 	}
@@ -2268,7 +2467,7 @@ int32_t SQLCompiler::makeInsertColumnMap(const SQLTableInfo &tableInfo,
 			static_cast<int32_t>(tableInfo.columnInfoList_.size()); columnId++) {
 		util::String key(static_cast<const char*>(
 				tableInfo.columnInfoList_[columnId].second.c_str()), alloc_);
-		const util::String &normalizedKey = SQLUtils::normalizeName(alloc_, key.c_str());
+		const util::String &normalizedKey = normalizeName(alloc_, key.c_str());
 		realColumnMap.insert(std::make_pair(normalizedKey, columnId));
 		realSensitiveColumnMap.insert(std::make_pair(key, columnId));
 		if (tableInfo.nosqlColumnOptionList_[columnId] != SyntaxTree::COLUMN_OPT_VIRTUAL) {
@@ -2296,7 +2495,7 @@ int32_t SQLCompiler::makeInsertColumnMap(const SQLTableInfo &tableInfo,
 			foundColumnId = (*it).second;
 		}
 		else {
-			const util::String &normalizedKey = SQLUtils::normalizeName(alloc_, key.c_str());
+			const util::String &normalizedKey = normalizeName(alloc_, key.c_str());
 			util::Map<util::String, int32_t>::iterator it = realColumnMap.find(normalizedKey);
 			if (it == realColumnMap.end()) {
 				GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -2335,7 +2534,7 @@ void SQLCompiler::setTargetTableInfo(const char *tableName, bool isCaseSensitive
 		const SQLTableInfo &tableInfo, SQLPreparedPlan::Node &node) {
 
 	for (size_t pos = 0; pos < tableInfo.nosqlColumnInfoList_.size(); pos++) {
-		if (!SQLUtils::checkNoSQLTypeToTupleType(tableInfo.nosqlColumnInfoList_[pos])) {
+		if (!checkNoSQLTypeToTupleType(tableInfo.nosqlColumnInfoList_[pos])) {
 			SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_UNSUPPORTED, NULL,
 					"Target column type='" << ValueProcessor::getTypeName(
 					tableInfo.nosqlColumnInfoList_[pos])
@@ -2352,6 +2551,7 @@ void SQLCompiler::setTargetTableInfo(const char *tableName, bool isCaseSensitive
 	node.tableIdInfo_.schemaVersionId_ = tableInfo.idInfo_.schemaVersionId_;
 	node.tableIdInfo_.partitionId_ = tableInfo.idInfo_.partitionId_;
 	node.tableIdInfo_.id_ = tableInfo.idInfo_.id_;
+	node.tableIdInfo_.approxSize_ = tableInfo.idInfo_.approxSize_;
 
 	PlanNode::PartitioningInfo *destPartitioning =
 			ALLOC_NEW(alloc_) SQLTableInfo::PartitioningInfo(alloc_);
@@ -2377,6 +2577,8 @@ void SQLCompiler::setTargetTableInfo(const char *tableName, bool isCaseSensitive
 		subInfo.containerId_ = tableInfo.idInfo_.containerId_;
 		subInfo.partitionId_ = tableInfo.idInfo_.partitionId_;
 		subInfo.schemaVersionId_ = tableInfo.idInfo_.schemaVersionId_;
+		subInfo.approxSize_ = tableInfo.idInfo_.approxSize_;
+
 		destPartitioning->subInfoList_.push_back(subInfo);
 		destPartitioning->partitioningCount_ = 1;
 	}
@@ -2409,10 +2611,8 @@ void SQLCompiler::genFrom(
 }
 
 void SQLCompiler::genWhere(GenRAContext &cxt, Plan &plan) {
-	const Select &select = cxt.select_;
 	const Expr* selectWhereExpr = cxt.whereExpr_;
 	const size_t basePlanSize = cxt.basePlanSize_;
-	bool inSubquery = cxt.inSubQuery_;
 
 	if (basePlanSize == plan.nodeList_.size()) {
 		genSelectProjection(cxt, plan);
@@ -2428,44 +2628,14 @@ void SQLCompiler::genWhere(GenRAContext &cxt, Plan &plan) {
 	bool splitted = splitSubqueryCond(*selectWhereExpr, scalarExpr, subExpr);
 	if (splitted) {
 		if (scalarExpr != NULL) {
-			SQLPreparedPlan::Node *node = NULL;
-			if (plan.nodeList_.size() > 0) {
-				node = &plan.back();
-				if (node->type_ == SQLType::EXEC_SELECT
-					|| node->type_ == SQLType::EXEC_SCAN
-					|| node->type_ == SQLType::EXEC_JOIN) {
-				}
-				else {
-					node = NULL;
-				}
-			}
-			if (node == NULL) {
-				node = &plan.append(SQLType::EXEC_SELECT);
-				node->inputList_.push_back(inputId);
-				node->outputList_ = inputListToOutput(plan);
-			}
+			SQLPreparedPlan::Node &node = plan.append(SQLType::EXEC_SELECT);
+			node.inputList_.push_back(inputId);
+			node.outputList_ = inputListToOutput(plan);
+
 			const Expr& whereExpr = genExpr(*scalarExpr, plan, MODE_WHERE);
-			assert(node->id_ == plan.back().id_);
-			if (node->predList_.size() == 0) {
-				node->predList_.push_back(whereExpr);
-			}
-			else {
-				size_t predListIndex = 0;
-				if (node->type_ == SQLType::EXEC_SELECT
-				|| node->type_ == SQLType::EXEC_SCAN) {
-					predListIndex = 0;
-				}
-				else {
-					assert(node->type_ == SQLType::EXEC_JOIN);
-					assert(node->predList_.size() > 1);
-					predListIndex = 1;
-				}
-				Expr newPredExpr = genOpExpr(
-					plan, SQLType::EXPR_AND,
-					ALLOC_NEW(alloc_) Expr(node->predList_[predListIndex]),
-					ALLOC_NEW(alloc_) Expr(whereExpr), MODE_DEFAULT, true);
-				node->predList_[predListIndex] = newPredExpr;
-			}
+			assert(node.id_ == plan.back().id_);
+			node.predList_.push_back(whereExpr);
+			cxt.scalarWhereNodeRef_ = toRef(plan, &node);
 		}
 		assert(subExpr != NULL);
 		inputId = plan.back().id_;
@@ -2490,65 +2660,14 @@ void SQLCompiler::genWhere(GenRAContext &cxt, Plan &plan) {
 		const Expr& whereExpr = genExpr(*selectWhereExpr, plan, MODE_WHERE);
 		assert(node.id_ == plan.back().id_);
 		node.predList_.push_back(whereExpr);
+		cxt.scalarWhereNodeRef_ = toRef(plan, &node);
 	}
 	cxt.whereExpr_ = NULL;
 }
 
-void SQLCompiler::genSelectAggrProjection(
-		ExprList *&aggrExprList,
-		PlanExprList &selectList,
-		PlanNodeId &productedNodeId,
-		Plan &plan) {
-	PlanExprList aggrList(alloc_);
-	{
-		assert(aggrExprList);
-		SQLPreparedPlan::Node *node = NULL;
-		const PlanNodeId inputId = plan.back().id_;
-		node = &plan.append(SQLType::EXEC_SELECT);
-		node->inputList_.push_back(inputId);
-		node->outputList_ = inputListToOutput(plan); 
-		assert(productedNodeId != UNDEF_PLAN_NODEID);
-		aggrList = genColumnExprList(
-				*aggrExprList, plan, MODE_AGGR_SELECT, &productedNodeId);
-		const size_t aggrListSize = aggrList.size();
-		node = &plan.back();
-		for (PlanExprList::iterator itr = aggrList.begin(); itr != aggrList.end(); ++itr) {
-			if (itr->subqueryLevel_ < subqueryLevel_) {
-				itr->subqueryLevel_ = subqueryLevel_;
-			}
-		}
-		node->outputList_.clear();
-		node->outputList_ = inputListToOutput(plan);
-		while (node->outputList_.size() > aggrListSize) {
-			node->outputList_.pop_back();
-		}
-		PlanExprList::const_iterator inItr = aggrList.begin();
-		PlanExprList::iterator outItr = selectList.begin();
-		for (; inItr != aggrList.end(); ++inItr, ++outItr) {
-			bool isAggrExpr = findAggrExpr(*inItr, true);
-			if (isAggrExpr) {
-				*outItr = *inItr;
-			}
-		}
-		{
-			inItr = aggrList.begin();
-			outItr = node->outputList_.begin();
-			for (; inItr != aggrList.end(); ++inItr, ++outItr) {
-				bool isAggrExpr = findAggrExpr(*inItr, true);
-				if (isAggrExpr) {
-					*outItr = *inItr;
-				}
-			}
-		}
-		while (node->outputList_.size() > aggrListSize) {
-			assert(false);
-			node->outputList_.pop_back();
-		}
-	}
-}
-
 void SQLCompiler::hideSelectListName(
 		GenRAContext &cxt, SQLPreparedPlan::Node &inputNode, Plan &plan) {
+	static_cast<void>(plan);
 	ExprList::const_iterator inItr = cxt.outExprList_.begin();
 	assert(cxt.selectTopColumnId_ + cxt.outExprList_.size()
 			<= inputNode.outputList_.size());
@@ -2592,12 +2711,12 @@ void SQLCompiler::genAggrFunc(GenRAContext &cxt, Plan &plan) {
 		SQLPreparedPlan::Node &inputNode = node->getInput(plan, 0);
 		PlanExprList saveOutputList(alloc_);
 		saveOutputList = inputNode.outputList_;
+		PlanNodeId saveOutputNodeId = inputNode.id_;
 		hideSelectListName(cxt, inputNode, plan);
 		aggrList = genColumnExprList(
 				cxt.aggrExprList_, plan, MODE_AGGR_SELECT, &inputId);
 
-		inputNode.outputList_ = saveOutputList;
-		const size_t aggrListSize = aggrList.size();
+		plan.nodeList_[saveOutputNodeId].outputList_ = saveOutputList;
 		node = &plan.back();
 		for (PlanExprList::iterator itr = aggrList.begin(); itr != aggrList.end(); ++itr) {
 			if (itr->subqueryLevel_ < subqueryLevel_) {
@@ -2708,7 +2827,6 @@ bool SQLCompiler::genSplittedSelectProjection(
 		while(itr != node->outputList_.end()) {
 			if (itr->srcId_ != -1 && itr->subqueryLevel_ == subqueryLevel_) {
 				if (srcIdSet.find(itr->srcId_) != srcIdSet.end()) {
-					SourceId sId = itr->srcId_;
 					itr = node->outputList_.erase(itr);
 					continue;
 				}
@@ -2756,11 +2874,12 @@ bool SQLCompiler::genSplittedSelectProjection(
 
 
 void SQLCompiler::genGroupBy(GenRAContext &cxt, ExprRef &havingExprRef, Plan &plan) {
+	if (genRangeGroup(cxt, havingExprRef, plan)) {
+		return;
+	}
+
 	const Select &select = cxt.select_;
-	const size_t basePlanSize = cxt.basePlanSize_;
 	bool inSubQuery = cxt.inSubQuery_;
-	Type type = cxt.type_;
-	const ExprRef &innerIdExprRef = cxt.innerIdExprRef_;
 	const Expr* selectHaving = select.having_;
 
 	ExprList inSelectList(alloc_);
@@ -2770,8 +2889,7 @@ void SQLCompiler::genGroupBy(GenRAContext &cxt, ExprRef &havingExprRef, Plan &pl
 		inSelectList.push_back(select.having_);
 	}
 	SQLPreparedPlan::Node *node = NULL;
-	const bool hasAggrExpr = genSplittedSelectProjection(cxt, inSelectList, plan);
-	const PlanNodeId splittedSelectProjId = plan.back().id_;
+	genSplittedSelectProjection(cxt, inSelectList, plan);
 	if (select.having_) {
 		assert(cxt.otherTopPos_ > 0);
 		size_t havingColId = cxt.otherTopPos_ - 1;
@@ -2805,7 +2923,6 @@ void SQLCompiler::genGroupBy(GenRAContext &cxt, ExprRef &havingExprRef, Plan &pl
 		assert(inputId != UNDEF_PLAN_NODEID);
 		aggrList = genColumnExprList(
 				cxt.aggrExprList_, plan, MODE_GROUP_SELECT, &inputId);
-		const size_t aggrListSize = aggrList.size();
 		node = &plan.back();
 		for (PlanExprList::iterator itr = aggrList.begin(); itr != aggrList.end(); ++itr) {
 			if (itr->subqueryLevel_ < subqueryLevel_) {
@@ -2832,7 +2949,7 @@ void SQLCompiler::genGroupBy(GenRAContext &cxt, ExprRef &havingExprRef, Plan &pl
 			}
 		}
 		if (cxt.inSubQuery_ && aggrList.size() > 0) {
-			assert(innerIdExprRef.get() != NULL);
+			assert(cxt.innerIdExprRef_.get() != NULL);
 			Expr innerIdColumnExpr(alloc_);
 			innerIdColumnExpr = cxt.innerIdExprRef_.generate();
 			inItr = aggrList.begin();
@@ -2908,7 +3025,7 @@ void SQLCompiler::genGroupBy(GenRAContext &cxt, ExprRef &havingExprRef, Plan &pl
 			if (columnPos > static_cast<int64_t>(cxt.selectList_.size())
 				|| columnPos <= 0) {
 				SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &(*itr),
-						"Invalid column refernce (" << columnPos << ")");
+						"Invalid column reference (" << columnPos << ")");
 			}
 			ColumnId colId = static_cast<ColumnId>(columnPos - 1);
 			if (findAggrExpr(cxt.selectList_[colId], true)) {
@@ -2949,6 +3066,7 @@ void SQLCompiler::genGroupBy(GenRAContext &cxt, ExprRef &havingExprRef, Plan &pl
 }
 
 void SQLCompiler::genHaving(GenRAContext &cxt, const ExprRef &havingExprRef, Plan &plan) {
+	static_cast<void>(cxt);
 	PlanNodeId inputId = plan.back().id_;
 
 	SQLPreparedPlan::Node &node = plan.append(SQLType::EXEC_SELECT);
@@ -2957,6 +3075,559 @@ void SQLCompiler::genHaving(GenRAContext &cxt, const ExprRef &havingExprRef, Pla
 	Expr havingExpr(alloc_);
 	havingExpr = havingExprRef.generate();
 	node.predList_.push_back(havingExpr);
+}
+
+bool SQLCompiler::genRangeGroup(
+		GenRAContext &cxt, ExprRef &havingExprRef, Plan &plan) {
+	const Select &select = cxt.select_;
+
+	if (!isRangeGroupPredicate(select.groupByList_)) {
+		return false;
+	}
+
+	if (cxt.inSubQuery_) {
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+				"GROUP BY RANGE clause in the subquery is not supported");
+	}
+
+	ExprList inSelectList(alloc_);
+	inSelectList.reserve(select.selectList_->size() + 1);
+	inSelectList.assign(select.selectList_->begin(), select.selectList_->end());
+	if (select.having_) {
+		inSelectList.push_back(select.having_);
+	}
+
+
+	if (findSubqueryExpr(inSelectList)) {
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+				"Subqueries in the SELECT " <<
+				(select.having_ == NULL ? "" : "or HAVING ") <<
+				"clause with GROUP BY RANGE clause "
+				"are not supported");
+	}
+
+	if (findDistinctAggregation(&inSelectList)) {
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+				"Distinct aggregation functions with GROUP BY RANGE clause "
+				"are not supported");
+	}
+
+	const Expr *windowExpr = NULL;
+
+	if (findWindowExpr(inSelectList, false, windowExpr) &&
+			calcFunctionCategory(*windowExpr, false) !=
+					FUNCTION_PSEUDO_WINDOW) {
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+				"Window functions with GROUP BY RANGE clause "
+				"are not supported");
+	}
+
+	genSplittedSelectProjection(cxt, inSelectList, plan);
+
+	ExprRef keyExprRef;
+	{
+		const PlanNodeId inputId = plan.back().id_;
+		const PlanNodeId *productedNodeId = &inputId;
+		PlanNode &node = plan.append(SQLType::EXEC_SORT);
+		node.inputList_.push_back(inputId);
+
+		ExprList inPredList(alloc_);
+		inPredList.push_back(select.groupByList_->front()->next_->front());
+		assert(inPredList.front()->op_ == SQLType::EXPR_COLUMN);
+
+		PlanExprList baseList = genExprList(
+				inPredList, plan, MODE_GROUPBY, productedNodeId);
+
+		keyExprRef = toRef(
+				plan,
+				plan.nodeList_[inputId].outputList_[baseList.front().columnId_],
+				&plan.nodeList_[inputId]);
+		plan.nodeList_.pop_back();
+	}
+
+	const bool withPseudoWindow = (cxt.pseudoWindowExprCount_ > 0);
+	if (withPseudoWindow) {
+		genPseudoWindowFunc(cxt, plan);
+
+		PlanNodeId inputId = plan.back().id_;
+		SQLPreparedPlan::Node &node = plan.append(SQLType::EXEC_SELECT);
+		node.inputList_.push_back(inputId);
+		node.outputList_ = inputListToOutput(plan);
+	}
+	else {
+		const PlanNodeId inputId = plan.back().id_;
+		const PlanNodeId *productedNodeId = &inputId;
+		PlanNode &node = plan.append(SQLType::EXEC_SORT);
+		node.inputList_.push_back(inputId);
+		node.outputList_ = inputListToOutput(plan);
+
+		ExprList inPredList(alloc_);
+		inPredList.push_back(select.groupByList_->front()->next_->front());
+		assert(inPredList.front()->op_ == SQLType::EXPR_COLUMN);
+
+		node.predList_ = genExprList(
+				inPredList, plan, MODE_GROUPBY, productedNodeId);
+	}
+
+	{
+		const PlanNodeId inputId = plan.back().id_;
+		const PlanNodeId *productedNodeId = &inputId;
+		PlanNode &node = plan.append(SQLType::EXEC_GROUP);
+		node.cmdOptionFlag_ |= PlanNode::Config::CMD_OPT_GROUP_RANGE;
+		node.inputList_.push_back(inputId);
+		node.outputList_ = inputListToOutput(plan); 
+
+		ExprList inTotalAggrList(alloc_);
+		inTotalAggrList.insert(
+				inTotalAggrList.end(),
+				cxt.aggrExprList_.begin(), cxt.aggrExprList_.end());
+		inTotalAggrList.insert(
+				inTotalAggrList.end(),
+				cxt.windowExprList_.begin(), cxt.windowExprList_.end());
+
+		PlanExprList totalAggrList = genColumnExprList(
+				inTotalAggrList, plan, MODE_GROUP_SELECT, productedNodeId);
+		assert(&node == &plan.back());
+		assert(
+				totalAggrList.size() ==
+				cxt.aggrExprList_.size() + cxt.windowExprList_.size());
+
+		PlanExprList::const_iterator aggrBegin = totalAggrList.begin();
+		PlanExprList::const_iterator aggrEnd = aggrBegin + cxt.aggrExprList_.size();
+		{
+			PlanExprList::const_iterator inIt = aggrBegin;
+			PlanExprList::iterator outIt = cxt.selectList_.begin();
+			for (; inIt != aggrEnd; ++inIt, ++outIt) {
+				if (findAggrExpr(*inIt, true)) {
+					*outIt = *inIt;
+				}
+			}
+		}
+		{
+			PlanExprList::const_iterator inIt = aggrBegin;
+			PlanExprList::iterator outIt =
+					node.outputList_.begin() + cxt.selectTopColumnId_;
+			for (; inIt != aggrEnd; ++inIt, ++outIt) {
+				if (findAggrExpr(*inIt, true)) {
+					*outIt = *inIt;
+				}
+			}
+		}
+		if (select.having_) {
+			cxt.selectList_.pop_back();
+			if (cxt.selectExprRefList_.size() > 1) {
+				cxt.selectExprRefList_.pop_back();
+			}
+		}
+
+		PlanNodeRef &whereNode = cxt.scalarWhereNodeRef_;
+		const PlanExprList *wherePred =
+				(whereNode.get() == NULL ? NULL : &whereNode->predList_);
+		if (wherePred == NULL || wherePred->empty()) {
+			SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+					"WHERE clause must be specified for GROUP BY RANGE clause");
+		}
+
+		const Expr keyExprInCond = *keyExprRef;
+		keyExprRef.update();
+
+		const Expr *optionExpr = select.groupByList_->front();
+		node.predList_.push_back(resolveRangeGroupPredicate(
+				plan, wherePred->front(), *keyExprRef, keyExprInCond,
+				*optionExpr));
+		whereNode = PlanNodeRef();
+
+		adjustRangeGroupOutput(plan, node, *keyExprRef);
+
+		cxt.selectTopColumnId_ = 0;
+		cxt.productedNodeId_ = node.id_;
+	}
+
+	if (select.having_) {
+		assert(cxt.otherTopPos_ > 0);
+		const size_t havingColId = cxt.otherTopPos_ - 1;
+		assert(plan.back().outputList_.size() > havingColId);
+		havingExprRef = toRef(plan, plan.back().outputList_[havingColId]);
+	}
+
+	return true;
+}
+
+bool SQLCompiler::genRangeGroupIdNode(
+		Plan &plan, const Select &select, int32_t &rangeGroupIdPos) {
+	rangeGroupIdPos = -1;
+
+	if (!isRangeGroupPredicate(select.groupByList_)) {
+		return false;
+	}
+	const Expr *optionExpr = select.groupByList_->front();
+
+	{
+		Plan::Node &node = plan.back();
+		node.outputList_.push_back(makeRangeGroupIdExpr(plan, *optionExpr));
+		rangeGroupIdPos = static_cast<int32_t>(node.outputList_.size() - 1);
+	}
+	const PlanNodeId inputId = plan.back().id_;
+
+	{
+		Plan::Node &node = plan.append(SQLType::EXEC_SELECT);
+		node.inputList_.push_back(inputId);
+		node.outputList_ = inputListToOutput(plan);
+	}
+
+	return true;
+}
+
+bool SQLCompiler::isRangeGroupPredicate(const ExprList *groupByList) {
+	if (groupByList == NULL || groupByList->size() != 1) {
+		return false;
+	}
+
+	const Expr *optionExpr = groupByList->front();
+	if (optionExpr->op_ != SQLType::EXPR_RANGE_GROUP) {
+		return false;
+	}
+
+	return true;
+}
+
+void SQLCompiler::adjustRangeGroupOutput(
+		Plan &plan, PlanNode &node, const Expr &keyExpr) {
+	PlanExprList &outExprList = node.outputList_;
+	assert(keyExpr.op_ == SQLType::EXPR_COLUMN);
+
+	for (PlanExprList::iterator it = outExprList.begin();
+			it != outExprList.end(); ++it) {
+		adjustRangeGroupOutput(*it, keyExpr);
+	}
+
+	refreshColumnTypes(plan, node, outExprList, true, false);
+	for (PlanExprList::iterator it = outExprList.begin();
+			it != outExprList.end(); ++it) {
+	}
+}
+
+void SQLCompiler::adjustRangeGroupOutput(
+		Expr &outExpr, const Expr &keyExpr) {
+	const Type type = outExpr.op_;
+	do {
+		Type destType;
+		if (SQLType::START_AGG < type && type < SQLType::END_AGG) {
+			destType = SQLType::EXPR_RANGE_FILL;
+		}
+		else if (type == SQLType::EXPR_COLUMN) {
+			destType = (outExpr.columnId_ == keyExpr.columnId_ ?
+					SQLType::EXPR_RANGE_KEY : SQLType::EXPR_RANGE_FILL);
+		}
+		else {
+			break;
+		}
+
+		Expr *subExpr = ALLOC_NEW(alloc_) Expr(outExpr);
+		outExpr = Expr(alloc_);
+		outExpr.op_ = destType;
+		outExpr.left_ = subExpr;
+		outExpr.autoGenerated_ = true;
+		setUpExprAttributes(
+				outExpr, subExpr, subExpr->columnType_, MODE_GROUP_SELECT,
+				SQLType::AGG_PHASE_ALL_PIPE);
+		outExpr.autoGenerated_ = subExpr->autoGenerated_;
+
+		outExpr.qName_ = subExpr->qName_;
+		outExpr.aliasName_ = subExpr->aliasName_;
+
+		return;
+	}
+	while (false);
+
+	for (ExprArgsIterator<false> it(outExpr); it.exists(); it.next()) {
+		adjustRangeGroupOutput(it.get(), keyExpr);
+	}
+}
+
+SQLCompiler::Expr SQLCompiler::resolveRangeGroupPredicate(
+		const Plan &plan, const Expr &whereCond, const Expr &keyExpr,
+		const Expr &keyExprInCond, const Expr &optionExpr) {
+	{
+		const ColumnType keyType = keyExpr.columnType_;
+		if (!ColumnTypeUtils::isNull(keyType) &&
+				!ProcessorUtils::isRangeGroupSupportedType(keyType)) {
+			SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+					"Unsuppoted column type for GROUP BY RANGE key (type=" <<
+					TupleList::TupleColumnTypeCoder()(keyType) << ")");
+		}
+	}
+
+	TupleValue lower;
+	const bool lowerFound =
+			findRangeGroupBoundary(whereCond, keyExprInCond, lower, true);
+
+	TupleValue upper;
+	const bool upperFound =
+			findRangeGroupBoundary(whereCond, keyExprInCond, upper, false);
+
+	if (!lowerFound || !upperFound) {
+		if (!lowerFound && !upperFound) {
+			SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+					"Boundary conditions in the WHERE clause "
+					"must be specified for GROUP BY RANGE clause");
+		}
+		else {
+			SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+					(lowerFound ? "Upper" : "Lower") << " "
+					"boundary condition in the WHERE clause "
+					"not specified for GROUP BY RANGE clause");
+		}
+	}
+
+	assert(optionExpr.op_ == SQLType::EXPR_RANGE_GROUP);
+	const Type fillType = (*optionExpr.next_)[1]->op_;
+	const int64_t baseInterval = (*optionExpr.next_)[2]->value_.get<int64_t>();
+	const int64_t unit = (*optionExpr.next_)[3]->value_.get<int64_t>();
+	const int64_t baseOffset = (*optionExpr.next_)[4]->value_.get<int64_t>();
+	const TupleValue &timeZone =
+			resolveRangeGroupTimeZone((*optionExpr.next_)[5]->value_);
+
+	int64_t interval = resolveRangeGroupIntervalOrOffset(baseInterval, unit, true);
+	int64_t offset = resolveRangeGroupIntervalOrOffset(baseOffset, unit, false);
+	adjustRangeGroupInterval(interval, offset, timeZone);
+	if (!ProcessorUtils::adjustRangeGroupBoundary(
+			lower, upper, interval, offset)) {
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+				"Boundary value for GROUP BY RANGE clause must not be "
+				"less than offset");
+	}
+
+	const int64_t limit = getMaxGeneratedRows(plan);
+	return makeRangeGroupPredicate(keyExpr, fillType, interval, lower, upper, limit);
+}
+
+SQLCompiler::Expr SQLCompiler::makeRangeGroupIdExpr(
+		Plan &plan, const Expr &optionExpr) {
+	assert(optionExpr.op_ == SQLType::EXPR_RANGE_GROUP);
+	Expr *inKeyExpr = (*optionExpr.next_)[0];
+	const int64_t baseInterval = (*optionExpr.next_)[2]->value_.get<int64_t>();
+	const int64_t unit = (*optionExpr.next_)[3]->value_.get<int64_t>();
+	const int64_t baseOffset = (*optionExpr.next_)[4]->value_.get<int64_t>();
+	const TupleValue &timeZone =
+			resolveRangeGroupTimeZone((*optionExpr.next_)[5]->value_);
+
+	int64_t interval = resolveRangeGroupIntervalOrOffset(baseInterval, unit, true);
+	int64_t offset = resolveRangeGroupIntervalOrOffset(baseOffset, unit, false);
+	adjustRangeGroupInterval(interval, offset, timeZone);
+
+	ExprList inPredList(alloc_);
+	inPredList.push_back(inKeyExpr);
+	assert(inPredList.front()->op_ == SQLType::EXPR_COLUMN);
+	Expr* outKeyExpr = ALLOC_NEW(alloc_) Expr(genExprList(
+			inPredList, plan, MODE_NORMAL_SELECT, NULL).front());
+
+	Expr outExpr(alloc_);
+	outExpr.op_ = SQLType::EXPR_RANGE_GROUP_ID;
+	outExpr.next_ = ALLOC_NEW(alloc_) ExprList(alloc_);
+	outExpr.next_->push_back(outKeyExpr);
+	outExpr.next_->push_back(makeRangeGroupConst(TupleValue(interval)));
+	outExpr.next_->push_back(makeRangeGroupConst(TupleValue(offset)));
+
+	return outExpr;
+}
+
+SQLCompiler::Expr SQLCompiler::makeRangeGroupPredicate(
+		const Expr &keyExpr, Type fillType, int64_t interval,
+		TupleValue lower, TupleValue upper, int64_t limit) {
+	Expr expr(alloc_);
+	expr.op_ = SQLType::EXPR_RANGE_GROUP;
+	expr.next_ = ALLOC_NEW(alloc_) ExprList(alloc_);
+	expr.next_->push_back(ALLOC_NEW(alloc_) Expr(keyExpr));
+	expr.next_->push_back(Expr::makeExpr(alloc_, fillType));
+	expr.next_->push_back(makeRangeGroupConst(TupleValue(interval)));
+	expr.next_->push_back(makeRangeGroupConst(lower));
+	expr.next_->push_back(makeRangeGroupConst(upper));
+	expr.next_->push_back(makeRangeGroupConst(TupleValue(limit)));
+	return expr;
+}
+
+int64_t SQLCompiler::resolveRangeGroupIntervalOrOffset(
+		int64_t baseInterval, int64_t unit, bool forInterval) {
+	util::DateTime dt(0);
+	try {
+		dt.addField(baseInterval, static_cast<util::DateTime::FieldType>(unit));
+	}
+	catch (util::UtilityException &e) {
+		const char8_t *target = (forInterval ? "interval" : "offset");
+		GS_RETHROW_USER_ERROR_CODED(
+				GS_ERROR_SQL_COMPILE_LIMIT_EXCEEDED,
+				e, "Too large range group " << target <<" (reason=" <<
+				e.getField(util::Exception::FIELD_MESSAGE) << ")");
+	}
+	return dt.getUnixTime();
+}
+
+void SQLCompiler::adjustRangeGroupInterval(
+		int64_t &interval, int64_t &offset, const TupleValue &timeZone) {
+	int64_t outInterval = std::max<int64_t>(interval, 1);
+	int64_t outOffset = std::max<int64_t>(offset, 0) % outInterval;
+
+	if (!ColumnTypeUtils::isNull(timeZone.getType())) {
+		const int64_t zoneOffset = timeZone.get<int64_t>();
+		int64_t diff;
+		if (zoneOffset >= 0) {
+			diff = zoneOffset % outInterval;
+		}
+		else {
+			diff = outInterval - ((-zoneOffset) % outInterval);
+		}
+
+		if (outOffset >= outInterval - diff) {
+			outOffset += diff - outInterval;
+		}
+		else {
+			outOffset += diff;
+		}
+	}
+
+	interval = outInterval;
+	offset = outOffset;
+}
+
+bool SQLCompiler::findRangeGroupBoundary(
+		const Expr &expr, const Expr &keyExpr, TupleValue &value,
+		bool forLower) {
+	bool bounding = true;
+	bool less = false;
+	bool inclusive = false;
+	switch (expr.op_) {
+	case SQLType::OP_LT:
+		less = true;
+		break;
+	case SQLType::OP_GT:
+		break;
+	case SQLType::OP_LE:
+		inclusive = true;
+		less = true;
+		break;
+	case SQLType::OP_GE:
+		inclusive = true;
+		break;
+	case SQLType::EXPR_AND:
+		bounding = false;
+		break;
+	default:
+		return false;
+	}
+
+	if (bounding) {
+		const Expr *lhs = expr.left_;
+		const Expr *rhs = expr.right_;
+		if (lhs->op_ != SQLType::EXPR_COLUMN) {
+			std::swap(lhs, rhs);
+			less = !less;
+			if (lhs->op_ != SQLType::EXPR_COLUMN) {
+				return false;
+			}
+		}
+		if (!(!forLower == less)) {
+			return false;
+		}
+		if (lhs->columnId_ != keyExpr.columnId_) {
+			return false;
+		}
+		if (rhs->op_ != SQLType::EXPR_CONSTANT) {
+			if (!isConstantOnExecution(*rhs)) {
+				return false;
+			}
+			return true;
+		}
+		const ColumnType keyType = keyExpr.columnType_;
+		const ColumnType valueType = rhs->value_.getType();
+		if (!ProcessorUtils::isRangeGroupSupportedType(keyType) ||
+				!ProcessorUtils::isRangeGroupSupportedType(valueType)) {
+			return false;
+		}
+		value = ProcessorUtils::getRangeGroupBoundary(
+				alloc_, keyType, rhs->value_, forLower, inclusive);
+		return true;
+	}
+
+	bool found = false;
+	TupleValue lastValue;
+	for (ExprArgsIterator<> it(expr); it.exists(); it.next()) {
+		TupleValue subValue;
+		if (!findRangeGroupBoundary(it.get(), keyExpr, subValue, forLower)) {
+			continue;
+		}
+
+		found = true;
+		if (ColumnTypeUtils::isNull(subValue.getType())) {
+			lastValue = TupleValue();
+			break;
+		}
+
+		if (ColumnTypeUtils::isNull(lastValue.getType())) {
+			lastValue = subValue;
+			continue;
+		}
+
+		const int64_t base1 = subValue.get<int64_t>();
+		const int64_t base2 = lastValue.get<int64_t>();
+		lastValue = TupleValue(forLower ?
+				std::max(base1, base2) :
+				std::min(base1, base2));
+	}
+
+	value = lastValue;
+	return found;
+}
+
+TupleValue SQLCompiler::resolveRangeGroupTimeZone(const TupleValue &specified) {
+	if (!ColumnTypeUtils::isNull(specified.getType())) {
+		return specified;
+	}
+
+	const util::TimeZone &zone = getCompileOption().getTimeZone();
+	if (!zone.isEmpty()) {
+		const int64_t offsetMillis = zone.getOffsetMillis();
+		return TupleValue(offsetMillis);
+	}
+
+	return TupleValue();
+}
+
+SQLCompiler::Expr* SQLCompiler::makeRangeGroupConst(const TupleValue &value) {
+	Expr *expr = ALLOC_NEW(alloc_) Expr(alloc_);
+	expr->op_ = SQLType::EXPR_CONSTANT;
+	expr->value_ = value;
+	expr->autoGenerated_ = true;
+	setUpExprAttributes(
+			*expr, NULL, TupleList::TYPE_NULL, MODE_GROUP_SELECT,
+			SQLType::AGG_PHASE_ALL_PIPE);
+	return expr;
+}
+
+bool SQLCompiler::findDistinctAggregation(const ExprList *exprList) {
+	if (exprList == NULL) {
+		return false;
+	}
+
+	for (ExprList::const_iterator it = exprList->begin();
+			it != exprList->end(); ++it) {
+		if (findDistinctAggregation(*it)) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool SQLCompiler::findDistinctAggregation(const Expr *expr) {
+	if (expr == NULL) {
+		return false;
+	}
+
+	assert(!(SQLType::START_AGG < expr->op_ && expr->op_ < SQLType::END_AGG));
+	return (expr->aggrOpts_ & SyntaxTree::AGGR_OPT_DISTINCT) != 0 ||
+			findDistinctAggregation(expr->left_) ||
+			findDistinctAggregation(expr->right_) ||
+			findDistinctAggregation(expr->next_);
 }
 
 void SQLCompiler::genOrderBy(GenRAContext &cxt, ExprRef &innerTopExprRef, Plan &plan) {
@@ -2990,10 +3661,11 @@ void SQLCompiler::genOrderBy(GenRAContext &cxt, ExprRef &innerTopExprRef, Plan &
 		if (SQLType::EXPR_CONSTANT == itr->op_
 			&& TupleList::TYPE_LONG == itr->value_.getType()) {
 			int64_t columnPos = size_t(itr->value_.get<int64_t>());
-			if (columnPos > static_cast<int64_t>(cxt.selectList_.size())
+			if (!cxt.select_.selectList_
+				|| columnPos > static_cast<int64_t>(cxt.select_.selectList_->size())
 				|| columnPos <= 0) {
 				SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &(*itr),
-					"Invalid column refernce (" << columnPos << ")");
+					"Invalid column reference (" << columnPos << ")");
 			}
 			ColumnId colId = static_cast<ColumnId>(columnPos - 1);
 			if (inSubQuery) {
@@ -3103,6 +3775,8 @@ void SQLCompiler::genSelectProjection(
 		PlanExprList &selectList,
 		ExprList *&windowExprList, size_t &windowExprCount,
 		PlanNodeId &productedNodeId, Plan &plan, bool removeAutoGen) {
+	static_cast<void>(windowExprList);
+	static_cast<void>(windowExprCount);
 	PlanNodeId inputId = (basePlanSize != plan.nodeList_.size()) ? plan.back().id_ : SyntaxTree::UNDEF_INPUTID;
 
 	{
@@ -3327,8 +4001,6 @@ void SQLCompiler::genWindowOverClauseOption(
 	PlanExprList windowPartitionByList1(alloc_);
 	PlanExprList windowOrderByList1(alloc_);
 
-	Mode mode = MODE_WHERE;
-
 	if (windowExpr->windowOpt_) {
 		SQLPreparedPlan::Node &inputNode = node->getInput(plan, 0);
 		PlanExprList saveOutputList(alloc_);
@@ -3347,17 +4019,30 @@ void SQLCompiler::genWindowOverClauseOption(
 			assert(node->id_ == plan.back().id_);
 		}
 		if (windowExpr->windowOpt_->orderByList_) {
-			if (findSubqueryExpr(*windowExpr->windowOpt_->orderByList_)) {
+			const ExprList &inExprList = *windowExpr->windowOpt_->orderByList_;
+			if (findSubqueryExpr(inExprList)) {
 				GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 						"Subqueries in the over clause are not supported");
 			}
 			windowOrderByList1 = genExprList(
-					*windowExpr->windowOpt_->orderByList_,
-					plan, MODE_NORMAL_SELECT, &inputId);
+					inExprList, plan, MODE_NORMAL_SELECT, &inputId);
 			assert(node->id_ == plan.back().id_);
+
+			PlanExprList::iterator itr = windowOrderByList1.begin();
+			ExprList::const_iterator inItr = inExprList.begin();
+			for (; inItr != inExprList.end(); ++inItr, ++itr) {
+				if (itr == windowOrderByList1.end() ||
+						(*inItr)->op_ == SQLType::EXPR_ALL_COLUMN) {
+					SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+				}
+				if ((*inItr)->op_ == SQLType::EXPR_COLUMN) {
+					continue;
+				}
+				itr->sortAscending_ = (*inItr)->sortAscending_;
+			}
 		}
-		inputNode.outputList_ = saveOutputList;
 		restoreSelectListName(cxt, saveOutputList, plan);
+		inputNode.outputList_ = saveOutputList;
 	}
 	overCxt.windowPartitionByList_.reserve(windowPartitionByList1.size() + 1);
 	overCxt.windowOrderByList_.reserve(windowOrderByList1.size() + 1);
@@ -3365,7 +4050,6 @@ void SQLCompiler::genWindowOverClauseOption(
 	overCxt.replaceColumnIndexList_.reserve(windowPartitionByList1.size() + 1);
 
 	int32_t index = cxt.inSubQuery_ ? 1 : 0;
-	size_t orderByStartPos = 0;
 	PlanExprList::const_iterator itr = windowPartitionByList1.begin();
 	for (; itr != windowPartitionByList1.end(); ++itr) {
 		overCxt.windowPartitionByList_.push_back(*itr);
@@ -3406,6 +4090,7 @@ void SQLCompiler::genWindowOverClauseOption(
 		SQLPreparedPlan::Node &inputNode = node->getInput(plan, 0);
 		PlanExprList saveOutputList(alloc_);
 		saveOutputList = inputNode.outputList_;
+		PlanNodeId saveOutputNodeId = inputNode.id_;
 		hideSelectListName(cxt, inputNode, plan);
 		assert(cxt.windowExprList_.size() > 0);
 		assert(cxt.productedNodeId_ != UNDEF_PLAN_NODEID);
@@ -3414,8 +4099,8 @@ void SQLCompiler::genWindowOverClauseOption(
 		node = &plan.back();
 		node->outputList_ = inputListToOutput(plan, *node, &inId);
 
-		inputNode.outputList_ = saveOutputList;
 		restoreSelectListName(cxt, saveOutputList, plan);
+		plan.nodeList_[saveOutputNodeId].outputList_ = saveOutputList;
 	}
 }
 
@@ -3450,8 +4135,10 @@ void SQLCompiler::genWindowSortPlan(
 		for (size_t addIndex = 0;
 				addIndex < overCxt.addColumnExprList_.size(); addIndex++) {
 			ColumnId colId = static_cast<ColumnId>(overCxt.baseOutputListSize_ + addIndex);
-			const Expr& col = genColumnExpr(plan, 0, colId);
-			tmpPredList[overCxt.replaceColumnIndexList_[addIndex]] = col;
+			Expr col = genColumnExpr(plan, 0, colId);
+			Expr &destCol = tmpPredList[overCxt.replaceColumnIndexList_[addIndex]];
+			col.sortAscending_ = destCol.sortAscending_;
+			destCol = col;
 		}
 		appendUniqueExpr(tmpPredList, sortNode.predList_);
 	}
@@ -3501,12 +4188,25 @@ void SQLCompiler::genWindowMainPlan(
 		tmpPredList.end(),
 		overCxt.windowPartitionByList_.begin(),
 		overCxt.windowPartitionByList_.end());
+	const size_t orderByStartPos = tmpPredList.size();
+	const bool ranking = isRankingWindowExpr(*overCxt.windowExpr_);
+	if (ranking) {
+		tmpPredList.insert(
+			tmpPredList.end(),
+			overCxt.windowOrderByList_.begin(),
+			overCxt.windowOrderByList_.end());
+	}
 	for (size_t addIndex = 0;
-			addIndex < overCxt.replaceColumnIndexList_.size()
-		 	&& addIndex < overCxt.orderByStartPos_; addIndex++) {
+			addIndex < overCxt.replaceColumnIndexList_.size(); addIndex++) {
+		if (!ranking && addIndex >= overCxt.orderByStartPos_) {
+			break;
+		}
 		ColumnId colId = static_cast<ColumnId>(overCxt.baseOutputListSize_ + addIndex);
-		const Expr& col = genColumnExpr(plan, 0, colId);
+		const Expr &col = genColumnExpr(plan, 0, colId);
 		tmpPredList[overCxt.replaceColumnIndexList_[addIndex]] = col;
+	}
+	for (size_t i = 0; i < tmpPredList.size(); i++) {
+		tmpPredList[i].sortAscending_ = (i < orderByStartPos);
 	}
 	appendUniqueExpr(tmpPredList, windowNode.predList_);
 	assert(cxt.selectTopColumnId_ != UNDEF_COLUMNID);
@@ -3533,8 +4233,6 @@ void SQLCompiler::genWindowMainPlan(
 
 void SQLCompiler::genOver(GenRAContext &cxt, Plan &plan) {
 	assert(cxt.windowExprList_.size() > 0);
-	const Select &select = cxt.select_;
-	bool inSubQuery = cxt.inSubQuery_;
 
 	size_t windowExprPos = 0;
 	ExprList::const_iterator it = cxt.windowExprList_.begin();
@@ -3543,14 +4241,8 @@ void SQLCompiler::genOver(GenRAContext &cxt, Plan &plan) {
 		const Expr *windowExpr = NULL;
 		if (findWindowExpr(*inExpr, false, windowExpr)) {
 			assert(windowExpr);
-			Type windowOp = windowExpr->op_;
-			if (windowOp == SQLType::EXPR_FUNCTION) {
-				windowOp = resolveFunction(*windowExpr);
-			}
-			bool isWindowOnly;
-			bool isPseudoWindow;
-			isWindowExprType(windowOp, isWindowOnly, isPseudoWindow);
-			if (isPseudoWindow) {
+			uint32_t funcCategory = calcFunctionCategory(*windowExpr, false);
+			if (funcCategory != FUNCTION_WINDOW) {
 				continue;
 			}
 			GenOverContext overCxt(alloc_);
@@ -3572,7 +4264,6 @@ void SQLCompiler::genOver(GenRAContext &cxt, Plan &plan) {
 }
 
 void SQLCompiler::genPseudoWindowFunc(GenRAContext &cxt, Plan &plan) {
-	const Select &select = cxt.select_;
 	bool inSubQuery = cxt.inSubQuery_;
 
 	assert(cxt.pseudoWindowExprCount_ == 1); 
@@ -3588,14 +4279,8 @@ void SQLCompiler::genPseudoWindowFunc(GenRAContext &cxt, Plan &plan) {
 		const Expr *windowExpr = NULL;
 		if (findWindowExpr(*inExpr, false, windowExpr)) {
 			assert(windowExpr);
-			Type windowOp = windowExpr->op_;
-			if (windowOp == SQLType::EXPR_FUNCTION) {
-				windowOp = resolveFunction(*windowExpr);
-			}
-			bool isWindowOnly;
-			bool isPseudoWindow;
-			isWindowExprType(windowOp, isWindowOnly, isPseudoWindow);
-			if (!isPseudoWindow) {
+			uint32_t funcCategory = calcFunctionCategory(*windowExpr, false);
+			if (funcCategory != FUNCTION_PSEUDO_WINDOW) {
 				continue;
 			}
 			overCxt.windowExpr_ = windowExpr;
@@ -3627,6 +4312,12 @@ void SQLCompiler::preparePseudoWindowOption(
 	node->inputList_.push_back(inputId);
 	node->outputList_ = inputListToOutput(plan);
 
+	int32_t rangeGroupIdPos;
+	if (genRangeGroupIdNode(plan, select, rangeGroupIdPos)) {
+		node = &plan.back();
+		inputId = node->inputList_.front();
+	}
+
 	PlanNodeId firstSelectNodeId = node->id_;
 
 	PlanExprList windowPartitionByList1(alloc_);
@@ -3642,8 +4333,14 @@ void SQLCompiler::preparePseudoWindowOption(
 		PlanExprList groupByList0(alloc_);
 		if (select.groupByList_) {
 			size_t orgSize = node->outputList_.size();
-			groupByList0 = genExprList(
-					*select.groupByList_, plan, mode, &inputId);
+			if (rangeGroupIdPos >= 0) {
+				groupByList0.push_back(genColumnExpr(
+						plan, 0, static_cast<ColumnId>(rangeGroupIdPos)));
+			}
+			else {
+				groupByList0 = genExprList(
+						*select.groupByList_, plan, mode, &inputId);
+			}
 			node = &plan.back();
 			node->outputList_ = inputListToOutput(plan, *node, &inId);
 			trimExprList(orgSize, node->outputList_);
@@ -3658,7 +4355,7 @@ void SQLCompiler::preparePseudoWindowOption(
 				if (columnPos > static_cast<int64_t>(cxt.selectList_.size())
 					|| columnPos <= 0) {
 					SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &(*itr),
-							"Invalid column refernce (" << columnPos << ")");
+							"Invalid column reference (" << columnPos << ")");
 				}
 				ColumnId colId = static_cast<ColumnId>(columnPos - 1);
 				if (findAggrExpr(*cxt.aggrExprList_[colId], false)) {
@@ -3681,6 +4378,7 @@ void SQLCompiler::preparePseudoWindowOption(
 	SQLPreparedPlan::Node &inputNode = node->getInput(plan, 0);
 	PlanExprList saveOutputList(alloc_);
 	saveOutputList = inputNode.outputList_;
+	PlanNodeId saveOutputNodeId = inputNode.id_;
 	hideSelectListName(cxt, inputNode, plan);
 	if (windowExpr->next_) {
 		assert(windowOrderByList1.size() == 0);
@@ -3738,8 +4436,8 @@ void SQLCompiler::preparePseudoWindowOption(
 		node = &plan.back();
 		node->outputList_ = inputListToOutput(plan, *node, &inId);
 	}
-	inputNode.outputList_ = saveOutputList;
 	restoreSelectListName(cxt, saveOutputList, plan);
+	plan.nodeList_[saveOutputNodeId].outputList_ = saveOutputList;
 }
 
 void SQLCompiler::genPseudoWindowResult(
@@ -3748,8 +4446,6 @@ void SQLCompiler::genPseudoWindowResult(
 	const Select &select = cxt.select_;
 	const bool inSubQuery = cxt.inSubQuery_;
 	assert(cxt.selectTopColumnId_ != UNDEF_COLUMNID);
-
-	const bool existGroupBy = (select.groupByList_ || inSubQuery);
 
 	ColumnId colId = static_cast<ColumnId>(cxt.selectTopColumnId_ + overCxt.windowExprPos_);
 	const Expr& col = genColumnExpr(plan, 0, colId);
@@ -3785,7 +4481,7 @@ void SQLCompiler::genSubquerySelect(
 	cxt.inSubQuery_ = true;
 	cxt.type_ = type;
 
-	size_t windowExprCount = validateWindowFunctionOccurence(
+	validateWindowFunctionOccurrence(
 			select, cxt.genuineWindowExprCount_, cxt.pseudoWindowExprCount_);
 
 	if (!select.selectList_
@@ -3887,8 +4583,9 @@ void SQLCompiler::genSubquerySelect(
 		}
 		if (!select.groupByList_ && (selectHasAggrExpr || havingHasAggrExpr)) {
 			PlanNodeId lastNodeId = plan.back().id_;
+#ifndef NDEBUG
 			size_t lastNodeOutputCount = plan.back().outputList_.size();
-
+#endif
 			SQLPreparedPlan::Node* joinNode = &plan.append(SQLType::EXEC_JOIN);
 			joinNode->joinType_ = SQLType::JOIN_LEFT_OUTER;
 
@@ -3972,7 +4669,7 @@ void SQLCompiler::genSubquerySelect(
 			SQLPreparedPlan::Node &node = plan.append(SQLType::EXEC_SELECT);
 			node.inputList_.push_back(inputId);
 			node.outputList_ = inputListToOutput(plan);
-		} 
+		}
 		SQLPreparedPlan::Node *node = &plan.back();
 		node->outputList_.clear();
 		PlanExprList &join1OutputList = plan.nodeList_[prevJoinNodeId].outputList_;
@@ -3993,7 +4690,7 @@ void SQLCompiler::genSubquerySelect(
 
 		for (size_t pos = 0; pos < cxt.selectExprRefList_.size(); ++pos) {
 			Expr selectExpr(alloc_);
-			colId = cxt.selectTopColumnId_ + pos;
+			colId = cxt.selectTopColumnId_ + static_cast<ColumnId>(pos);
 			selectExpr = genColumnExpr(plan, 0, colId);
 			if (selectExpr.subqueryLevel_ < subqueryLevel_) {
 				selectExpr.subqueryLevel_ = subqueryLevel_;
@@ -4415,9 +5112,7 @@ void SQLCompiler::genTable(const Expr &table, const Expr* &whereExpr, Plan &plan
 			node.setName(*table.aliasName_, NULL, nsId);
 		}
 		node.tableIdInfo_ = tableInfo.idInfo_;
-		node.indexInfoList_ = ALLOC_NEW(alloc_) SQLTableInfo::IndexInfoList(
-				tableInfo.indexInfoList_.begin(), tableInfo.indexInfoList_.end(),
-				alloc_);
+		node.indexInfoList_ = tableInfo.basicIndexInfoList_;
 		node.outputList_ =
 				tableInfoToOutput(plan, tableInfo, MODE_NORMAL_SELECT);
 		if (table.next_ != NULL) {
@@ -4554,8 +5249,9 @@ void SQLCompiler::Meta::genDriverColumns(
 	projNode.outputList_.push_back(genConstColumn(
 			plan, TupleValue(static_cast<int32_t>(2000000000)),
 					STR_BUFFER_LENGTH));
-	projNode.outputList_.push_back(genConstColumn(
-			plan, TupleValue(static_cast<int32_t>(10)), STR_DECIMAL_DIGITS));
+	projNode.outputList_.push_back(genRefColumn<MetaType>(
+			plan, scanOutputList, MetaType::COLUMN_DECIMAL_DIGITS,
+					STR_DECIMAL_DIGITS));
 	projNode.outputList_.push_back(genConstColumn(
 			plan, TupleValue(static_cast<int32_t>(10)), STR_NUM_PREC_RADIX));
 	{
@@ -4596,8 +5292,8 @@ void SQLCompiler::Meta::genDriverColumns(
 	projNode.outputList_.push_back(genConstColumn(
 			plan, TupleValue(static_cast<int32_t>(0)),
 					STR_SQL_DATETIME_SUB));
-	projNode.outputList_.push_back(genConstColumn(
-			plan, TupleValue(static_cast<int32_t>(2000000000)),
+	projNode.outputList_.push_back(genRefColumn<MetaType>(
+			plan, scanOutputList, MetaType::COLUMN_CHAR_OCTET_LENGTH,
 					STR_CHAR_OCTET_LENGTH));
 	projNode.outputList_.push_back(genRefColumn<MetaType>(
 			plan, scanOutputList, MetaType::COLUMN_ORDINAL,
@@ -4808,6 +5504,10 @@ void SQLCompiler::Meta::appendMetaTableInfoId(
 		return;
 	}
 
+	if (metaInfo.id_ == MetaType::TYPE_PARTITION_STATS) {
+		return;
+	}
+
 	{
 		const TableInfo::SubInfoList &subInfoList = tableInfo.partitioning_->subInfoList_;
 
@@ -4840,7 +5540,7 @@ void SQLCompiler::Meta::genDriverTypeInfo(
 		TupleList::TYPE_LONG,
 		TupleList::TYPE_FLOAT,
 		TupleList::TYPE_DOUBLE,
-		TupleList::TYPE_TIMESTAMP,
+		TupleList::TYPE_NANO_TIMESTAMP, 
 		TupleList::TYPE_BOOL,
 		TupleList::TYPE_ANY,
 		TupleList::TYPE_STRING,
@@ -4851,7 +5551,9 @@ void SQLCompiler::Meta::genDriverTypeInfo(
 		SQLPreparedPlan::Node &projNode = plan.append(SQLType::EXEC_SELECT);
 		planNodeIdList.push_back(projNode.id_);
 
-		const char8_t *typeStr = TupleList::TupleColumnTypeCoder()(*it);
+		const bool precisionIgnorable = true;
+		const char8_t *typeStr = ValueProcessor::getTypeNameChars(
+				convertTupleTypeToNoSQLType(*it), precisionIgnorable);
 		if (*it == TupleList::TYPE_ANY) {
 			typeStr = str(STR_UNKNOWN);
 		}
@@ -4862,8 +5564,13 @@ void SQLCompiler::Meta::genDriverTypeInfo(
 		const int32_t dataType = ProcessorUtils::toSQLColumnType(*it);
 		projNode.outputList_.push_back(genConstColumn(
 				plan, TupleValue(dataType), STR_DATA_TYPE));
+		int32_t typePrecision = ValueProcessor::getValuePrecision(
+				convertTupleTypeToNoSQLType(*it));
+		if (typePrecision < 0) {
+			typePrecision = 0;
+		}
 		projNode.outputList_.push_back(genConstColumn(
-				plan, TupleValue(static_cast<int32_t>(0)), STR_PRECISION));
+				plan, TupleValue(typePrecision), STR_PRECISION));
 		projNode.outputList_.push_back(genEmptyColumn(
 				plan, TupleList::TYPE_STRING, STR_LITERAL_PREFIX));
 		projNode.outputList_.push_back(genEmptyColumn(
@@ -5270,12 +5977,14 @@ void SQLCompiler::genJoinCondition(const Plan &plan,
 		++itr;
 	}
 	if (checkUsing && (usingExprList.size() > 0)) {
-		Expr &frontExpr = usingExprList.front();
-		const char* c_str = static_cast<const char*>(frontExpr.value_.varData());
-		util::String name(c_str, frontExpr.value_.varSize(), alloc_);
+		const char8_t *name = "";
+		const Expr &frontExpr = usingExprList.front();
+		if (frontExpr.qName_ != NULL && frontExpr.qName_->name_ != NULL) {
+			name = frontExpr.qName_->name_->c_str();
+		}
 		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
-			"Column \"" << name.c_str()
-			<< "\" specified in USING clause does not exist in left or right table");
+				"Column \"" << name <<
+				"\" specified in USING clause does not exist in left or right table");
 	}
 	if (tempOnExpr.op_ != SQLType::Id()) {
 		onExpr = tempOnExpr;
@@ -5507,22 +6216,16 @@ bool SQLCompiler::findAggrExpr(const ExprList &exprList, bool resolved, bool exc
 }
 
 bool SQLCompiler::findAggrExpr(const Expr &expr, bool resolved, bool exceptWindowFunc) {
-	SQLType::Id opType = expr.op_;
-	if (!resolved && opType == SQLType::EXPR_FUNCTION) {
-		opType = resolveFunction(expr);
-	}
-	if (SQLType::START_AGG < opType && opType < SQLType::END_AGG) {
-		if (exceptWindowFunc) {
-			bool windowOnly;
-			bool pseudoWindow;
-			if (isWindowExprType(opType, windowOnly, pseudoWindow)) {
-				return false;
-			}
-			else {
-				return true;
-			}
+	uint32_t funcCategory = calcFunctionCategory(expr, resolved);
+	if (exceptWindowFunc) {
+		if (funcCategory == FUNCTION_AGGR
+			|| funcCategory == FUNCTION_PSEUDO_WINDOW) {
+			return true;
 		}
-		else {
+	} else {
+		if (funcCategory == FUNCTION_AGGR
+			|| funcCategory == FUNCTION_WINDOW
+			|| funcCategory == FUNCTION_PSEUDO_WINDOW) {
 			return true;
 		}
 	}
@@ -5633,13 +6336,13 @@ void SQLCompiler::trimExprList(size_t len, PlanExprList &list) {
 	assert(len == list.size());
 }
 
-size_t SQLCompiler::validateWindowFunctionOccurence(
+size_t SQLCompiler::validateWindowFunctionOccurrence(
 		const Select &select,
 		size_t &genuineWindowExprCount, size_t &pseudoWindowExprCount) {
 	genuineWindowExprCount = 0;
 	pseudoWindowExprCount = 0;
 
-	size_t occurenceCount = 0;
+	size_t occurrenceCount = 0;
 	bool resolved = false;
 	bool found = false;
 	const Expr* foundExpr = NULL;
@@ -5753,9 +6456,9 @@ size_t SQLCompiler::validateWindowFunctionOccurence(
 				}
 			}
 		}
-		occurenceCount = totalWindowCount;
+		occurrenceCount = totalWindowCount;
 	}
-	return occurenceCount;
+	return occurrenceCount;
 }
 
 bool SQLCompiler::findWindowExpr(const ExprList &exprList, bool resolved, const Expr* &foundExpr) {
@@ -5770,15 +6473,9 @@ bool SQLCompiler::findWindowExpr(const ExprList &exprList, bool resolved, const 
 }
 
 bool SQLCompiler::findWindowExpr(const Expr &expr, bool resolved, const Expr* &foundExpr) {
-	SQLType::Id opType = expr.op_;
-	if (!resolved && opType == SQLType::EXPR_FUNCTION) {
-		opType = resolveFunction(expr);
-	}
-	bool windowOnly;
-	bool pseudoWindow;
-	if (SQLType::START_AGG < opType && opType < SQLType::END_AGG &&
-			(isWindowExprType(opType, windowOnly, pseudoWindow) ||
-			pseudoWindow)) {
+	uint32_t funcCategory = calcFunctionCategory(expr, resolved);
+	if (funcCategory == FUNCTION_WINDOW
+			|| funcCategory == FUNCTION_PSEUDO_WINDOW) {
 		foundExpr = &expr;
 		return true;
 	}
@@ -5804,8 +6501,75 @@ bool SQLCompiler::findWindowExpr(const Expr &expr, bool resolved, const Expr* &f
 	return false;
 }
 
-bool SQLCompiler::isWindowExprType(Type type, bool &windowOnly, bool &pseudoWindow) {
-	return ProcessorUtils::isWindowExprType(type, windowOnly, pseudoWindow);
+bool SQLCompiler::isRankingWindowExpr(const Expr &expr) {
+	bool ranking = false;
+
+	Type opType = expr.op_;
+	if (opType == SQLType::EXPR_FUNCTION) {
+		opType = resolveFunction(expr);
+	}
+
+	bool windowOnly;
+	bool pseudoWindow;
+	if (ProcessorUtils::isWindowExprType(opType, windowOnly, pseudoWindow)) {
+		ranking = !(windowOnly || pseudoWindow);
+	}
+
+	return ranking;
+}
+
+uint32_t SQLCompiler::calcFunctionCategory(const Expr &expr, bool resolved) {
+	SQLType::Id opType = expr.op_;
+	if (!resolved && opType == SQLType::EXPR_FUNCTION) {
+		opType = resolveFunction(expr);
+	}
+	if (SQLType::START_AGG < opType && opType < SQLType::END_AGG) {
+		bool windowOnly;
+		bool pseudoWindow;
+		bool isWindow = ProcessorUtils::isWindowExprType(opType, windowOnly, pseudoWindow);
+		if (isWindow) {
+			if (windowOnly) {
+				if (!expr.windowOpt_) {
+					SQL_COMPILER_THROW_ERROR(
+							GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
+							"The function must have an OVER clause");
+				}
+				return FUNCTION_WINDOW;
+			}
+			if (expr.windowOpt_) {
+				return FUNCTION_WINDOW;
+			}
+			else {
+				return FUNCTION_AGGR;
+			}
+		}
+		else if (pseudoWindow) {
+			if (expr.windowOpt_) {
+				SQL_COMPILER_THROW_ERROR(
+						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
+						"The OVER clause cannot be used with the function");
+			}
+			return FUNCTION_PSEUDO_WINDOW;
+		}
+		else {
+			if (expr.windowOpt_) {
+				SQL_COMPILER_THROW_ERROR(
+						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
+						"The OVER clause cannot be used with the function");
+			}
+		}
+		return FUNCTION_AGGR;
+	}
+	return FUNCTION_SCALAR;
+}
+
+bool SQLCompiler::isRangeGroupNode(const PlanNode &node) {
+	if ((node.cmdOptionFlag_ &
+			PlanNode::Config::CMD_OPT_GROUP_RANGE) != 0) {
+		assert(node.type_ == SQLType::EXEC_GROUP);
+		return true;
+	}
+	return false;
 }
 
 bool SQLCompiler::isWindowNode(const PlanNode &node) {
@@ -5821,39 +6585,30 @@ void SQLCompiler::checkNestedAggrWindowExpr(
 		const Expr &expr, bool resolved, size_t &genuineWindowCount,
 		size_t &pseudoWindowCount, size_t &aggrCount) {
 
-	SQLType::Id opType = expr.op_;
-	if (!resolved && opType == SQLType::EXPR_FUNCTION) {
-		opType = resolveFunction(expr);
+	uint32_t funcCategory = calcFunctionCategory(expr, resolved);
+	switch(funcCategory) {
+	case FUNCTION_WINDOW:
+		++genuineWindowCount;
+		break;
+	case FUNCTION_PSEUDO_WINDOW:
+		++pseudoWindowCount;
+		break;
+	case FUNCTION_AGGR:
+		++aggrCount;
+		break;
+	default:
+		break;
 	}
-	bool windowOnly;
-	bool pseudoWindow;
-	if (SQLType::START_AGG < opType && opType < SQLType::END_AGG) {
-		if (isWindowExprType(opType, windowOnly, pseudoWindow) || pseudoWindow) {
-			if (pseudoWindow) {
-				++pseudoWindowCount;
-			}
-			else {
-				++genuineWindowCount;
-			}
- 			if ((genuineWindowCount + pseudoWindowCount) > 1) {
-				SQL_COMPILER_THROW_ERROR(
-						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
-						"Too many window functions are found");
-			}
-			if (aggrCount > 0) {
-				SQL_COMPILER_THROW_ERROR(
-						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
-						"Illegal window or aggregation function occurrence");
-			}
-		}
-		else {
-			++aggrCount;
-			if ((genuineWindowCount + pseudoWindowCount) > 0) {
-				SQL_COMPILER_THROW_ERROR(
-						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
-						"Illegal aggregation function occurrence");
-			}
-		}
+
+	if ((genuineWindowCount + pseudoWindowCount) > 1) {
+		SQL_COMPILER_THROW_ERROR(
+			GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
+			"Too many window functions are found");
+	}
+	if (aggrCount > 0 && (genuineWindowCount + pseudoWindowCount) > 0) {
+		SQL_COMPILER_THROW_ERROR(
+			GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
+			"Illegal window or aggregation function occurrence");
 	}
 	if (expr.left_) {
 		checkNestedAggrWindowExpr(*expr.left_, resolved, genuineWindowCount, pseudoWindowCount, aggrCount);
@@ -6056,8 +6811,6 @@ SQLCompiler::Expr SQLCompiler::genScalarExpr(
 
 	if (inExpr.op_ == SQLType::EXPR_FUNCTION) {
 		exprType = resolveFunction(inExpr);
-		resolveTimestampField(
-				plan, mode, exprType, inExpr.next_, timestampField);
 
 		if (exprType == SQLType::AGG_COUNT_ALL) {
 			exprNext = NULL;
@@ -6096,11 +6849,6 @@ SQLCompiler::Expr SQLCompiler::genScalarExpr(
 		ExprList *outNext = ALLOC_NEW(alloc_) ExprList(alloc_);
 
 		ExprList::const_iterator it = exprNext->begin();
-		if (timestampField != NULL) {
-			++it;
-			outNext->push_back(timestampField);
-		}
-
 		for (; it != exprNext->end(); ++it) {
 			outNext->push_back(ALLOC_NEW(alloc_) Expr(genScalarExpr(
 					**it, plan, mode, subAggregated, productedNodeId,
@@ -6110,11 +6858,24 @@ SQLCompiler::Expr SQLCompiler::genScalarExpr(
 		outExpr.next_ = outNext;
 	}
 
+	if (inExpr.op_ == SQLType::EXPR_FUNCTION) {
+		arrangeFunctionArgs(exprType, outExpr);
+	}
+
 	if (SQLType::START_FUNC < exprType && exprType < SQLType::END_FUNC) {
 		outExpr.op_ = exprType;
 
 		if (exprType == SQLType::FUNC_NOW) {
-			currentTimeRequired_ = true;
+			if (queryStartTime_.getUnixTime() !=
+					util::DateTime::INITIAL_UNIX_TIME) {
+				const int64_t unixTime = queryStartTime_.getUnixTime();
+				outExpr.value_ =
+						TupleValue(&unixTime, TupleList::TYPE_TIMESTAMP);
+				outExpr.op_ = SQLType::EXPR_CONSTANT;
+			}
+			else {
+				currentTimeRequired_ = true;
+			}
 		}
 	}
 	else if (SQLType::START_AGG < exprType && exprType < SQLType::END_AGG) {
@@ -6161,7 +6922,7 @@ SQLCompiler::Expr SQLCompiler::genScalarExpr(
 
 		if (exprType == SQLType::EXPR_TYPE) {
 			if (!inExpr.autoGenerated_ &&
-					TupleColumnTypeUtils::isDeclarable(inExpr.columnType_)) {
+					ColumnTypeUtils::isDeclarable(inExpr.columnType_)) {
 				columnType = setColumnTypeNullable(inExpr.columnType_, true);
 			}
 		}
@@ -6182,8 +6943,24 @@ SQLCompiler::Expr SQLCompiler::genScalarExpr(
 			}
 
 			assert(inExpr.placeHolderCount_ > 0);
-			outExpr.columnId_ =
+			const ColumnId pos =
 					static_cast<ColumnId>(inExpr.placeHolderCount_ - 1);
+			if (pos < plan.parameterList_.size()) {
+				outExpr.value_ = plan.parameterList_[pos];
+				outExpr.op_ = SQLType::EXPR_CONSTANT;
+			}
+			else {
+				outExpr.columnId_ = pos;
+			}
+		}
+		else if (exprType == SQLType::EXPR_AGG_ORDERING) {
+			assert(outExpr.next_ != NULL);
+			if (outExpr.next_->size() != 1) {
+				SQL_COMPILER_THROW_ERROR(
+						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &inExpr,
+						"Only one sort key can be used for WITHIN GROUP clause");
+			}
+			return *outExpr.next_->front();
 		}
 		else if (outExpr.next_ != NULL &&
 				(exprType == SQLType::EXPR_AND ||
@@ -6487,7 +7264,13 @@ SQLCompiler::Expr SQLCompiler::genSubqueryRef(
 
 SQLCompiler::Expr SQLCompiler::genConstExpr(
 		const Plan &plan, const TupleValue &value, Mode mode,
-		const char* name) {
+		const char8_t *name) {
+	return genConstExprBase(&plan, value, mode, name);
+}
+
+SQLCompiler::Expr SQLCompiler::genConstExprBase(
+		const Plan *plan, const TupleValue &value, Mode mode,
+		const char8_t *name) {
 	Expr expr(alloc_);
 	expr.op_ = SQLType::EXPR_CONSTANT;
 	expr.value_ = value;
@@ -6495,7 +7278,16 @@ SQLCompiler::Expr SQLCompiler::genConstExpr(
 	if (name != NULL) {
 		expr.aliasName_ = ALLOC_NEW(alloc_) util::String(name, alloc_);
 	}
-	return genScalarExpr(expr, plan, mode, false, NULL);
+
+	if (plan == NULL) {
+		setUpExprAttributes(
+				expr, NULL, TupleList::TYPE_NULL, mode,
+				SQLType::AGG_PHASE_ALL_PIPE);
+		return expr;
+	}
+	else {
+		return genScalarExpr(expr, *plan, mode, false, NULL);
+	}
 }
 
 SQLCompiler::Expr SQLCompiler::genTupleIdExpr(
@@ -6601,7 +7393,7 @@ int64_t SQLCompiler::genLimitOffsetValue(
 	}
 
 	const TupleValue &targetValue = targetExpr.value_;
-	if (!TupleColumnTypeUtils::isIntegral(targetValue.getType())) {
+	if (!ColumnTypeUtils::isIntegral(targetValue.getType())) {
 		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, inExpr,
 				"Limit or offset expression must be evaluated as integral value");
 	}
@@ -6658,6 +7450,11 @@ void SQLCompiler::reduceExpr(Expr &expr, bool strict) {
 			SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
 		}
 		outType = columnType;
+
+		if (outType != TupleList::TYPE_ANY) {
+			value = ProcessorUtils::convertType(
+					getVarContext(), value, outType, implicit);
+		}
 	}
 	while (false);
 
@@ -6799,7 +7596,6 @@ void SQLCompiler::splitAggrWindowExprList(
 	cxt.windowExprList_.reserve(size);
 
 	size_t windowExprCount = 0;
-	bool foundAggrExpr = false;
 	cxt.aggrExprCount_ = 0;
 	for (ExprList::const_iterator it = inExprList.begin();
 			it != inExprList.end(); ++it) {
@@ -6826,7 +7622,6 @@ void SQLCompiler::splitAggrWindowExprList(
 					genReplacedAggrExpr(plan, inExpr)));
 
 			cxt.aggrExprList_.push_back(inExpr);
-			foundAggrExpr = true;
 			++cxt.aggrExprCount_;
 			cxt.windowExprList_.push_back(ALLOC_NEW(alloc_) Expr(
 					genReplacedAggrExpr(plan, inExpr)));
@@ -7164,17 +7959,22 @@ bool SQLCompiler::splitExprList(
 		size_t groupCount = 0;
 		if (groupExprList1 != NULL) {
 			groupCount = groupExprList1->size();
-			splitted = (groupCount > 0);
 		}
 
 		if (groupExprList2 != NULL) {
 			groupExprList2->clear();
 		}
 
-		bool allPipeSplitted = false;
-		if (!splitted && !isDereferenceableExprList(inExprList)) {
-			allPipeSplitted = true;
+		util::Vector<uint32_t> *inputOffsetList = NULL;
+		util::Vector<uint32_t> inputOffsetListBase(alloc_);
+		bool fullSplittable = true;
+		if (groupCount > 0) {
 			splitted = true;
+		}
+		else if (!isDereferenceableExprList(inExprList)) {
+			fullSplittable = false;
+			makeSplittingInputOffsetList(inExprList, inputOffsetListBase);
+			inputOffsetList = &inputOffsetListBase;
 		}
 
 		uint32_t aggLevel = getNodeAggregationLevel(inExprList);
@@ -7217,22 +8017,17 @@ bool SQLCompiler::splitExprList(
 				dupIt->second = static_cast<uint32_t>(outExprList1.size());
 			}
 
-			Expr *outExpr;
+			const Expr *outExpr;
+			const bool lastTop = (it + 1 == inExprList.end());
 			splitted |= splitExprListSub(
 					*it, outExprList1, outExpr, aggLevel, nonDupGroupCount,
-					aggregating);
+					aggregating, lastTop, inputOffsetList);
 			outExprList2.push_back(*outExpr);
 		}
 
 		if (splitted) {
-			if (allPipeSplitted) {
-				outPhase1 = SQLType::AGG_PHASE_ALL_PIPE;
-				outPhase2 = SQLType::AGG_PHASE_ALL_PIPE;
-			}
-			else {
-				outPhase1 = SQLType::AGG_PHASE_ADVANCE_PIPE;
-				outPhase2 = SQLType::AGG_PHASE_MERGE_PIPE;
-			}
+			outPhase1 = SQLType::AGG_PHASE_ADVANCE_PIPE;
+			outPhase2 = SQLType::AGG_PHASE_MERGE_PIPE;
 
 			if (groupCount > 0) {
 				assert(groupExprList2 != NULL);
@@ -7267,9 +8062,14 @@ bool SQLCompiler::splitExprList(
 			setSplittedExprListType(outExprList1, outPhase1);
 		}
 		else {
-			outExprList1.swap(outExprList2);
-			sameOutList = &outExprList2;
-			assert(sameOutList->empty());
+			if (fullSplittable) {
+				outExprList1.swap(outExprList2);
+				sameOutList = &outExprList2;
+				assert(sameOutList->empty());
+			}
+			else {
+				splitted = true;
+			}
 
 			outPhase1 = SQLType::AGG_PHASE_ALL_PIPE;
 			outPhase2 = SQLType::AGG_PHASE_ALL_PIPE;
@@ -7293,11 +8093,17 @@ bool SQLCompiler::splitExprList(
 }
 
 bool SQLCompiler::splitExprListSub(
-		const Expr &inExpr, PlanExprList &outExprList, Expr *&outExpr,
-		uint32_t parentLevel, size_t groupCount, bool aggregating) {
+		const Expr &inExpr, PlanExprList &outExprList,
+		const Expr *&outExpr, uint32_t parentLevel, size_t groupCount,
+		bool aggregating, bool lastTop,
+		util::Vector<uint32_t> *inputOffsetList) {
 	outExpr = NULL;
 
-	if (SQLType::START_AGG < inExpr.op_ && inExpr.op_ < SQLType::END_AGG) {
+	const bool fullSplittable = (inputOffsetList == NULL);
+	assert(fullSplittable || groupCount <= 0);
+
+	if ((SQLType::START_AGG < inExpr.op_ && inExpr.op_ < SQLType::END_AGG) &&
+			fullSplittable) {
 		const AggregationPhase phase = SQLType::AGG_PHASE_ADVANCE_PIPE;
 
 		const Mode mode =
@@ -7309,15 +8115,16 @@ bool SQLCompiler::splitExprListSub(
 		const ColumnId columnId =
 				static_cast<ColumnId>(groupCount + outExprList.size());
 
-		outExpr = ALLOC_NEW(alloc_) Expr(inExpr);
-		outExpr->next_ = ALLOC_NEW(alloc_) ExprList(alloc_);
+		Expr *target = ALLOC_NEW(alloc_) Expr(inExpr);
+		outExpr = target;
+		target->next_ = ALLOC_NEW(alloc_) ExprList(alloc_);
 
 		{
 			Expr advanceExpr = inExpr;
 			advanceExpr.columnType_ = advanceType;
 			outExprList.push_back(advanceExpr);
 
-			outExpr->next_->push_back(ALLOC_NEW(alloc_) Expr(genColumnExprBase(
+			target->next_->push_back(ALLOC_NEW(alloc_) Expr(genColumnExprBase(
 					NULL, NULL, inputId, columnId, &advanceExpr)));
 		}
 
@@ -7330,7 +8137,7 @@ bool SQLCompiler::splitExprListSub(
 				inExpr, NULL, TupleList::TYPE_NULL, mode, i, phase);
 			outExprList.push_back(followingExpr);
 
-			outExpr->next_->push_back(ALLOC_NEW(alloc_) Expr(genColumnExprBase(
+			target->next_->push_back(ALLOC_NEW(alloc_) Expr(genColumnExprBase(
 					NULL, NULL, inputId, columnId + i, &followingExpr)));
 		}
 
@@ -7354,22 +8161,28 @@ bool SQLCompiler::splitExprListSub(
 			return splitted;
 		}
 
-		const bool needSplitting = (inExpr.aggrNestLevel_ != parentLevel &&
+		const bool needSplitting = (fullSplittable &&
+				inExpr.aggrNestLevel_ != parentLevel &&
 				isDereferenceableExprType(inExpr.op_) &&
-				inExpr.op_ != SQLType::EXPR_TYPE);
+				inExpr.op_ != SQLType::EXPR_TYPE &&
+				inExpr.op_ != SQLType::EXPR_CONSTANT);
 
 		Expr *left = NULL;
 		if (inExpr.left_ != NULL) {
+			const Expr *subExpr;
 			splitted |= splitExprListSub(
-					*inExpr.left_, outExprList, left, inExpr.aggrNestLevel_,
-					groupCount, aggregating);
+					*inExpr.left_, outExprList, subExpr, inExpr.aggrNestLevel_,
+					groupCount, aggregating, false, inputOffsetList);
+			left = ALLOC_NEW(alloc_) Expr(*subExpr);
 		}
 
 		Expr *right = NULL;
 		if (inExpr.right_ != NULL) {
+			const Expr *subExpr;
 			splitted |= splitExprListSub(
-					*inExpr.right_, outExprList, right, inExpr.aggrNestLevel_,
-					groupCount, aggregating);
+					*inExpr.right_, outExprList, subExpr, inExpr.aggrNestLevel_,
+					groupCount, aggregating, false, inputOffsetList);
+			right = ALLOC_NEW(alloc_) Expr(*subExpr);
 		}
 
 		ExprList *next = NULL;
@@ -7377,11 +8190,11 @@ bool SQLCompiler::splitExprListSub(
 			next = ALLOC_NEW(alloc_) ExprList(alloc_);
 			for (ExprList::iterator it = inExpr.next_->begin();
 					it != inExpr.next_->end(); ++it) {
-				Expr *subExpr;
+				const Expr *subExpr;
 				splitted |= splitExprListSub(
 						**it, outExprList, subExpr, inExpr.aggrNestLevel_,
-						groupCount, aggregating);
-				next->push_back(subExpr);
+						groupCount, aggregating, false, inputOffsetList);
+				next->push_back(ALLOC_NEW(alloc_) Expr(*subExpr));
 			}
 		}
 
@@ -7392,17 +8205,33 @@ bool SQLCompiler::splitExprListSub(
 			outExprList.push_back(inExpr);
 			targetExpr = &outExprList.back();
 		}
-		else {
+		else if (fullSplittable || inExpr.op_ != SQLType::EXPR_COLUMN) {
 			columnId = std::numeric_limits<ColumnId>::max();
 			targetExpr = ALLOC_NEW(alloc_) Expr(inExpr);
 			outExpr = targetExpr;
+		}
+		else {
+			columnId = (*inputOffsetList)[inExpr.inputId_] + inExpr.columnId_;
+			while (columnId >= outExprList.size()) {
+				outExprList.push_back(genConstExprBase(
+						NULL, TupleValue(static_cast<int64_t>(0)),
+						MODE_NORMAL_SELECT));
+			}
+			targetExpr = &outExprList[columnId];
+			*targetExpr = inExpr;
+		}
+
+		if (!fullSplittable && lastTop && outExprList.empty()) {
+			outExprList.push_back(genConstExprBase(
+					NULL, TupleValue(static_cast<int64_t>(0)),
+					MODE_NORMAL_SELECT));
 		}
 
 		targetExpr->left_ = left;
 		targetExpr->right_ = right;
 		targetExpr->next_ = next;
 
-		if (needSplitting) {
+		if (outExpr == NULL) {
 			const uint32_t inputId = 0;
 			outExpr = ALLOC_NEW(alloc_) Expr(genColumnExprBase(
 					NULL, NULL, inputId, columnId, targetExpr));
@@ -7413,6 +8242,36 @@ bool SQLCompiler::splitExprListSub(
 		}
 
 		return splitted;
+	}
+}
+
+void SQLCompiler::makeSplittingInputOffsetList(
+		const PlanExprList &exprList, util::Vector<uint32_t> &offsetList) {
+	for (PlanExprList::const_iterator it = exprList.begin();
+			it != exprList.end(); ++it) {
+		makeSplittingInputSizeList(*it, offsetList);
+	}
+
+	uint32_t lastOffset = 0;
+	for (util::Vector<uint32_t>::iterator it = offsetList.begin();
+			it != offsetList.end(); ++it) {
+		const uint32_t size = *it;
+		*it = lastOffset;
+		lastOffset += size;
+	}
+}
+
+void SQLCompiler::makeSplittingInputSizeList(
+		const Expr &expr, util::Vector<uint32_t> &sizeList) {
+	if (expr.op_ == SQLType::EXPR_COLUMN) {
+		while (expr.inputId_ >= sizeList.size()) {
+			sizeList.push_back(0);
+		}
+		uint32_t &destSize = sizeList[expr.inputId_];
+		destSize = std::max(destSize, expr.columnId_ + 1);
+	}
+	for (ExprArgsIterator<> it(expr); it.exists(); it.next()) {
+		makeSplittingInputSizeList(it.get(), sizeList);
 	}
 }
 
@@ -7733,14 +8592,27 @@ void SQLCompiler::refreshColumnTypes(
 						SQLType::AGG_PHASE_ALL_PIPE, NULL, NULL);
 			}
 
-			if (expr.next_ == NULL || expr.next_->empty() ||
-					expr.next_->front()->op_ != SQLType::EXPR_COLUMN) {
+			if (expr.next_ != NULL && !expr.next_->empty()) {
+				advExpr = expr.next_->front();
+				if (advExpr->op_ == SQLType::EXPR_CONSTANT &&
+						expr.op_ == SQLType::AGG_COUNT_ALL &&
+						advExpr->columnType_ == TupleList::TYPE_LONG &&
+						expr.columnType_ == TupleList::TYPE_LONG) {
+					return;
+				}
+				else if (advExpr->op_ != SQLType::EXPR_COLUMN) {
+					advExpr = NULL;
+				}
+			}
+			else {
+				advExpr = NULL;
+			}
+
+			if (advExpr == NULL) {
 				assert(false);
 				SQL_COMPILER_THROW_ERROR(
 						GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
 			}
-
-			advExpr = expr.next_->front();
 		}
 		else {
 			break;
@@ -7772,15 +8644,39 @@ void SQLCompiler::refreshColumnTypes(
 					getTableInfoList().resolve(id), expr.columnId_, NULL);
 		}
 		else {
-			const PlanNode &inNode =
-					node.getInput(plan, expr.inputId_ - tableCount);
-
-			const Expr &inExpr = inNode.outputList_[expr.columnId_];
-			if (isDisabledExpr(inExpr)) {
-				return;
+			PlanNode::IdList::const_iterator inBegin = node.inputList_.begin();
+			PlanNode::IdList::const_iterator inEnd = node.inputList_.end();
+			if (node.type_ != SQLType::EXEC_UNION) {
+				inBegin += (expr.inputId_ - tableCount);
+				inEnd = inBegin + 1;
 			}
 
-			expr.columnType_ = inExpr.columnType_;
+			ColumnType outType = TupleList::TYPE_NULL;
+			for (PlanNode::IdList::const_iterator it = inBegin; it != inEnd; ++it) {
+				const PlanNode &inNode = plan.nodeList_[*it];
+				const Expr &inExpr = inNode.outputList_[expr.columnId_];
+				if (isDisabledExpr(inExpr)) {
+					return;
+				}
+
+				const ColumnType inType = inExpr.columnType_;
+				if (ColumnTypeUtils::isNull(inType)) {
+					outType = TupleList::TYPE_NULL;
+					break;
+				}
+				else if (it == inBegin) {
+					outType = inType;
+					continue;
+				}
+
+				outType = ProcessorUtils::findPromotionType(outType, inType);
+				if (ColumnTypeUtils::isNull(inType)) {
+					assert(false);
+					SQL_COMPILER_THROW_ERROR(
+							GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+				}
+			}
+			expr.columnType_ = outType;
 		}
 
 		if (isInputNullable(node, expr.inputId_) || aggregated) {
@@ -7993,6 +8889,50 @@ bool SQLCompiler::isForInsertOrUpdate(const PlanNode &node) {
 			node.type_ == SQLType::EXEC_UPDATE);
 }
 
+void SQLCompiler::finalizeScanCostHints(Plan &plan, bool tableCostAffected) {
+	for (PlanNodeList::iterator nodeIt = plan.nodeList_.begin();
+			nodeIt != plan.nodeList_.end(); ++nodeIt) {
+		SQLTableInfo::IdInfo &idInfo = nodeIt->tableIdInfo_;
+		int64_t &approxSize = idInfo.approxSize_;
+
+		if (tableCostAffected && nodeIt->type_ == SQLType::EXEC_SCAN) {
+			const SQLTableInfo &info = getTableInfoList().resolve(idInfo.id_);
+			if (info.partitioning_ == NULL) {
+				approxSize = info.idInfo_.approxSize_;
+			}
+			else {
+				assert(idInfo.subContainerId_ >= 0);
+				approxSize = info.partitioning_->subInfoList_[
+						idInfo.subContainerId_].approxSize_;
+			}
+
+			if (approxSize < 0) {
+				approxSize = 0;
+			}
+		}
+		else {
+			approxSize = -1;
+		}
+	}
+}
+
+void SQLCompiler::applyPlanningOption(Plan &plan) {
+	const CompileOption &option = getCompileOption();
+
+	applyPlanningVersion(option.getPlanningVersion(), plan.planningVersion_);
+
+	const SQLHintInfo *hintInfo = plan.hintInfo_;
+	applyPlanningVersion(
+			getPlanningVersionHint(hintInfo), plan.planningVersion_);
+}
+
+void SQLCompiler::applyPlanningVersion(
+		const SQLPlanningVersion &src, SQLPlanningVersion &dest) {
+	if (!src.isEmpty()) {
+		dest = src;
+	}
+}
+
 void SQLCompiler::applyScanOption(Plan &plan) {
 	const SQLHintInfo *hint = plan.hintInfo_;
 	if (hint == NULL && !indexScanEnabled_) {
@@ -8076,13 +9016,9 @@ void SQLCompiler::applyJoinOption(
 		const PlanNode &inputNode = plan.nodeList_[*itr];
 		if (inputNode.qName_ != NULL && inputNode.qName_->table_ != NULL
 				&& inputNode.qName_->nsId_ == SyntaxTree::QualifiedName::TOP_NS_ID) {
-			const util::String *origStr = inputNode.qName_->table_;
-			const char8_t *strTop = origStr->c_str();
-			const size_t strLen = origStr->size();
-			util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-			SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-			util::String *normName = ALLOC_NEW(alloc_)
-					util::String(nameBuf.data(), strLen, alloc_);
+			const SyntaxTree::QualifiedName &qName = *inputNode.qName_;
+			util::String *normName = ALLOC_NEW(alloc_) util::String(
+					normalizeName(alloc_, qName.table_->c_str()));
 			nodeNameList.push_back(normName);
 		}
 		else if (inputNode.type_ == SQLType::EXEC_SCAN) {
@@ -8090,13 +9026,9 @@ void SQLCompiler::applyJoinOption(
 					&& inputNode.qName_->nsId_ != SyntaxTree::QualifiedName::TOP_NS_ID) {
 				return;
 			}
-			const util::String &origStr = getTableInfoList().resolve(inputNode.tableIdInfo_.id_).tableName_;
-			const char8_t *strTop = origStr.c_str();
-			const size_t strLen = origStr.size();
-			util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-			SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-			util::String *normName = ALLOC_NEW(alloc_)
-					util::String(nameBuf.data(), strLen, alloc_);
+			const SQLTableInfo& tableInfo = getTableInfoList().resolve(inputNode.tableIdInfo_.id_);
+			util::String *normName = ALLOC_NEW(alloc_) util::String(
+					normalizeName(alloc_, tableInfo.tableName_.c_str()));
 			nodeNameList.push_back(normName);
 		}
 		else {
@@ -8131,25 +9063,186 @@ void SQLCompiler::applyJoinOption(
 	}
 }
 
+void SQLCompiler::relocateOptimizationProfile(Plan &plan) {
+	if (nextProfileKey_ < 0) {
+		return;
+	}
+	KeyToNodeIdList keyToNodeIdList(alloc_);
+
+	SQLPreparedPlan::TotalProfile **totalProfile = NULL;
+	for (PlanNodeList::iterator nodeIt = plan.nodeList_.begin();
+			nodeIt != plan.nodeList_.end(); ++nodeIt) {
+		const KeyToNodeId entry(
+				nodeIt->profileKey_,
+				static_cast<PlanNodeId>(nodeIt - plan.nodeList_.begin()));
+
+		if (entry.first >= 0) {
+			keyToNodeIdList.push_back(entry);
+		}
+		if (nodeIt->type_ == SQLType::EXEC_RESULT) {
+			totalProfile = &nodeIt->profile_;
+			if (*totalProfile == NULL) {
+				break;
+			}
+		}
+	}
+
+	if (keyToNodeIdList.empty() ||
+			totalProfile == NULL ||
+			*totalProfile == NULL ||
+			(*totalProfile)->plan_ == NULL ||
+			(*totalProfile)->plan_->optimization_ == NULL) {
+		return;
+	}
+
+	std::sort(keyToNodeIdList.begin(), keyToNodeIdList.end());
+
+	SQLPreparedPlan::OptProfile &optProfile =
+			*(*totalProfile)->plan_->optimization_;
+
+	bool relocatedFull = true;
+	relocatedFull &= relocateOptimizationProfile(
+			plan, keyToNodeIdList, optProfile.joinReordering_);
+
+	if (relocatedFull) {
+		SQLPreparedPlan::TotalProfile::clearIfEmpty(*totalProfile);
+	}
+}
+
+bool SQLCompiler::relocateOptimizationProfile(
+		Plan &plan, const KeyToNodeIdList &keyToNodeIdList,
+		util::Vector<SQLPreparedPlan::OptProfile::Join> *&joinList) {
+	if (joinList == NULL) {
+		return true;
+	}
+
+	for (util::Vector<SQLPreparedPlan::OptProfile::Join>::iterator it =
+			joinList->begin(); it != joinList->end();) {
+		KeyToNodeIdList::const_iterator nodeIt = std::lower_bound(
+				keyToNodeIdList.begin(), keyToNodeIdList.end(),
+				KeyToNodeId(it->profileKey_, 0));
+
+		if (nodeIt != keyToNodeIdList.end() &&
+				nodeIt->first == it->profileKey_) {
+			addOptimizationProfile(
+					NULL, &plan.nodeList_[nodeIt->second], &(*it));
+			it = joinList->erase(it);
+		}
+		else {
+			++it;
+		}
+	}
+
+	if (joinList->empty()) {
+		joinList = NULL;
+		return true;
+	}
+	return false;
+}
+
+void SQLCompiler::addOptimizationProfile(
+		Plan *plan, PlanNode *node,
+		SQLPreparedPlan::OptProfile::Join *profile) {
+	if (profile == NULL) {
+		return;
+	}
+
+	PlanNode *nodeForAdd = (plan == NULL ? node : NULL);
+	SQLPreparedPlan::OptProfile &optProfile =
+			prepareOptimizationProfile(plan, nodeForAdd);
+	if (optProfile.joinReordering_ == NULL) {
+		optProfile.joinReordering_ = ALLOC_NEW(alloc_) util::Vector<
+				SQLPreparedPlan::OptProfile::Join>(alloc_);
+	}
+
+	profile->profileKey_ = prepareProfileKey(*node);
+	optProfile.joinReordering_->push_back(*profile);
+}
+
+SQLPreparedPlan::OptProfile&
+SQLCompiler::prepareOptimizationProfile(Plan *plan, PlanNode *node) {
+	if (node == NULL) {
+		assert(plan != NULL);
+		for (PlanNodeList::iterator nodeIt = plan->nodeList_.begin();
+				nodeIt != plan->nodeList_.end(); ++nodeIt) {
+			if (nodeIt->type_ == SQLType::EXEC_RESULT) {
+				return prepareOptimizationProfile(NULL, &(*nodeIt));
+			}
+		}
+		assert(false);
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+	}
+
+	SQLPreparedPlan::TotalProfile *&profile = node->profile_;
+	if (profile == NULL) {
+		profile = ALLOC_NEW(alloc_) SQLPreparedPlan::TotalProfile();
+	}
+
+	SQLPreparedPlan::Profile *&planProfile = profile->plan_;
+	if (planProfile == NULL) {
+		planProfile = ALLOC_NEW(alloc_) SQLPreparedPlan::Profile();
+	}
+
+	SQLPreparedPlan::OptProfile *&optProfile = planProfile->optimization_;
+	if (optProfile == NULL) {
+		optProfile = ALLOC_NEW(alloc_) SQLPreparedPlan::OptProfile();
+	}
+
+	return *optProfile;
+}
+
+SQLPreparedPlan::ProfileKey SQLCompiler::prepareProfileKey(PlanNode &node) {
+	if (node.profileKey_ < 0) {
+		node.profileKey_ = ++nextProfileKey_;
+	}
+	return node.profileKey_;
+}
+
+void SQLCompiler::checkOptimizationUnitSupport(OptimizationUnitType type) {
+	if (!optimizationOption_->isSupported(type) &&
+			!optimizationOption_->isCheckOnly(type)) {
+		assert(false);
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, "");
+	}
+}
+
 bool SQLCompiler::isOptimizationUnitEnabled(OptimizationUnitType type) {
-	return (optimizationFlags_ &
-			(static_cast<OptimizationFlags>(1) << type)) != 0;
+	return optimizationOption_->isEnabled(type);
+}
+
+bool SQLCompiler::isOptimizationUnitCheckOnly(OptimizationUnitType type) {
+	return optimizationOption_->isCheckOnly(type);
 }
 
 SQLCompiler::OptimizationFlags SQLCompiler::getDefaultOptimizationFlags() {
-	UTIL_STATIC_ASSERT(OPT_END < sizeof(OptimizationFlags) * CHAR_BIT);
-
-	OptimizationFlags flags =
-			(static_cast<OptimizationFlags>(1) << OPT_END) - 1;
+	OptimizationOption option(NULL);
+	option.supportFull();
 
 
 
 
-	return flags;
+	return option.getEnablementFlags();
+}
+
+SQLCompiler::OptimizationOption SQLCompiler::makeJoinPushDownHintsOption() {
+	OptimizationOption option(NULL);
+	option.support(OPT_SIMPLIFY_SUBQUERY, false);
+	option.support(OPT_MERGE_SUB_PLAN, false);
+	option.support(OPT_MINIMIZE_PROJECTION, false);
+	option.support(OPT_PUSH_DOWN_PREDICATE, false);
+	option.support(OPT_PUSH_DOWN_AGGREGATE, false);
+	option.support(OPT_MAKE_JOIN_PUSH_DOWN_HINTS, false);
+	option.support(OPT_PUSH_DOWN_JOIN, false);
+	option.support(OPT_PUSH_DOWN_LIMIT, true);
+	option.support(OPT_REMOVE_REDUNDANCY, true);
+	option.support(OPT_REMOVE_INPUT_REDUNDANCY, true);
+	option.support(OPT_MAKE_INDEX_JOIN, true);
+	option.setCheckOnly(OPT_MAKE_INDEX_JOIN);
+	return option;
 }
 
 void SQLCompiler::optimize(Plan &plan) {
-	if (optimizationFlags_ == 0) {
+	if (!optimizationOption_->isSomeEnabled()) {
 		return;
 	}
 
@@ -8160,14 +9253,14 @@ void SQLCompiler::optimize(Plan &plan) {
 		{
 			OptimizationUnit unit(cxt, OPT_MINIMIZE_PROJECTION);
 			if (unit(unit() && minimizeProjection(plan, true))) {
-				plan.removeEmptyColumns();
+				removeEmptyColumns(cxt, plan);
 			}
 		}
 
 		{
 			OptimizationUnit unit(cxt, OPT_SIMPLIFY_SUBQUERY);
 			if (unit(unit() && simplifySubquery(plan))) {
-				plan.removeEmptyColumns();
+				removeEmptyColumns(cxt, plan);
 			}
 			else {
 				minimizedLast = true;
@@ -8191,6 +9284,11 @@ void SQLCompiler::optimize(Plan &plan) {
 		{
 			OptimizationUnit unit(cxt, OPT_PUSH_DOWN_AGGREGATE);
 			found |= unit(unit() && pushDownAggregate(plan));
+		}
+
+		if (first) {
+			OptimizationUnit unit(cxt, OPT_MAKE_JOIN_PUSH_DOWN_HINTS);
+			found |= unit(unit() && makeJoinPushDownHints(plan));
 		}
 
 		{
@@ -8217,8 +9315,8 @@ void SQLCompiler::optimize(Plan &plan) {
 			break;
 		}
 
-		plan.removeEmptyNodes();
-		plan.removeEmptyColumns();
+		removeEmptyNodes(cxt, plan);
+		removeEmptyColumns(cxt, plan);
 	}
 
 	do {
@@ -8227,11 +9325,20 @@ void SQLCompiler::optimize(Plan &plan) {
 			break;
 		}
 
-		plan.removeEmptyNodes();
-		plan.removeEmptyColumns();
+		removeEmptyNodes(cxt, plan);
+		removeEmptyColumns(cxt, plan);
 	}
 	while (false);
 
+	{
+		OptimizationUnit unit(cxt, OPT_MAKE_INDEX_JOIN);
+		if (unit(unit() && makeIndexJoin(plan, unit.isCheckOnly()))) {
+			removeEmptyNodes(cxt, plan);
+		}
+		if (unit.isCheckOnly()) {
+			return;
+		}
+	}
 
 	do {
 		{
@@ -8262,8 +9369,8 @@ void SQLCompiler::optimize(Plan &plan) {
 				break;
 			}
 
-			plan.removeEmptyNodes();
-			plan.removeEmptyColumns();
+			removeEmptyNodes(cxt, plan);
+			removeEmptyColumns(cxt, plan);
 		}
 	}
 	while (false);
@@ -8324,7 +9431,7 @@ bool SQLCompiler::mergeSubPlan(Plan &plan) {
 					++nodeIt;
 				}
 
-				if (node->type_ == SQLType::START_EXEC) {
+				if (isDisabledNode(*node)) {
 					continue;
 				}
 
@@ -8362,7 +9469,7 @@ bool SQLCompiler::mergeSubPlan(Plan &plan) {
 			for (PlanNodeList::iterator nodeIt = plan.nodeList_.begin();
 					nodeIt != plan.nodeList_.end(); ++nodeIt) {
 				PlanNode &node = *nodeIt;
-				if (node.type_ == SQLType::START_EXEC) {
+				if (isDisabledNode(node)) {
 					continue;
 				}
 
@@ -8382,7 +9489,7 @@ bool SQLCompiler::mergeSubPlan(Plan &plan) {
 			const PlanNodeId orgId = targetIt->first;
 			const PlanNodeId newId = targetIt->second;
 
-			if (plan.nodeList_[newId].type_ == SQLType::START_EXEC) {
+			if (isDisabledNode(plan.nodeList_[newId])) {
 				assert(false);
 				SQL_COMPILER_THROW_ERROR(
 						GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
@@ -8396,7 +9503,7 @@ bool SQLCompiler::mergeSubPlan(Plan &plan) {
 
 				PlanNode &destNode = plan.nodeList_[destId];
 
-				if (destNode.type_ == SQLType::START_EXEC ||
+				if (isDisabledNode(destNode) ||
 						destNode.inputList_[destInput] != orgId) {
 					assert(false);
 					SQL_COMPILER_THROW_ERROR(
@@ -8414,13 +9521,13 @@ bool SQLCompiler::mergeSubPlan(Plan &plan) {
 			}
 
 			PlanNode &orgNode = plan.nodeList_[orgId];
-			if (orgNode.type_ == SQLType::START_EXEC) {
+			if (isDisabledNode(orgNode)) {
 				assert(false);
 				SQL_COMPILER_THROW_ERROR(
 						GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
 			}
 
-			orgNode.type_ = SQLType::START_EXEC;
+			setDisabledNodeType(orgNode);
 
 			if (orgNode.inputList_ != plan.nodeList_[newId].inputList_) {
 				assert(false);
@@ -8458,7 +9565,7 @@ bool SQLCompiler::mergeSubPlan(Plan &plan) {
 			const NodeMap::value_type value(key, &node);
 			MapIt mapIt = std::find(range.first, range.second, value);
 			if (mapIt == range.second) {
-				if (plan.nodeList_[*it].type_ != SQLType::START_EXEC) {
+				if (!isDisabledNode(plan.nodeList_[*it])) {
 					assert(false);
 					SQL_COMPILER_THROW_ERROR(
 							GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
@@ -8751,6 +9858,10 @@ bool SQLCompiler::pushDownAggregate(Plan &plan) {
 				continue;
 			}
 
+			if (isRangeGroupNode(node)) {
+				continue;
+			}
+
 			unionNodeId = node.inputList_.front();
 			unionNode = &plan.nodeList_[unionNodeId];
 			if (unionNode->type_ != SQLType::EXEC_UNION ||
@@ -8766,8 +9877,6 @@ bool SQLCompiler::pushDownAggregate(Plan &plan) {
 			if (nodeRefList[unionNodeId] != 1) {
 				continue;
 			}
-
-			totalFound = true;
 
 			nodeType = node.type_;
 			advancePredList = node.predList_;
@@ -8789,6 +9898,11 @@ bool SQLCompiler::pushDownAggregate(Plan &plan) {
 					(nodeType == SQLType::EXEC_GROUP ?
 							&advancePredList : NULL),
 					&node.predList_);
+			if (mergePhase == SQLType::AGG_PHASE_ALL_PIPE) {
+				continue;
+			}
+
+			totalFound = true;
 
 			node.outputList_ = mergeOutList;
 			node.aggPhase_ = mergePhase;
@@ -9075,6 +10189,11 @@ bool SQLCompiler::removeRedundancy(Plan &plan) {
 				inNodeIt != inNodeList.end(); ++inNodeIt) {
 			PlanNode &inNode = **inNodeIt;
 
+			if (inNode.subLimit_ >= 0) {
+				acceptable = false;
+				break;
+			}
+
 			sameOutput &=
 					(node.outputList_.size() == inNode.outputList_.size() &&
 					node.aggPhase_ == SQLType::AGG_PHASE_ALL_PIPE);
@@ -9092,10 +10211,6 @@ bool SQLCompiler::removeRedundancy(Plan &plan) {
 					sameOutput = false;
 					break;
 				}
-			}
-			if (inNode.subLimit_ >= 0) {
-				acceptable = false;
-				break;
 			}
 		}
 
@@ -9305,7 +10420,7 @@ bool SQLCompiler::removeInputRedundancy(Plan &plan) {
 			*inIt = inNode.inputList_.front();
 
 			if (nodeRefList[inNodeId] <= 1) {
-				inNode.type_ = SQLType::START_EXEC;
+				setDisabledNodeType(inNode);
 			}
 
 			for (size_t i = 0; i < 2; i++) {
@@ -9357,7 +10472,7 @@ bool SQLCompiler::removeAggregationRedundancy(Plan &plan) {
 			for (PlanExprList::const_iterator it = advNode.outputList_.begin();
 					acceptable && it != advNode.outputList_.end();
 					++baseIt, ++it) {
-				if (TupleColumnTypeUtils::isNull(it->columnType_)) {
+				if (ColumnTypeUtils::isNull(it->columnType_)) {
 					acceptable = false;
 					break;
 				}
@@ -9466,9 +10581,11 @@ bool SQLCompiler::assignJoinPrimaryCond(Plan &plan, bool &complexFound) {
 	return found;
 }
 
-bool SQLCompiler::makeIndexJoin(Plan &plan) {
+bool SQLCompiler::makeIndexJoin(Plan &plan, bool checkOnly) {
 	const size_t joinCount = 2;
 	util::Vector<uint32_t> nodeRefList(alloc_);
+
+	const PlanNode::CommandOptionFlag drivingMask = getJoinDrivingOptionMask();
 
 	bool found = false;
 	bool foundLocal = false;
@@ -9490,8 +10607,14 @@ bool SQLCompiler::makeIndexJoin(Plan &plan) {
 			continue;
 		}
 
+		if (checkOnly && (node.cmdOptionFlag_ & drivingMask) != 0) {
+			continue;
+		}
+
 		if (plan.hintInfo_) {
 			if ((node.cmdOptionFlag_ & PlanNode::Config::CMD_OPT_JOIN_NO_INDEX) != 0) {
+				node.cmdOptionFlag_ |=
+						PlanNode::Config::CMD_OPT_JOIN_DRIVING_NONE_LEFT;
 				continue;
 			}
 		}
@@ -9506,6 +10629,7 @@ bool SQLCompiler::makeIndexJoin(Plan &plan) {
 		const bool aggressiveList[] = { leadingList[0], leadingList[1] };
 
 		const uint32_t start = (!leadingList[0] && leadingList[1] ? 1 : 0);
+		PlanNode::CommandOptionFlag drivingFlags = 0;
 
 		for (uint32_t i = 0; i < joinCount; i++) {
 			const uint32_t smaller = (i + start) % joinCount;
@@ -9513,13 +10637,23 @@ bool SQLCompiler::makeIndexJoin(Plan &plan) {
 			PlanNode &smallerNode = node.getInput(plan, smaller);
 
 			const uint32_t larger = (smaller == 0 ? 1 : 0);
-			if (!findIndexedPredicate(plan, node, larger)) {
+			if (!findIndexedPredicate(plan, node, larger, checkOnly)) {
 				continue;
 			}
 
 			if (!aggressiveList[smaller] &&
-					!isNallowingJoinInput(plan, node, smaller)) {
+					!isNarrowingJoinInput(plan, node, smaller)) {
 				continue;
+			}
+
+			if (checkOnly) {
+				drivingFlags = PlanNode::Config::CMD_OPT_JOIN_DRIVING_SOME;
+				if (i == 0) {
+					drivingFlags |=
+							PlanNode::Config::CMD_OPT_JOIN_DRIVING_NONE_LEFT;
+				}
+				foundLocal = true;
+				break;
 			}
 
 			util::Map<uint32_t, uint32_t> inputIdMap(alloc_);
@@ -9577,22 +10711,62 @@ bool SQLCompiler::makeIndexJoin(Plan &plan) {
 			refreshColumnTypes(plan, node, node.outputList_, true, false);
 
 			if (nodeRefList[largerId] <= 1) {
-				largerNode.type_ = SQLType::START_EXEC;
+				setDisabledNodeType(largerNode);
 			}
 
 			foundLocal = true;
 			break;
+		}
+
+		if (checkOnly) {
+			if (drivingFlags == 0) {
+				drivingFlags |=
+						PlanNode::Config::CMD_OPT_JOIN_DRIVING_NONE_LEFT;
+			}
+			node.cmdOptionFlag_ |= drivingFlags;
 		}
 	}
 
 	return found;
 }
 
+bool SQLCompiler::makeScanCostHints(Plan &plan) {
+	util::StackAllocator::Scope scope(alloc_);
+	Plan modPlan(alloc_);
+	copyPlan(plan, modPlan);
+
+	CompilerSource src(this);
+	CompileOption option(&src);
+	SQLCompiler subCompiler(getVarContext(), &option);
+	subCompiler.assignReducedScanCostHints(modPlan);
+
+	return applyScanCostHints(modPlan, plan);
+}
+
+bool SQLCompiler::makeJoinPushDownHints(Plan &plan) {
+	if (!findJoinPushDownHintingTarget(plan)) {
+		return false;
+	}
+
+	util::StackAllocator::Scope scope(alloc_);
+	Plan modPlan(alloc_);
+	copyPlan(plan, modPlan);
+
+	CompilerSource src(this);
+	CompileOption option(&src);
+	SQLCompiler subCompiler(getVarContext(), &option);
+
+	*subCompiler.optimizationOption_ = makeJoinPushDownHintsOption();
+	subCompiler.optimize(modPlan);
+
+	return applyJoinPushDownHints(modPlan, plan);
+}
+
 bool SQLCompiler::factorizePredicate(Plan &plan) {
 	bool found = false;
 	for (PlanNodeList::iterator nodeIt = plan.nodeList_.begin();
 			nodeIt != plan.nodeList_.end(); ++nodeIt) {
-		if (nodeIt->type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(*nodeIt)) {
 			continue;
 		}
 
@@ -9620,26 +10794,30 @@ void SQLCompiler::makeNodeNameList(
 		const PlanNode &node = plan.nodeList_[*itr];
 		if (node.qName_ != NULL && node.qName_->table_ != NULL
 				&& node.qName_->nsId_ == SyntaxTree::QualifiedName::TOP_NS_ID) {
-			const util::String *origStr = node.qName_->table_;
-			const char8_t *strTop = origStr->c_str();
-			const size_t strLen = origStr->size();
-			util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-			SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-			util::String *normName = ALLOC_NEW(alloc_)
-					util::String(nameBuf.data(), strLen, alloc_);
+
+			const SyntaxTree::QualifiedName &qName = *node.qName_;
+			util::String *normName = ALLOC_NEW(alloc_) util::String(
+					normalizeName(alloc_, qName.table_->c_str()));
 			nodeNameList.push_back(normName);
+
 		}
 		else if (node.type_ == SQLType::EXEC_SCAN) {
 			if (node.qName_ != NULL
 					&& node.qName_->nsId_ != SyntaxTree::QualifiedName::TOP_NS_ID) {
 				continue;
 			}
-			nodeNameList.push_back(&getTableInfoList().resolve(node.tableIdInfo_.id_).tableName_);
+			const SQLTableInfo& tableInfo = getTableInfoList().resolve(node.tableIdInfo_.id_);
+			util::String *normName = ALLOC_NEW(alloc_) util::String(
+					normalizeName(alloc_, tableInfo.tableName_.c_str()));
+			nodeNameList.push_back(normName);
+
 		}
 	}
 }
 
-bool SQLCompiler::reorderJoin(Plan &plan) {
+bool SQLCompiler::reorderJoin(Plan &plan, bool &tableCostAffected) {
+	tableCostAffected = false;
+
 	util::Vector<bool> acceptedRefList(plan.nodeList_.size(), false, alloc_);
 	util::Vector<PlanNodeId> nodeIdList(alloc_);
 	util::Vector<PlanNodeId> joinIdList(alloc_);
@@ -9648,26 +10826,43 @@ bool SQLCompiler::reorderJoin(Plan &plan) {
 	util::Vector<JoinOperation> srcJoinOpList(alloc_);
 	util::Vector<JoinOperation> destJoinOpList(alloc_);
 
+	const bool legacy = isLegacyJoinReordering(plan);
+	const bool profiling = (explainType_ != SyntaxTree::EXPLAIN_NONE);
+
 	bool found = false;
 	PlanNodeId tailNodeId = static_cast<PlanNodeId>(plan.nodeList_.size());
 	while (makeJoinGraph(
 			plan, tailNodeId, acceptedRefList, nodeIdList, joinIdList,
-			joinNodeList, joinEdgeList, srcJoinOpList)) {
+			joinNodeList, joinEdgeList, srcJoinOpList, legacy)) {
 
 		util::Vector<SQLHintInfo::ParsedHint> hintList(alloc_);
 		if (plan.hintInfo_) {
 			util::Vector<const util::String*> nodeNameList(alloc_);
 			makeNodeNameList(plan, nodeIdList, nodeNameList);
 			plan.hintInfo_->findJoinHintList(nodeNameList, SQLHint::LEADING, hintList);
+			if (!legacy) {
+				const util::Vector<SQLHintInfo::ParsedHint> &symbolHints =
+						plan.hintInfo_->getSymbolHintList();
+				hintList.insert(
+						hintList.end(), symbolHints.begin(), symbolHints.end());
+			}
 		}
 
 		if (reorderJoinSub(
 				alloc_, joinNodeList, joinEdgeList,
-				srcJoinOpList, hintList, destJoinOpList)) {
+				srcJoinOpList, hintList, destJoinOpList, legacy, profiling)) {
 			applyJoinOrder(
 					plan, nodeIdList, joinIdList, joinNodeList, destJoinOpList);
 			found = true;
 		}
+
+		addJoinReorderingProfile(
+				plan, nodeIdList, joinIdList, joinNodeList, destJoinOpList);
+
+		if (!destJoinOpList.empty()) {
+			tableCostAffected |= destJoinOpList.back().tableCostAffected_;
+		}
+
 
 	}
 
@@ -9678,11 +10873,65 @@ bool SQLCompiler::reorderJoin(Plan &plan) {
 	return found;
 }
 
-void SQLCompiler::dumpJoinGraph(
+void SQLCompiler::addJoinReorderingProfile(
+		Plan &plan, const util::Vector<PlanNodeId> &nodeIdList,
+		const util::Vector<PlanNodeId> &joinIdList,
+		const util::Vector<JoinNode> &joinNodeList,
+		const util::Vector<JoinOperation> &joinOpList) {
+	if (joinOpList.empty() || joinIdList.empty()) {
+		return;
+	}
+
+	SQLPreparedPlan::OptProfile::Join *profile = joinOpList.back().profile_;
+	if (profile == NULL) {
+		return;
+	}
+
+	profileJoinTables(plan, nodeIdList, joinNodeList, *profile);
+	addOptimizationProfile(
+			&plan, &plan.nodeList_[joinIdList.back()], profile);
+}
+
+void SQLCompiler::profileJoinTables(
+		const Plan &plan, const util::Vector<PlanNodeId> &nodeIdList,
+		const util::Vector<JoinNode> &joinNodeList,
+		SQLPreparedPlan::OptProfile::Join &profile) const {
+	SQLPreparedPlan::OptProfile::JoinOrdinal ordinal = 0;
+	util::Vector<SQLPreparedPlan::OptProfile::JoinNode> *nodeList =
+			ALLOC_NEW(alloc_) util::Vector<
+					SQLPreparedPlan::OptProfile::JoinNode>(alloc_);
+
+	util::Vector<JoinNode>::const_iterator noinNodeIt = joinNodeList.begin();
+	for (util::Vector<PlanNodeId>::const_iterator it = nodeIdList.begin();
+			it != nodeIdList.end(); ++it) {
+		const PlanNode &node = plan.nodeList_[*it];
+
+		nodeList->push_back(SQLPreparedPlan::OptProfile::JoinNode());
+		SQLPreparedPlan::OptProfile::JoinNode &nodeProfile = nodeList->back();
+
+		QualifiedName *qName = NULL;
+		const char8_t *tableName = getJoinTableName(node);
+		if (tableName != NULL) {
+			qName = ALLOC_NEW(alloc_) QualifiedName(alloc_);
+			qName->table_ = ALLOC_NEW(alloc_) util::String(tableName, alloc_);
+		}
+
+		nodeProfile.ordinal_ = ordinal;
+		nodeProfile.qName_ = qName;
+
+		if (noinNodeIt != joinNodeList.end()) {
+			nodeProfile.approxSize_ = noinNodeIt->approxSize_;
+			++noinNodeIt;
+		}
+		++ordinal;
+	}
+
+	profile.nodes_ = nodeList;
+}
+
+void SQLCompiler::dumpJoinTables(
 		std::ostream &os, const Plan &plan,
-		const util::Vector<PlanNodeId> &nodeIdList,
-		const util::Vector<JoinEdge> &joinEdgeList,
-		const util::Vector<JoinOperation> &joinOpList) const {
+		const util::Vector<PlanNodeId> &nodeIdList) const {
 	for (util::Vector<PlanNodeId>::const_iterator it = nodeIdList.begin();
 			it != nodeIdList.end(); ++it) {
 		const PlanNode &node = plan.nodeList_[*it];
@@ -9691,15 +10940,19 @@ void SQLCompiler::dumpJoinGraph(
 			os << ", ";
 		}
 		os << it - nodeIdList.begin() << ":";
-		if (node.qName_ != NULL && node.qName_->table_ != NULL) {
-			os << *node.qName_->table_;
-		}
-		else if (node.type_ == SQLType::EXEC_SCAN) {
-			os << getTableInfoList().resolve(node.tableIdInfo_.id_).tableName_;
+
+		const char8_t *tableName = getJoinTableName(node);
+		if (tableName != NULL) {
+			os << tableName;
 		}
 	}
 	os << std::endl;
+}
 
+void SQLCompiler::dumpJoinGraph(
+		std::ostream &os,
+		const util::Vector<JoinEdge> &joinEdgeList,
+		const util::Vector<JoinOperation> &joinOpList) const {
 	for (util::Vector<JoinEdge>::const_iterator it = joinEdgeList.begin();
 			it != joinEdgeList.end(); ++it) {
 		it->dump(os);
@@ -9713,6 +10966,19 @@ void SQLCompiler::dumpJoinGraph(
 	}
 }
 
+const char8_t* SQLCompiler::getJoinTableName(const PlanNode &node) const {
+	if (node.qName_ != NULL && node.qName_->table_ != NULL) {
+		return node.qName_->table_->c_str();
+	}
+	else if (node.type_ == SQLType::EXEC_SCAN) {
+		return getTableInfoList().resolve(
+				node.tableIdInfo_.id_).tableName_.c_str();
+	}
+	else {
+		return NULL;
+	}
+}
+
 bool SQLCompiler::makeJoinGraph(
 		const Plan &plan, PlanNodeId &tailNodeId,
 		util::Vector<bool> &acceptedRefList,
@@ -9720,7 +10986,7 @@ bool SQLCompiler::makeJoinGraph(
 		util::Vector<PlanNodeId> &joinIdList,
 		util::Vector<JoinNode> &joinNodeList,
 		util::Vector<JoinEdge> &joinEdgeList,
-		util::Vector<JoinOperation> &joinOpList) {
+		util::Vector<JoinOperation> &joinOpList, bool legacy) {
 	assert(acceptedRefList.size() == plan.nodeList_.size());
 
 	nodeIdList.clear();
@@ -9732,8 +10998,12 @@ bool SQLCompiler::makeJoinGraph(
 	util::Vector<uint32_t> nodeRefList(alloc_);
 	makeNodeRefList(plan, nodeRefList);
 
+	util::Vector<PlanNodeId> predIdList(alloc_);
+
 	typedef util::Map<PlanNodeId, JoinNodeId> NodeIdMap;
 	NodeIdMap nodeIdMap(alloc_);
+
+	util::Vector<int64_t> approxSizeList(alloc_);
 
 	if (tailNodeId <= 0) {
 		return false;
@@ -9765,17 +11035,19 @@ bool SQLCompiler::makeJoinGraph(
 				break;
 			}
 
+			if (!legacy) {
+				makeJoinNodesCost(plan, node, approxSizeList);
+			}
+
 			for (util::Vector<PlanNodeId>::const_iterator it = nodeIdList.begin();
 					it != nodeIdList.end(); ++it) {
-				 const PlanNode &node = plan.nodeList_[*it];
-				 if (node.type_ == SQLType::EXEC_SCAN) {
-					 const SQLTableInfo &tableInfo =
-							tableInfoList_->resolve(node.tableIdInfo_.id_);
-					 JoinNodeId joinNodeId =
-							static_cast<JoinNodeId>(it - nodeIdList.begin());
-					 joinNodeList[joinNodeId].approxSize_ = tableInfo.approxSize_;
 
+				 const JoinNodeId joinNodeId =
+						static_cast<JoinNodeId>(it - nodeIdList.begin());
+				 if (!approxSizeList.empty()) {
+					joinNodeList[joinNodeId].approxSize_ = approxSizeList[*it];
 				 }
+
 			 }
 			for (util::Vector<PlanNodeId>::iterator joinIt = joinIdList.begin();
 					joinIt != joinIdList.end(); ++joinIt) {
@@ -9791,7 +11063,16 @@ bool SQLCompiler::makeJoinGraph(
 					}
 				}
 			}
-			if (joinEdgeList.empty()) {
+			{
+				const PlanNode *predNode =
+						findJoinPredNode(plan, nodeId, predIdList);
+				if (predNode != NULL) {
+					makeJoinEdges(
+							plan, *predNode, predNode->predList_.front(),
+							nodeIdMap, joinNodeList, joinEdgeList);
+				}
+			}
+			if (joinEdgeList.empty() && legacy) {
 				break;
 			}
 
@@ -9918,6 +11199,108 @@ void SQLCompiler::makeJoinEdges(
 
 		 ++it;
 	}
+}
+
+void SQLCompiler::makeJoinNodesCost(
+		const Plan &plan, const PlanNode &node,
+		util::Vector<int64_t> &approxSizeList) {
+	assert(approxSizeList.empty());
+	const PlanNodeId nodeId =
+			static_cast<PlanNodeId>(&node - &plan.nodeList_[0]);
+
+	util::Vector< std::pair<int64_t, bool> > nodeLimitList(alloc_);
+	makeNodeLimitList(plan, nodeLimitList);
+
+	typedef std::pair<PlanNodeId, uint32_t> NodePathEntry;
+	typedef util::Vector<NodePathEntry> NodePath;
+	NodePath nodePath(alloc_);
+	util::Vector<bool> visitedList(alloc_);
+	nodePath.push_back(NodePathEntry(nodeId, 0));
+
+	while (!nodePath.empty()) {
+		const NodePathEntry &entry = nodePath.back();
+		const uint32_t inputId = entry.second;
+		nodePath.pop_back();
+
+		const PlanNodeId nodeId = entry.first;
+		const PlanNode &node = plan.nodeList_[nodeId];
+
+		if (inputId < node.inputList_.size()) {
+			nodePath.push_back(NodePathEntry(nodeId, inputId + 1));
+
+			const PlanNodeId inId = node.inputList_[inputId];
+			nodePath.push_back(NodePathEntry(inId, 0));
+			continue;
+		}
+
+		if (nodeId >= visitedList.size()) {
+			visitedList.resize(nodeId + 1, false);
+		}
+		if (visitedList[nodeId]) {
+			continue;
+		}
+		visitedList[nodeId] = true;
+
+		if (nodeId >= approxSizeList.size()) {
+			approxSizeList.resize(nodeId + 1, -1);
+		}
+		int64_t &approxSize = approxSizeList[nodeId];
+
+		approxSize = resolveJoinNodeApproxSize(node, plan.hintInfo_);
+
+		if (approxSize < 0) {
+			for (PlanNode::IdList::const_iterator it =
+					node.inputList_.begin();
+					it != node.inputList_.end(); ++it) {
+				const int64_t sub = approxSizeList[*it];
+				if (approxSize < 0) {
+					approxSize = sub;
+				}
+				else if (sub >= 0) {
+					if (node.type_ == SQLType::EXEC_UNION) {
+						approxSize += sub;
+					}
+					else {
+						approxSize = std::max(approxSize, sub);
+					}
+				}
+			}
+		}
+
+		const int64_t limit = nodeLimitList[nodeId].first;
+		if (limit >= 0 && (approxSize < 0 || approxSize >= limit)) {
+			approxSize = limit;
+		}
+	}
+}
+
+int64_t SQLCompiler::resolveJoinNodeApproxSize(
+		const PlanNode &node, const SQLHintInfo *hintInfo) {
+	do {
+		if (hintInfo == NULL) {
+			break;
+		}
+
+		const char8_t *tableName = getJoinTableName(node);
+		if (tableName == NULL) {
+			break;
+		}
+
+		const SQLHintValue *value = hintInfo->findStatisticalHint(
+				SQLHint::TABLE_ROW_COUNT, tableName);
+		if (value == NULL) {
+			break;
+		}
+
+		return value->getInt64();
+	}
+	while (false);
+
+	if (node.type_ == SQLType::EXEC_SCAN) {
+		return node.tableIdInfo_.approxSize_;
+	}
+
+	return -1;
 }
 
 void SQLCompiler::makeJoinEdgesSub(
@@ -10211,7 +11594,8 @@ bool SQLCompiler::followJoinColumnInput(
 		const Plan &plan, const PlanNode &node, const Expr &expr,
 		const util::Map<PlanNodeId, JoinNodeId> &nodeIdMap,
 		PlanNodeId &resultNodeId, ColumnId *resultColumnId) {
-	assert(node.type_ == SQLType::EXEC_JOIN);
+	assert(node.type_ == SQLType::EXEC_JOIN ||
+			node.type_ == SQLType::EXEC_SELECT);
 
 	if (expr.op_ != SQLType::EXPR_COLUMN) {
 		return false;
@@ -10242,6 +11626,46 @@ bool SQLCompiler::followJoinColumnInput(
 
 		return true;
 	}
+}
+
+const SQLCompiler::PlanNode* SQLCompiler::findJoinPredNode(
+		const Plan &plan, PlanNodeId joinNodeId,
+		util::Vector<PlanNodeId> &predIdList) {
+	if (predIdList.empty()) {
+		predIdList.assign(
+				plan.nodeList_.size(), std::numeric_limits<PlanNodeId>::max());
+
+		for (PlanNodeList::const_iterator nodeIt = plan.nodeList_.begin();
+				nodeIt != plan.nodeList_.end(); ++nodeIt) {
+			const PlanNode &node = *nodeIt;
+
+			if (node.type_ != SQLType::EXEC_SELECT) {
+				continue;
+			}
+
+			if (node.predList_.empty() || isTrueExpr(node.predList_.front())) {
+				continue;
+			}
+
+			if (node.inputList_.size() != 1) {
+				continue;
+			}
+
+			const PlanNodeId inId = node.inputList_.front();
+			if (plan.nodeList_[inId].type_ != SQLType::EXEC_JOIN) {
+				continue;
+			}
+
+			predIdList[inId] =
+					static_cast<PlanNodeId>(nodeIt - plan.nodeList_.begin());
+		}
+	}
+
+	const PlanNodeId nodeId = predIdList[joinNodeId];
+	if (nodeId >= plan.nodeList_.size()) {
+		return NULL;
+	}
+	return &plan.nodeList_[nodeId];
 }
 
 void SQLCompiler::applyJoinOrder(
@@ -10351,7 +11775,7 @@ void SQLCompiler::applyJoinOrder(
 
 	for (util::Vector<PlanNodeId>::iterator it = restJoinIdList.begin();
 			it != restJoinIdList.end(); ++it) {
-		plan.nodeList_[*it].type_ = SQLType::START_EXEC;
+		setDisabledNodeType(plan.nodeList_[*it]);
 	}
 
 	{
@@ -10709,55 +12133,135 @@ uint64_t SQLCompiler::getMaxExpansionCount(const Plan &plan) {
 	return count;
 }
 
+int64_t SQLCompiler::getMaxGeneratedRows(const Plan &plan) {
+	uint64_t count;
+	const bool found = getSingleHintValue(
+			plan.hintInfo_, SQLHint::MAX_GENERATED_ROWS,
+			0, count);
+	if (!found) {
+		return -1;
+	}
+	return static_cast<int64_t>(count);
+}
+
+bool SQLCompiler::isLegacyJoinReordering(const Plan &plan) {
+	if (plan.hintInfo_ != NULL) {
+		if (plan.hintInfo_->hasHint(SQLHint::COST_BASED_JOIN)) {
+			return false;
+		}
+		if (plan.hintInfo_->hasHint(SQLHint::NO_COST_BASED_JOIN)) {
+			return true;
+		}
+	}
+
+	if (isLegacyPlanning(plan, LEGACY_JOIN_REORDERING_VERSION)) {
+		return true;
+	}
+
+	if (compileOption_->isCostBasedJoin()) {
+		return false;
+	}
+	return true;
+}
+
+bool SQLCompiler::isLegacyPlanning(
+		const Plan &plan, const SQLPlanningVersion &legacyVersion) {
+	return plan.planningVersion_.compareTo(legacyVersion) <= 0;
+}
+
+SQLPlanningVersion SQLCompiler::getPlanningVersionHint(
+		const SQLHintInfo *hintInfo) {
+	const size_t valueCount = 3;
+	const size_t minValueCount = 2;
+
+	const SQLHint::Id hintId = SQLHint::LEGACY_PLAN;
+
+	uint64_t valueList[valueCount] = { 0 };
+	const bool found = (getMultipleHintValues(
+			hintInfo, hintId, valueList, valueCount, minValueCount) > 0);
+
+	SQLPlanningVersion version;
+	if (found) {
+		version = SQLPlanningVersion(
+				static_cast<int32_t>(valueList[0]),
+				static_cast<int32_t>(valueList[1]));
+	}
+
+	return version;
+}
+
 bool SQLCompiler::getSingleHintValue(
 		const SQLHintInfo *hintInfo, SQLHint::Id hint, uint64_t defaultValue,
 		uint64_t &value) {
+	const size_t valueCount = 1;
+	const size_t minValueCount = valueCount;
 
-	value = defaultValue;
-	bool hintFound = false;
+	uint64_t valueList[valueCount] = { defaultValue };
+	const bool found = (getMultipleHintValues(
+			hintInfo, hint, valueList, valueCount, minValueCount) > 0);
+	value = valueList[0];
 
-	if (hintInfo != NULL) {
-		int64_t srcValue = -1;
-		do {
-			util::StackAllocator::Scope scope(alloc_);
+	return found;
+}
 
-			if (hintInfo->getHintList(hint) == NULL) {
+size_t SQLCompiler::getMultipleHintValues(
+		const SQLHintInfo *hintInfo, SQLHint::Id hint, uint64_t *valueList,
+		size_t valueCount, size_t minValueCount) {
+	size_t resultValueCount = 0;
+	bool valid = true;
+
+	do {
+		if (hintInfo == NULL) {
+			break;
+		}
+
+		util::StackAllocator::Scope scope(alloc_);
+
+		if (hintInfo->getHintList(hint) == NULL) {
+			break;
+		}
+
+		valid = false;
+
+		util::Vector<TupleValue> hintValueList(alloc_);
+		hintInfo->getHintValueList(hint, hintValueList);
+
+		if (hintValueList.size() < minValueCount) {
+			break;
+		}
+
+		for (size_t i = 0;; i++) {
+			if (!(i < valueCount && i < hintValueList.size())) {
+				valid = true;
 				break;
 			}
 
-			hintFound = true;
-
-			util::Vector<TupleValue> hintValueList(alloc_);
-			hintInfo->getHintValueList(hint, hintValueList);
-
-			if (hintValueList.size() != 1) {
+			const TupleValue &hintValue = hintValueList[i];
+			if (hintValue.getType() != TupleList::TYPE_LONG) {
 				break;
 			}
 
-			if (hintValueList[0].getType() != TupleList::TYPE_LONG) {
-				break;
-			}
-
-			srcValue = hintValueList[0].get<int64_t>();
+			const int64_t srcValue = hintValue.get<int64_t>();
 			if (srcValue < 0) {
 				break;
 			}
 
-			value = static_cast<uint64_t>(srcValue);
-		}
-		while (false);
-
-		if (hintFound && srcValue < 0) {
-			const char8_t *hintName = SQLHint::Coder()(hint);
-			hintName = (hintName == NULL ? "" : hintName);
-
-			SQL_COMPILER_THROW_ERROR(
-					GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
-					"Invalid value for Hint(" << hintName << ")");
+			valueList[i] = static_cast<uint64_t>(srcValue);
+			resultValueCount++;
 		}
 	}
+	while (false);
 
-	return hintFound;
+	if (!valid) {
+		const char8_t *hintName = SQLHint::Coder()(hint);
+		hintName = (hintName == NULL ? "" : hintName);
+
+		SQL_COMPILER_THROW_ERROR(
+				GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+				"Invalid value for Hint(" << hintName << ")");
+	}
+
+	return resultValueCount;
 }
 
 
@@ -10778,7 +12282,7 @@ void SQLCompiler::initializeMinimizingTargets(
 			nodeIt != plan.nodeList_.end(); ++nodeIt) {
 		const PlanNode &node = *nodeIt;
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			continue;
 		}
 
@@ -10942,15 +12446,15 @@ void SQLCompiler::balanceMinimizingTargets(
 				static_cast<PlanNodeId>(nodeIt - plan.nodeList_.begin());
 
 		bool checked = false;
-		for (size_t i = 0; i < 2; i++) {
-			const bool forRetention = (i == 0);
-			CheckList &list = (forRetention ? retainList : modList);
+		do {
+			const bool forRetention = true;
+			CheckList &list = retainList;
 			const bool fixingValue = forRetention;
 
 			CheckEntry *entry = list[nodeId];
 
 			if (entry == NULL || entry->empty()) {
-				continue;
+				break;
 			}
 
 			CheckEntry::iterator checkIt = entry->begin();
@@ -10982,13 +12486,20 @@ void SQLCompiler::balanceMinimizingTargets(
 				for (PlanNode::IdList::const_iterator inIt =
 						node.inputList_.begin();
 						inIt != node.inputList_.end(); ++inIt) {
-					CheckEntry *inEntry = list[*inIt];
-					(*inEntry)[columnId] = fixingValue;
+					CheckEntry::iterator elemIt =
+							list[*inIt]->begin() + columnId;
+					if (*elemIt == fixingValue) {
+						continue;
+					}
+
+					*elemIt = fixingValue;
+					(*modList[*inIt])[columnId] = fixingValue;
 				}
 
 				unionAffected = true;
 			}
 		}
+		while (false);
 
 		if (!checked) {
 			assert(false);
@@ -11056,13 +12567,11 @@ bool SQLCompiler::rewriteMinimizingTargets(
 			}
 			else if (*modIt) {
 				if (aggrMod) {
-					if (it->op_ == SQLType::AGG_COUNT_ALL) {
-						continue;
-					}
+					const bool asCountAll = (it->op_ == SQLType::AGG_COUNT_ALL);
 
 					ExprList *argList = NULL;
 					if (node.aggPhase_ == SQLType::AGG_PHASE_MERGE_PIPE) {
-						if (it->next_ != NULL && !it->next_->empty() &&
+						if (asCountAll && it->next_ != NULL && !it->next_->empty() &&
 								it->next_->front()->op_ == SQLType::EXPR_CONSTANT &&
 								it->next_->front()->columnType_ == TupleList::TYPE_LONG) {
 							continue;
@@ -11071,6 +12580,11 @@ bool SQLCompiler::rewriteMinimizingTargets(
 						argList->push_back(ALLOC_NEW(alloc_) Expr(genConstExpr(
 								plan, TupleValue(static_cast<int64_t>(0)),
 								MODE_AGGR_SELECT)));
+					}
+					else {
+						if (asCountAll) {
+							continue;
+						}
 					}
 
 					*it = genExprWithArgs(
@@ -11246,7 +12760,7 @@ void SQLCompiler::makeJoinExpansionMetaInput(
 
 		bool metaOnly;
 		if (!isJoinExpansionMetaInputRequired(
-				i, joinType, joinInputList, expansionInfo, metaOnly)) {
+				i, joinType, joinInputList, metaOnly)) {
 			continue;
 		}
 
@@ -11532,14 +13046,12 @@ bool SQLCompiler::findJoinExpansion(
 
 	util::StackAllocator::Scope scope(alloc_);
 
-	const uint32_t expansionLimit = getAcceptableJoinExpansionCount(plan);
-
 	const NarrowingKeyTable emptyKeyTable(alloc_);
 	JoinKeyTableList keyTableList = { emptyKeyTable, emptyKeyTable };
 	bool joinCondNarrowable;
 	if (!makeJoinNarrowingKeyTables(
-			plan, node, joinInputList, expansionLimit, tableNarrowingList,
-			keyTableList, joinCondNarrowable)) {
+			plan, node, joinInputList, tableNarrowingList, keyTableList,
+			joinCondNarrowable)) {
 		return joinCondNarrowable;
 	}
 
@@ -11554,13 +13066,12 @@ bool SQLCompiler::findJoinExpansion(
 			keyTableList, joinKeyIdList, unifyingUnitList, inputUsageList,
 			singleUnitList);
 
-	if (!splitted && expansionLimit <= 0) {
-		return false;
-	}
+	const uint32_t expansionLimit = getAcceptableJoinExpansionCount(plan);
 
 	if (!tryMakeJoinAllUnitDividableExpansion(
-			node.joinType_, joinInputList, keyTableList, joinKeyIdList,
-			unifyingUnitList, singleUnitList, expansionLimit, expansionInfo)) {
+			node.joinType_, node.cmdOptionFlag_, joinInputList, keyTableList,
+			joinKeyIdList, unifyingUnitList, singleUnitList, expansionLimit,
+			&expansionInfo)) {
 		if (!splitted) {
 			return false;
 		}
@@ -11576,7 +13087,7 @@ bool SQLCompiler::findJoinExpansion(
 
 bool SQLCompiler::makeJoinNarrowingKeyTables(
 		const Plan &plan, const PlanNode &node,
-		const JoinNodeIdList &joinInputList, uint32_t expansionLimit,
+		const JoinNodeIdList &joinInputList,
 		const TableNarrowingList &tableNarrowingList,
 		JoinKeyTableList &keyTableList, bool &joinCondNarrowable) {
 	const uint32_t inCount = JOIN_INPUT_COUNT;
@@ -11633,7 +13144,7 @@ bool SQLCompiler::makeJoinNarrowingKeyTables(
 	const bool single =
 			(keyTableList[left].getSize() == 1 &&
 			keyTableList[right].getSize() == 1);
-	if (!resolved && (single || expansionLimit <= 0)) {
+	if (!resolved && single) {
 		joinCondNarrowable = false;
 		return false;
 	}
@@ -11718,17 +13229,36 @@ bool SQLCompiler::splitJoinByReachableUnit(
 }
 
 bool SQLCompiler::tryMakeJoinAllUnitDividableExpansion(
-		SQLType::JoinType joinType, const JoinNodeIdList &joinInputList,
-		JoinKeyTableList &keyTableList, const JoinKeyIdList &joinKeyIdList,
+		SQLType::JoinType joinType, PlanNode::CommandOptionFlag cmdOptionFlag,
+		const JoinNodeIdList &joinInputList, JoinKeyTableList &keyTableList,
+		const JoinKeyIdList &joinKeyIdList,
 		const JoinUnifyingUnitList &unifyingUnitList,
 		const JoinBoolList &singleUnitList, uint32_t expansionLimit,
-		JoinExpansionInfo &expansionInfo) {
-	if (expansionLimit <= 0) {
-		return false;
+		JoinExpansionInfo *expansionInfo) {
+	const bool checkOnly = (expansionInfo == NULL);
+	if (!checkOnly) {
+		util::StackAllocator::Scope scope(alloc_);
+		JoinExpansionInfo *infoForCheckOnly = NULL;
+
+		const bool dividable = tryMakeJoinAllUnitDividableExpansion(
+				joinType, cmdOptionFlag, joinInputList, keyTableList,
+				joinKeyIdList, unifyingUnitList, singleUnitList,
+				expansionLimit, infoForCheckOnly);
+		if (!dividable) {
+			return false;
+		}
 	}
 
 	JoinBoolList dividableList;
 	if (!checkJoinUnitDividable(joinType, singleUnitList, dividableList)) {
+		return false;
+	}
+
+	JoinBoolList baseJoinOptList;
+	const JoinBoolList *drivingOptList = getJoinUnitDrivingOptionList(
+			cmdOptionFlag, dividableList, baseJoinOptList);
+
+	if (drivingOptList == NULL && expansionLimit <= 0) {
 		return false;
 	}
 
@@ -11744,27 +13274,34 @@ bool SQLCompiler::tryMakeJoinAllUnitDividableExpansion(
 	JoinMatchCountList matchCountList(alloc_);
 	util::Vector<uint32_t> subLimitList(alloc_);
 
-	JoinExpansionBuildInfo buildInfo(alloc_, expansionInfo);
+	util::LocalUniquePtr<JoinExpansionBuildInfo> buildInfo;
+	if (!checkOnly) {
+		buildInfo = UTIL_MAKE_LOCAL_UNIQUE(
+				buildInfo, JoinExpansionBuildInfo, alloc_, *expansionInfo);
+	}
 
+	bool dividable = false;
 	for (util::Vector<uint32_t>::iterator it = limitList.begin();
 			it != limitList.end(); ++it) {
 		const uint32_t unitIndex =
 				static_cast<uint32_t>(it - limitList.begin());
 		const uint32_t unitLimit = *it;
 
-		makeJoinUnitDividableExpansion(
+		dividable |= makeJoinUnitDividableExpansion(
 				dividableList, joinInputList, keyTableList, joinKeyIdList,
-				unifyingUnitList, unitIndex, unitLimit,
+				unifyingUnitList, drivingOptList, unitIndex, unitLimit,
 				fullMatchList[unitIndex], joinSubKeyIdList, matchCountList,
-				subLimitList, buildInfo);
+				subLimitList, buildInfo.get());
 	}
 
-	expansionInfo.extraCount_ = static_cast<uint32_t>(
-			expansionInfo.expansionCount_ - limitList.size());
-	expansionInfo.limitReached_ =
-			(expansionInfo.extraCount_ >= expansionLimit);
+	if (!checkOnly) {
+		expansionInfo->extraCount_ = static_cast<uint32_t>(
+				expansionInfo->expansionCount_ - limitList.size());
+		expansionInfo->limitReached_ =
+				(expansionInfo->extraCount_ >= expansionLimit);
+	}
 
-	return true;
+	return dividable;
 }
 
 void SQLCompiler::makeJoinAllUnitNonDividableExpansion(
@@ -11827,32 +13364,18 @@ void SQLCompiler::removeJoinExpansionMatchedInput(
 	}
 }
 
-void SQLCompiler::makeJoinUnitDividableExpansion(
+bool SQLCompiler::makeJoinUnitDividableExpansion(
 		const JoinBoolList &dividableList, const JoinNodeIdList &joinInputList,
 		JoinKeyTableList &keyTableList, const JoinKeyIdList &joinKeyIdList,
-		const JoinUnifyingUnitList &unifyingUnitList, uint32_t unitIndex,
-		uint32_t unitLimit, bool fullMatch, JoinKeyIdList &joinSubKeyIdList,
-		JoinMatchCountList &matchCountList,
+		const JoinUnifyingUnitList &unifyingUnitList,
+		const JoinBoolList *drivingOptList, uint32_t unitIndex,
+		uint32_t baseUnitLimit, bool fullMatch,
+		JoinKeyIdList &joinSubKeyIdList, JoinMatchCountList &matchCountList,
 		util::Vector<uint32_t> &subLimitList,
-		JoinExpansionBuildInfo &buildInfo) {
+		JoinExpansionBuildInfo *buildInfo) {
 	const uint32_t inCount = JOIN_INPUT_COUNT;
-	const uint32_t left = JOIN_LEFT_INPUT;
-	const uint32_t right = JOIN_RIGHT_INPUT;
 
 	typedef NarrowingKeyTable::KeyIdList KeyIdList;
-
-	if (unitLimit <= 1) {
-		JoinSizeList keyIdStartList;
-		JoinSizeList keyIdEndList;
-		for (uint32_t i = 0; i < inCount; i++) {
-			keyIdStartList[i] = unifyingUnitList[i][unitIndex];
-			keyIdEndList[i] = unifyingUnitList[i][unitIndex + 1];
-		}
-		makeJoinUnitExpansion(
-				joinInputList, joinKeyIdList, keyIdStartList, keyIdEndList,
-				buildInfo);
-		return;
-	}
 
 	KeyIdList::const_iterator unitBeginList[inCount];
 	KeyIdList::const_iterator unitEndList[inCount];
@@ -11867,9 +13390,28 @@ void SQLCompiler::makeJoinUnitDividableExpansion(
 
 	uint32_t dividingSide;
 	uint64_t sideLimit;
-	getJoinUnitDividableExpansionLimit(
-			unitSizeList, unitLimit, fullMatch, dividableList, dividingSide,
-			sideLimit);
+	uint64_t unitLimit;
+	const bool dividable = getJoinUnitDividableExpansionLimit(
+			unitSizeList, baseUnitLimit, fullMatch, dividableList,
+			drivingOptList, dividingSide, sideLimit, unitLimit);
+
+	const bool checkOnly = (buildInfo == NULL);
+	if (checkOnly) {
+		return dividable;
+	}
+
+	if (!dividable) {
+		JoinSizeList keyIdStartList;
+		JoinSizeList keyIdEndList;
+		for (uint32_t i = 0; i < inCount; i++) {
+			keyIdStartList[i] = unifyingUnitList[i][unitIndex];
+			keyIdEndList[i] = unifyingUnitList[i][unitIndex + 1];
+		}
+		makeJoinUnitExpansion(
+				joinInputList, joinKeyIdList, keyIdStartList, keyIdEndList,
+				*buildInfo);
+		return false;
+	}
 
 	const uint32_t anotherSide = getJoinAnotherSide(dividingSide);
 
@@ -11921,9 +13463,9 @@ void SQLCompiler::makeJoinUnitDividableExpansion(
 					sideKeyTable, 0, sideSubList, anotherSubList, shallow);
 		}
 
-		const uint64_t subLimit = subLimitList.empty() ?
+		const uint64_t subLimit = std::max<uint64_t>(subLimitList.empty() ?
 				limitPartitioner.popGroup() :
-				subLimitList[sideSubIdIt - unitBeginList[dividingSide]];
+				subLimitList[sideSubIdIt - unitBeginList[dividingSide]], 1);
 		assert(subLimitList.empty() || sideCount == 1);
 
 		IntegralPartitioner anotherPartitioner(
@@ -11942,18 +13484,23 @@ void SQLCompiler::makeJoinUnitDividableExpansion(
 
 			makeJoinUnitExpansion(
 					joinInputList, joinSubKeyIdList,
-					keyIdStartList, keyIdEndList, buildInfo);
+					keyIdStartList, keyIdEndList, *buildInfo);
 
 			anotherSubIdIt += anotherCount;
 		}
 		sideSubIdIt += sideCount;
 	}
+
+	return true;
 }
 
-void SQLCompiler::getJoinUnitDividableExpansionLimit(
-		const JoinSizeList &unitSizeList, uint64_t unitLimit,
+bool SQLCompiler::getJoinUnitDividableExpansionLimit(
+		const JoinSizeList &unitSizeList, uint64_t baseUnitLimit,
 		bool fullMatch, const JoinBoolList &dividableList,
-		uint32_t &dividingSide, uint64_t &sideLimit) {
+		const JoinBoolList *drivingOptList, uint32_t &dividingSide,
+		uint64_t &sideLimit, uint64_t &unitLimit) {
+	unitLimit = baseUnitLimit;
+
 	const uint32_t left = JOIN_LEFT_INPUT;
 	const uint32_t right = JOIN_RIGHT_INPUT;
 
@@ -11963,17 +13510,25 @@ void SQLCompiler::getJoinUnitDividableExpansionLimit(
 	const bool leftDividable = dividableList[left];
 	const bool rightDividable = dividableList[right];
 
-	if (unitLimit <= 1 || (!leftDividable && !rightDividable)) {
+	if (drivingOptList != NULL) {
+		dividingSide = ((*drivingOptList)[left] ? right : left);
+		sideLimit = unitSizeList[dividingSide];
+		unitLimit = std::max<uint32_t>(baseUnitLimit, 1U);
+	}
+	else if (baseUnitLimit <= 1 || (!leftDividable && !rightDividable)) {
 		dividingSide = (leftSize <= rightSize ? left : right);
 		sideLimit = 1;
+		if (baseUnitLimit <= 1) {
+			return false;
+		}
 	}
 	else if (!leftDividable || !rightDividable) {
 		dividingSide = (leftDividable ? left : right);
-		sideLimit = unitLimit;
+		sideLimit = baseUnitLimit;
 	}
 	else if (fullMatch) {
 		const uint64_t squareLimit =
-				static_cast<uint64_t>(sqrt(static_cast<double>(unitLimit)));
+				static_cast<uint64_t>(sqrt(static_cast<double>(baseUnitLimit)));
 		if (squareLimit > leftSize) {
 			dividingSide = left;
 			sideLimit = leftSize;
@@ -11991,13 +13546,14 @@ void SQLCompiler::getJoinUnitDividableExpansionLimit(
 		dividingSide = (leftSize <= rightSize ? left : right);
 
 		const uint64_t minSize = std::min<uint64_t>(leftSize, rightSize);
-		if (unitLimit <= minSize) {
-			sideLimit = unitLimit;
+		if (baseUnitLimit <= minSize) {
+			sideLimit = baseUnitLimit;
 		}
 		else {
 			sideLimit = minSize;
 		}
 	}
+	return (sideLimit > 1 || unitLimit > 1);
 }
 
 void SQLCompiler::makeJoinUnitExpansion(
@@ -12074,9 +13630,6 @@ void SQLCompiler::makeJoinAllUnitLimitList(
 		const JoinUnifyingUnitList &unifyingUnitList,
 		uint32_t expansionLimit, util::Vector<uint32_t> &limitList,
 		util::Vector<bool> &fullMatchList) {
-	const uint32_t left = JOIN_LEFT_INPUT;
-	const uint32_t right = JOIN_RIGHT_INPUT;
-
 	typedef NarrowingKeyTable::KeyIdList KeyIdList;
 
 	limitList.clear();
@@ -12135,7 +13688,7 @@ void SQLCompiler::makeJoinAllUnitLimitList(
 
 void SQLCompiler::arrangeJoinExpansionLimit(
 		JoinMatchCountList &matchCountList,
-		util::Vector<uint32_t> &unitLimitList, uint32_t totalLimit) {
+		util::Vector<uint32_t> &unitLimitList, uint64_t totalLimit) {
 	const size_t unitCount = matchCountList.size();
 
 	std::sort(matchCountList.begin(), matchCountList.end());
@@ -12187,6 +13740,32 @@ bool SQLCompiler::getJoinDividableList(
 
 	const bool dividable = (dividableList[left] || dividableList[right]);
 	return dividable;
+}
+
+const SQLCompiler::JoinBoolList* SQLCompiler::getJoinUnitDrivingOptionList(
+		PlanNode::CommandOptionFlag cmdOptionFlag,
+		const JoinBoolList &dividableList, JoinBoolList &baseJoinOptList) {
+	const uint32_t left = JOIN_LEFT_INPUT;
+	const uint32_t right = JOIN_RIGHT_INPUT;
+
+	baseJoinOptList[left] = false;
+	baseJoinOptList[right] = false;
+
+	if ((cmdOptionFlag & PlanNode::Config::CMD_OPT_JOIN_DRIVING_SOME) == 0) {
+		return NULL;
+	}
+
+	const uint32_t drivingSide = ((cmdOptionFlag &
+			PlanNode::Config::CMD_OPT_JOIN_DRIVING_NONE_LEFT) == 0 ?
+					right : left);
+	const uint32_t innerSide = getJoinAnotherSide(drivingSide);
+
+	if (!dividableList[innerSide]) {
+		return NULL;
+	}
+
+	baseJoinOptList[drivingSide] = true;
+	return &baseJoinOptList;
 }
 
 uint32_t SQLCompiler::getJoinSmallerSide(const JoinNodeIdList &joinInputList) {
@@ -12506,9 +14085,7 @@ bool SQLCompiler::isJoinExpansionUnmatchInputRequired(
 
 bool SQLCompiler::isJoinExpansionMetaInputRequired(
 		uint32_t joinInputId, SQLType::JoinType joinType,
-		const JoinNodeIdList &joinInputList,
-		const JoinExpansionInfo &expansionInfo, bool &metaOnly) {
-	const uint32_t inCount = JOIN_INPUT_COUNT;
+		const JoinNodeIdList &joinInputList, bool &metaOnly) {
 	const uint32_t left = JOIN_LEFT_INPUT;
 	const uint32_t right = JOIN_RIGHT_INPUT;
 
@@ -12564,7 +14141,6 @@ size_t SQLCompiler::getJoinExpansionMetaUnificationCount(
 		uint32_t joinInputId, SQLType::JoinType joinType,
 		const JoinNodeIdList &joinInputList,
 		const JoinNodeIdList &metaInputList) {
-	const uint32_t inCount = JOIN_INPUT_COUNT;
 	const uint32_t left = JOIN_LEFT_INPUT;
 	const uint32_t right = JOIN_RIGHT_INPUT;
 
@@ -12773,7 +14349,7 @@ bool SQLCompiler::listRelatedSubqueries(
 		visitedNodeIdSet.insert(nodeId);
 
 		const PlanNode &node = plan.nodeList_[nodeId];
-		assert(node.type_ != SQLType::START_EXEC);
+		assert(!isDisabledNode(node));
 
 		pendingIdList.insert(
 				pendingIdList.end(),
@@ -13231,7 +14807,36 @@ bool SQLCompiler::getSubqueryCorrelation(
 		bothSideJoinList.insert(
 				bothSideJoinList.end(), idJoinList.begin(), idJoinList.end());
 	}
-	else  {
+
+	if (simple && insidePredId != std::numeric_limits<PlanNodeId>::max()) {
+		const PlanNode &predNode = plan.nodeList_[insidePredId];
+
+		util::Vector<uint32_t> nodeRefList(alloc_);
+		for (ExprList::const_iterator it = correlationList.begin();
+				it != correlationList.end(); ++it) {
+			for (uint32_t i = 0; i < 2; i++) {
+				const Expr *opExpr = (i ==0 ? (*it)->left_ : (*it)->right_);
+				if (opExpr->op_ == SQLType::EXPR_COLUMN) {
+					continue;
+				}
+
+				if (nodeRefList.empty()) {
+					makeNodeRefList(plan, nodeRefList);
+				}
+
+				const PlanNodeId opNodeId = predNode.inputList_[i];
+				const PlanNode &opNode = plan.nodeList_[opNodeId];
+
+				if (nodeRefList[opNodeId] > (2 - i) ||
+						opNode.type_ != SQLType::EXEC_SELECT) {
+					simple = false;
+					break;
+				}
+			}
+		}
+	}
+
+	if (!simple) {
 		insidePredId = std::numeric_limits<PlanNodeId>::max();
 		correlationList.clear();
 		foldExpr = NULL;
@@ -13680,10 +15285,16 @@ bool SQLCompiler::rewriteSubquery(
 
 	PlanNodeId outsideId;
 	PlanNodeId foldNodeId;
+	ColumnId outsideColumnId;
 	{
 		PlanNode &node = plan.nodeList_[subqueryJoinId];
 		outsideId = node.inputList_[0];
 		foldNodeId = node.inputList_[1];
+		outsideColumnId = (node.predList_.size() > 1 &&
+				node.predList_[1].op_ == SQLType::OP_EQ &&
+				node.predList_[1].left_->op_ == SQLType::EXPR_COLUMN &&
+				node.predList_[1].left_->inputId_ == 0 ?
+						node.predList_[1].left_->columnId_ : UNDEF_COLUMNID);
 	}
 
 	if (rewroteJoinIdSet.find(foldNodeId) != rewroteJoinIdSet.end()) {
@@ -13780,11 +15391,66 @@ bool SQLCompiler::rewriteSubquery(
 				continue;
 			}
 			else {
+				ColumnId resolvedInsideColumnId = insideColumnId;
+				do {
+					if (!(resolvedInsideColumnId == UNDEF_COLUMNID &&
+							node.type_ == SQLType::EXEC_JOIN &&
+							node.inputList_[0] == outsideId)) {
+						break;
+					}
+
+					for (PlanExprList::iterator it = node.outputList_.begin();
+							it != node.outputList_.end(); ++it) {
+						if (it->op_ == SQLType::EXPR_COLUMN &&
+								it->inputId_ == 0 &&
+								it->columnId_ == outsideColumnId) {
+							resolvedInsideColumnId =
+									static_cast<ColumnId>(it - node.outputList_.begin());
+							break;
+						}
+					}
+
+					if (resolvedInsideColumnId == UNDEF_COLUMNID) {
+						break;
+					}
+
+					PlanNodeId prevNodeId = nodeId;
+					ColumnId prevInsideColumnId = resolvedInsideColumnId;
+					for (NodePath::reverse_iterator pathIt = nodePath.rbegin();
+							pathIt != nodePath.rend(); ++pathIt) {
+						const PlanNodeId curNodeId = pathIt->first;
+						ColumnId &curInsideColumnId = pathIt->second.second;
+						if (curNodeId == foldNodeId ||
+								curInsideColumnId != UNDEF_COLUMNID) {
+							break;
+						}
+						PlanNode &curNode = plan.nodeList_[curNodeId];
+
+						for (PlanExprList::iterator it = curNode.outputList_.begin();
+								it != curNode.outputList_.end(); ++it) {
+							if (it->op_ == SQLType::EXPR_COLUMN &&
+									curNode.inputList_[it->inputId_] == prevNodeId &&
+									it->columnId_ == prevInsideColumnId) {
+								curInsideColumnId = static_cast<ColumnId>(
+										it - curNode.outputList_.begin());
+								break;
+							}
+						}
+
+						if (curInsideColumnId == UNDEF_COLUMNID) {
+							break;
+						}
+						prevNodeId = curNodeId;
+						prevInsideColumnId = curInsideColumnId;
+					}
+				}
+				while (false);
+
 				visitedList[nodeId] = true;
 
 				bool typeRefreshRequired;
 				disableSubqueryOutsideColumns(
-						plan, node, outsideId, insideColumnId,
+						plan, node, outsideId, resolvedInsideColumnId,
 						typeRefreshRequired, fullDisabledList,
 						pendingLimitOffsetIdList);
 
@@ -14218,12 +15884,12 @@ void SQLCompiler::setUpSimpleSubqueryGroup(
 	else if (matching && !withValue) {
 		assert(!preGrouped);
 
-		ColumnId beseInColumnId;
+		ColumnId baseInColumnId;
 		if (inNodeId == preFoldId) {
-			beseInColumnId = (*foldExpr.next_)[2]->columnId_;
+			baseInColumnId = (*foldExpr.next_)[2]->columnId_;
 		}
 		else {
-			beseInColumnId = static_cast<ColumnId>(
+			baseInColumnId = static_cast<ColumnId>(
 					node.outputList_.size()) + reducedNECount;
 		}
 
@@ -14243,7 +15909,7 @@ void SQLCompiler::setUpSimpleSubqueryGroup(
 			ExprList *aggrArgs = ALLOC_NEW(alloc_) ExprList(alloc_);
 			if (argExpr == NULL) {
 				const ColumnId inColumnId =
-						beseInColumnId + (neReducing ? outIndex : 0);
+						baseInColumnId + (neReducing ? outIndex : 0);
 
 				Expr *colExpr = ALLOC_NEW(alloc_) Expr(genColumnExprBase(
 						&plan, &node, 0, inColumnId, NULL));
@@ -14539,7 +16205,8 @@ void SQLCompiler::setUpSimpleSubqueryJoin(
 				plan, node, baseColumnIdList, foldExpr, filtering, withNE,
 				compensating, nullCondExpr);
 		do {
-			if (outExpr.columnType_ == orgColumnType) {
+			if (outExpr.columnType_ == orgColumnType ||
+					ColumnTypeUtils::isNull(orgColumnType)) {
 				break;
 			}
 
@@ -14934,7 +16601,7 @@ bool SQLCompiler::pushDownSubquery(
 	ColumnId subqueryResultColumn = UNDEF_COLUMNID;
 	bool resultFiltering = false;
 	{
-		PlanNode &destNode = plan.append(SQLType::START_EXEC);
+		PlanNode &destNode = plan.append(getDisabledNodeType());
 		PlanNode &srcNode = plan.nodeList_[nodePath.front()];
 
 		const PlanNodeId destNodeId = destNode.id_;
@@ -15368,7 +17035,8 @@ void SQLCompiler::disableSubqueryOutsideColumns(
 			typeRefreshRequired = true;
 		}
 
-		if (node.subLimit_ >= 0 || node.subOffset_ > 0) {
+		if (insideColumnId != UNDEF_COLUMNID &&
+				(node.subLimit_ >= 0 || node.subOffset_ > 0)) {
 			assert(!(node.limit_ >= 0 || node.offset_ > 0));
 
 			if (node.subOffset_ > 0) {
@@ -15685,14 +17353,34 @@ void SQLCompiler::disableSubqueryLimitOffset(Plan &plan, PlanNodeId nodeId) {
 	orgNode.subOffset_ = 0;
 }
 
+void SQLCompiler::removeEmptyNodes(OptimizationContext &cxt, Plan &plan) {
+	static_cast<void>(cxt);
+
+	if (optimizationOption_->isSomeCheckOnly()) {
+		return;
+	}
+
+	plan.removeEmptyNodes();
+}
+
+void SQLCompiler::removeEmptyColumns(OptimizationContext &cxt, Plan &plan) {
+	static_cast<void>(cxt);
+
+	plan.removeEmptyColumns();
+}
+
 SQLCompiler::Expr SQLCompiler::genDisabledExpr() {
 	Expr expr(alloc_);
-	expr.op_ = SQLType::START_EXPR;
+	expr.op_ = getDisabledExprType();
 	return expr;
 }
 
 bool SQLCompiler::isDisabledExpr(const Expr &expr) {
-	return (expr.op_ == SQLType::START_EXPR);
+	return Plan::isDisabledExpr(expr);
+}
+
+SQLCompiler::Type SQLCompiler::getDisabledExprType() {
+	return Plan::getDisabledExprType();
 }
 
 uint64_t SQLCompiler::applyRatio(uint64_t denom, uint64_t ratio) {
@@ -15721,7 +17409,7 @@ void SQLCompiler::makeNodeRefList(
 	for (PlanNodeList::const_iterator nodeIt = plan.nodeList_.begin();
 			nodeIt != plan.nodeList_.end(); ++nodeIt) {
 		const PlanNode &node = *nodeIt;
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			continue;
 		}
 
@@ -15792,12 +17480,20 @@ void SQLCompiler::checkReference(
 	}
 
 	if (expr.op_ == SQLType::EXPR_COLUMN) {
-		assert(node.type_ != SQLType::START_EXEC);
+		assert(!isDisabledNode(node));
 
 		if (node.type_ == SQLType::EXEC_JOIN ||
-				node.type_ == SQLType::EXEC_SELECT) {
-			const PlanNodeId nodeId = node.inputList_[expr.inputId_];
-			(*checkList[nodeId])[expr.columnId_] = true;
+				node.type_ == SQLType::EXEC_SELECT ||
+				node.type_ == SQLType::EXEC_SCAN) {
+			const uint32_t tableCount = node.getInputTableCount();
+			if (expr.inputId_ >= tableCount) {
+				const uint32_t pos = expr.inputId_ - tableCount;
+				assert(pos < node.inputList_.size());
+
+				const PlanNodeId nodeId = node.inputList_[pos];
+				assert(expr.columnId_ < checkList[nodeId]->size());
+				(*checkList[nodeId])[expr.columnId_] = true;
+			}
 		}
 		else {
 			for (PlanNode::IdList::const_iterator it = node.inputList_.begin();
@@ -15856,13 +17552,13 @@ bool SQLCompiler::isSameOutputRequired(
 }
 
 void SQLCompiler::disableNode(Plan &plan, PlanNodeId nodeId) {
-	plan.nodeList_[nodeId].type_ = SQLType::START_EXEC;
+	setDisabledNodeType(plan.nodeList_[nodeId]);
 
 	for (PlanNodeList::iterator nodeIt = plan.nodeList_.begin();
 			nodeIt != plan.nodeList_.end(); ++nodeIt) {
 		PlanNode &node = *nodeIt;
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			continue;
 		}
 
@@ -15888,7 +17584,7 @@ void SQLCompiler::setNodeAndRefDisabled(
 		uint32_t &nodeRef = nodeRefList[curNodeId];
 		PlanNode &node = plan.nodeList_[curNodeId];
 
-		if (node.type_ == SQLType::START_EXEC) {
+		if (isDisabledNode(node)) {
 			assert(false);
 			SQL_COMPILER_THROW_ERROR(
 					GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
@@ -15905,13 +17601,25 @@ void SQLCompiler::setNodeAndRefDisabled(
 		}
 		else {
 			if (nodeRef == 0) {
-				node.type_ = SQLType::START_EXEC;
+				setDisabledNodeType(node);
 			}
 			inIt = node.inputList_.begin();
 			inEnd = node.inputList_.end();
 			forInputRef = true;
 		}
 	}
+}
+
+void SQLCompiler::setDisabledNodeType(PlanNode &node) {
+	node.type_ = getDisabledNodeType();
+}
+
+bool SQLCompiler::isDisabledNode(const PlanNode &node) {
+	return Plan::isDisabledNode(node);
+}
+
+SQLCompiler::Type SQLCompiler::getDisabledNodeType() {
+	return Plan::getDisabledNodeType();
 }
 
 bool SQLCompiler::factorizeExpr(
@@ -16226,17 +17934,115 @@ uint32_t SQLCompiler::getNodeAggregationLevel(const PlanExprList &exprList) {
 	return level;
 }
 
-bool SQLCompiler::isNallowingJoinInput(
+void SQLCompiler::assignReducedScanCostHints(Plan &plan) {
+	if (optimizationOption_->isSomeEnabled()) {
+		OptimizationContext cxt(*this, plan);
+
+		{
+			OptimizationUnit unit(cxt, OPT_PUSH_DOWN_PREDICATE);
+			unit(unit() && pushDownPredicate(plan, true));
+		}
+	}
+
+	const bool costCheckOnly = true;
+	genDistributedPlan(plan, costCheckOnly);
+}
+
+bool SQLCompiler::applyScanCostHints(const Plan &srcPlan, Plan &destPlan) {
+	if (srcPlan.nodeList_.size() != destPlan.nodeList_.size()) {
+		assert(false);
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+	}
+
+	bool found = false;
+	for (PlanNodeList::const_iterator nodeIt = srcPlan.nodeList_.begin();
+			nodeIt != srcPlan.nodeList_.end(); ++nodeIt) {
+		const PlanNode &srcNode = *nodeIt;
+		PlanNode &destNode =
+				destPlan.nodeList_[nodeIt - srcPlan.nodeList_.begin()];
+
+		const int64_t srcSize = srcNode.tableIdInfo_.approxSize_;
+		if (!(srcNode.type_ == SQLType::EXEC_SCAN &&
+				destNode.type_ == SQLType::EXEC_SCAN &&
+				srcSize >= 0)) {
+			continue;
+		}
+
+		int64_t &destSize = destNode.tableIdInfo_.approxSize_;
+		const int64_t orgSize = destSize;
+
+		destSize = srcSize;
+		found |= (orgSize != destSize);
+	}
+
+	return found;
+}
+
+bool SQLCompiler::findJoinPushDownHintingTarget(const Plan &plan) {
+	const PlanNode::CommandOptionFlag mask = getJoinDrivingOptionMask();
+
+	for (PlanNodeList::const_iterator nodeIt = plan.nodeList_.begin();
+			nodeIt != plan.nodeList_.end(); ++nodeIt) {
+		if (nodeIt->type_ == SQLType::EXEC_JOIN &&
+				(nodeIt->cmdOptionFlag_ & mask) == 0) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool SQLCompiler::applyJoinPushDownHints(const Plan &srcPlan, Plan &destPlan) {
+	if (srcPlan.nodeList_.size() != destPlan.nodeList_.size()) {
+		assert(false);
+		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+	}
+
+	const PlanNode::CommandOptionFlag mask = getJoinDrivingOptionMask();
+
+	bool found = false;
+	for (PlanNodeList::const_iterator nodeIt = srcPlan.nodeList_.begin();
+			nodeIt != srcPlan.nodeList_.end(); ++nodeIt) {
+		const PlanNode &srcNode = *nodeIt;
+		PlanNode &destNode =
+				destPlan.nodeList_[nodeIt - srcPlan.nodeList_.begin()];
+
+		if (!(srcNode.type_ == SQLType::EXEC_JOIN &&
+				destNode.type_ == SQLType::EXEC_JOIN &&
+				(srcNode.cmdOptionFlag_ & mask) != 0 &&
+				(destNode.cmdOptionFlag_ & mask) == 0)) {
+			continue;
+		}
+
+		PlanNode::CommandOptionFlag &destFlags = destNode.cmdOptionFlag_;
+		const PlanNode::CommandOptionFlag orgFlags = destFlags;
+
+		destFlags = (
+				(orgFlags & (~mask)) | (srcNode.cmdOptionFlag_ & mask));
+		found |= (orgFlags != destFlags);
+	}
+
+	return found;
+}
+
+SQLCompiler::PlanNode::CommandOptionFlag
+SQLCompiler::getJoinDrivingOptionMask() {
+	return (
+			PlanNode::Config::CMD_OPT_JOIN_DRIVING_NONE_LEFT |
+			PlanNode::Config::CMD_OPT_JOIN_DRIVING_SOME);
+}
+
+bool SQLCompiler::isNarrowingJoinInput(
 		const Plan &plan, const PlanNode &node, uint32_t inputId) {
 	assert(node.type_ == SQLType::EXEC_JOIN);
 	assert(node.joinType_ == SQLType::JOIN_INNER);
 
-	if (isNallowingNode(node.getInput(plan, inputId))) {
+	if (isNarrowingNode(node.getInput(plan, inputId))) {
 		return true;
 	}
 
 	if (node.predList_.size() > 1 &&
-			isNallowingPredicate(node.predList_[1], &inputId)) {
+			isNarrowingPredicate(node.predList_[1], &inputId)) {
 		return true;
 	}
 
@@ -16253,7 +18059,7 @@ bool SQLCompiler::isNallowingJoinInput(
 			continue;
 		}
 
-		if (isNallowingNode(inNode)) {
+		if (isNarrowingNode(inNode)) {
 			continue;
 		}
 		else if (inNode.inputList_.empty()) {
@@ -16279,7 +18085,7 @@ bool SQLCompiler::isNallowingJoinInput(
 	return true;
 }
 
-bool SQLCompiler::isNallowingNode(const PlanNode &node) {
+bool SQLCompiler::isNarrowingNode(const PlanNode &node) {
 	if (isNodeAggregated(node) || (node.limit_ >= 0 && node.limit_ <= 1)) {
 		return true;
 	}
@@ -16296,26 +18102,26 @@ bool SQLCompiler::isNallowingNode(const PlanNode &node) {
 	}
 
 	if (!node.predList_.empty() &&
-			isNallowingPredicate(node.predList_.front(), NULL)) {
+			isNarrowingPredicate(node.predList_.front(), NULL)) {
 		return true;
 	}
 
 	return false;
 }
 
-bool SQLCompiler::isNallowingPredicate(
+bool SQLCompiler::isNarrowingPredicate(
 		const Expr &expr, const uint32_t *inputId) {
 	if (expr.op_ == SQLType::EXPR_AND) {
-		return isNallowingPredicate(*expr.left_, inputId) ||
-				isNallowingPredicate(*expr.right_, inputId);
+		return isNarrowingPredicate(*expr.left_, inputId) ||
+				isNarrowingPredicate(*expr.right_, inputId);
 	}
 	else if (expr.op_ == SQLType::EXPR_OR) {
-		return isNallowingPredicate(*expr.left_, inputId) &&
-				isNallowingPredicate(*expr.right_, inputId);
+		return isNarrowingPredicate(*expr.left_, inputId) &&
+				isNarrowingPredicate(*expr.right_, inputId);
 	}
 	else if (expr.op_ == SQLType::OP_EQ) {
 		const Expr *columnExpr = expr.left_;
-		const Expr *constExpr =expr.right_;
+		const Expr *constExpr = expr.right_;
 
 		if (columnExpr->op_ != SQLType::EXPR_COLUMN) {
 			std::swap(columnExpr, constExpr);
@@ -16336,9 +18142,33 @@ bool SQLCompiler::isNallowingPredicate(
 }
 
 bool SQLCompiler::findIndexedPredicate(
-		const Plan &plan, const PlanNode &node, uint32_t inputId) {
+		const Plan &plan, const PlanNode &node, uint32_t inputId,
+		bool withUnionScan) {
+	const PlanNode &baseInNode = node.getInput(plan, inputId);
 
-	const PlanNode &inNode = node.getInput(plan, inputId);
+	if (!withUnionScan || baseInNode.type_ != SQLType::EXEC_UNION) {
+		return findIndexedPredicateSub(plan, node, inputId, NULL);
+	}
+
+	bool found = true;
+	for (PlanNode::IdList::const_iterator it = baseInNode.inputList_.begin();
+			it != baseInNode.inputList_.end(); ++it) {
+		const uint32_t unionInputId =
+				static_cast<uint32_t>(it - baseInNode.inputList_.begin());
+		if (!findIndexedPredicateSub(plan, node, inputId, &unionInputId)) {
+			return false;
+		}
+	}
+	return found;
+}
+
+bool SQLCompiler::findIndexedPredicateSub(
+		const Plan &plan, const PlanNode &node, uint32_t inputId,
+		const uint32_t *unionInputId) {
+
+	const PlanNode &baseInNode = node.getInput(plan, inputId);
+	const PlanNode &inNode = (unionInputId == NULL ?
+			baseInNode : baseInNode.getInput(plan, *unionInputId));
 	if (inNode.type_ != SQLType::EXEC_SCAN ||
 			!inNode.inputList_.empty() || inNode.limit_ >= 0 ||
 			inNode.aggPhase_ != SQLType::AGG_PHASE_ALL_PIPE ||
@@ -16347,10 +18177,10 @@ bool SQLCompiler::findIndexedPredicate(
 		return false;
 	}
 
-	const SQLTableInfo::IndexInfoList &indexInfoList =
+	const SQLTableInfo::BasicIndexInfoList *indexInfoList =
 			getTableInfoList().getIndexInfoList(inNode.tableIdInfo_);
 
-	if (indexInfoList.empty()) {
+	if (indexInfoList == NULL) {
 		return false;
 	}
 
@@ -16366,8 +18196,9 @@ bool SQLCompiler::findIndexedPredicate(
 			return false;
 		}
 
-		if (findIndexedPredicate(
-				plan, node, indexInfoList, inputId, *it, firstUnmatched)) {
+		if (findIndexedPredicateSub(
+				plan, node, *indexInfoList, inputId, unionInputId, *it,
+				firstUnmatched)) {
 			found = true;
 		}
 	}
@@ -16375,22 +18206,25 @@ bool SQLCompiler::findIndexedPredicate(
 	return found;
 }
 
-bool SQLCompiler::findIndexedPredicate(
+bool SQLCompiler::findIndexedPredicateSub(
 		const Plan &plan, const PlanNode &node,
-		const SQLTableInfo::IndexInfoList &indexInfoList,
-		uint32_t inputId, const Expr &expr, bool &firstUnmatched) {
+		const SQLTableInfo::BasicIndexInfoList &indexInfoList,
+		uint32_t inputId, const uint32_t *unionInputId, const Expr &expr,
+		bool &firstUnmatched) {
 	if (firstUnmatched) {
 		return false;
 	}
 
 	if (expr.op_ == SQLType::EXPR_AND) {
-		if (findIndexedPredicate(
-				plan, node, indexInfoList, inputId, *expr.left_, firstUnmatched)) {
+		if (findIndexedPredicateSub(
+				plan, node, indexInfoList, inputId, unionInputId, *expr.left_,
+				firstUnmatched)) {
 			return true;
 		}
 
-		if (findIndexedPredicate(
-				plan, node, indexInfoList, inputId, *expr.right_, firstUnmatched)) {
+		if (findIndexedPredicateSub(
+				plan, node, indexInfoList, inputId, unionInputId, *expr.right_,
+				firstUnmatched)) {
 			return true;
 		}
 
@@ -16415,26 +18249,24 @@ bool SQLCompiler::findIndexedPredicate(
 			return false;
 		}
 
-		const Expr &orgTableExpr = node.getInput(
-				plan, inputId).outputList_[tableExpr->columnId_];
-		if (orgTableExpr.op_ != SQLType::EXPR_COLUMN) {
+		const PlanNode &baseInNode = node.getInput(plan, inputId);
+		const Expr &baseTableExpr =
+				baseInNode.outputList_[tableExpr->columnId_];
+		if (baseTableExpr.op_ != SQLType::EXPR_COLUMN) {
 			return false;
 		}
 
-		const ColumnId orgColumnId = orgTableExpr.columnId_;
-		if (orgColumnId >= indexInfoList.size()) {
-			return false;
+		ColumnId orgColumnId = baseTableExpr.columnId_;
+		if (unionInputId != NULL) {
+			const Expr &orgTableExpr = baseInNode.getInput(
+					plan, inputId).outputList_[orgColumnId];
+			if (orgTableExpr.op_ != SQLType::EXPR_COLUMN) {
+				return false;
+			}
+			orgColumnId = orgTableExpr.columnId_;
 		}
 
-		const uint32_t flags = indexInfoList[orgColumnId];
-		if ((flags &
-				((1 << SQLType::INDEX_TREE_RANGE) |
-				(1 << SQLType::INDEX_TREE_EQ))) == 0) {
-			firstUnmatched = true;
-			return false;
-		}
-
-		return true;
+		return indexInfoList.isIndexed(orgColumnId);
 	}
 	else {
 		if (getJoinPrimaryCondScore(expr, NULL, false) > 0) {
@@ -16511,6 +18343,13 @@ bool SQLCompiler::isDereferenceableNode(
 		}
 	}
 
+	if (outputList != NULL && !isDereferenceableExprList(*outputList)) {
+		if (getNodeAggregationLevel(inNode.outputList_) > 0 &&
+				inNode.type_ != SQLType::EXEC_GROUP) {
+			return false;
+		}
+	}
+
 	if (multiInput && outputList != NULL &&
 			!isDereferenceableExprList(*outputList)) {
 		return false;
@@ -16576,7 +18415,10 @@ bool SQLCompiler::isInputDereferenceable(
 bool SQLCompiler::isInputDereferenceable(
 		const Plan &plan, const PlanNode &node, const uint32_t *inputId,
 		const Expr &expr, bool columnRefOnly) {
-	if (expr.op_ == SQLType::EXPR_COLUMN) {
+	if (isDisabledExpr(expr)) {
+		return false;
+	}
+	else if (expr.op_ == SQLType::EXPR_COLUMN) {
 		if (inputId != NULL && expr.inputId_ == *inputId) {
 			assert(node.tableIdInfo_.isEmpty());
 
@@ -16669,13 +18511,10 @@ void SQLCompiler::dereferenceExpr(
 				inExpr.columnType_ != TupleList::TYPE_NULL ?
 				inExpr : expr).columnType_;
 
+		outExpr = ALLOC_NEW(alloc_) Expr(alloc_);
+		copyExpr(expr, *outExpr);
 		if (inputReplacing) {
-			outExpr = ALLOC_NEW(alloc_) Expr(alloc_);
-			copyExpr(expr, *outExpr);
 			replaceExprInput(*outExpr, inputId);
-		}
-		else {
-			outExpr = ALLOC_NEW(alloc_) Expr(expr);
 		}
 		outExpr->sortAscending_ = inExpr.sortAscending_;
 
@@ -16752,6 +18591,32 @@ void SQLCompiler::replaceExprInput(Expr &expr, uint32_t inputId) {
 
 	for (ExprArgsIterator<false> it(expr); it.exists(); it.next()) {
 		replaceExprInput(it.get(), inputId);
+	}
+}
+
+void SQLCompiler::copyPlan(const Plan &src, Plan &dest) {
+	dest = src;
+
+	for (PlanNodeList::const_iterator nodeIt = src.nodeList_.begin();
+			nodeIt != src.nodeList_.end(); ++nodeIt) {
+		const PlanNode &srcNode = *nodeIt;
+		PlanNode &destNode = dest.nodeList_[nodeIt - src.nodeList_.begin()];
+		copyNode(srcNode, destNode);
+	}
+}
+
+void SQLCompiler::copyNode(const PlanNode &src, PlanNode &dest) {
+	dest = src;
+
+	dest.predList_.clear();
+	copyExprList(src.predList_, dest.predList_, false);
+
+	dest.outputList_.clear();
+	copyExprList(src.outputList_, dest.outputList_, false);
+
+	if (src.updateSetList_ != NULL) {
+		dest.updateSetList_ = ALLOC_NEW(alloc_) PlanExprList(alloc_);
+		copyExprList(*src.updateSetList_, *dest.updateSetList_, false);
 	}
 }
 
@@ -16888,7 +18753,7 @@ void SQLCompiler::makeNodeLimitList(
 			const PlanNode &node = *nodeIt;
 
 			int64_t limit;
-			if (node.type_ == SQLType::START_EXEC) {
+			if (isDisabledNode(node)) {
 				limit = -1;
 			}
 			else if (getNodeAggregationLevel(node.outputList_) > 0 &&
@@ -17060,12 +18925,14 @@ size_t SQLCompiler::resolveColumn(
 	bool tableFound = false;
 	const Expr *foundExpr = NULL;
 
+	const bool forNormalGroupSelect =
+			(mode == MODE_GROUP_SELECT && !isRangeGroupNode(node));
 	bool deepError = false;
 	Expr deepOut(alloc_);
 	const PendingColumn *deepPendingColumn = NULL;
 	if (shallow &&
 			(mode == MODE_GROUPBY ||
-			mode == MODE_GROUP_SELECT ||
+			forNormalGroupSelect ||
 			mode == MODE_ORDERBY)) {
 		if (productedNodeId != NULL) {
 			deepCount = resolveColumnDeep(
@@ -17081,7 +18948,7 @@ size_t SQLCompiler::resolveColumn(
 	const PlanNode::IdList &inputList = node.inputList_;
 
 	PlanNode::IdList::const_iterator inIt = inputList.begin();
-	if (shallow && mode == MODE_GROUP_SELECT) {
+	if (shallow && forNormalGroupSelect) {
 		inIt = inputList.end();
 	}
 
@@ -17593,7 +19460,7 @@ SQLCompiler::Type SQLCompiler::resolveFunction(const Expr &expr) {
 		}
 		bool windowOnly;
 		bool pseudoWindow;
-		bool isWindowExprType = SQLCompiler::isWindowExprType(type, windowOnly, pseudoWindow);
+		bool isWindowExprType = ProcessorUtils::isWindowExprType(type, windowOnly, pseudoWindow);
 		if (isWindowExprType) {
 			if (windowOnly && !expr.windowOpt_) {
 				SQL_COMPILER_THROW_ERROR(
@@ -17606,6 +19473,26 @@ SQLCompiler::Type SQLCompiler::resolveFunction(const Expr &expr) {
 				SQL_COMPILER_THROW_ERROR(
 						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
 						"The OVER clause cannot be used with the function '" << name << "'");
+			}
+		}
+
+		const bool orderingAggr =
+				ProcessorUtils::isExplicitOrderingAggregation(type);
+		const bool withOrderingArg =
+				(expr.next_ != NULL && !expr.next_->empty() &&
+				expr.next_->front()->op_ == SQLType::EXPR_AGG_ORDERING);
+		if (!orderingAggr != !withOrderingArg) {
+			if (orderingAggr) {
+				SQL_COMPILER_THROW_ERROR(
+						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
+						"The function '" << name <<
+						"' must have an WITHIN GROUP clause");
+			}
+			else {
+				SQL_COMPILER_THROW_ERROR(
+						GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, &expr,
+						"The WITHIN GROUP clause cannot be used "
+						"with the function '" << name << "'");
 			}
 		}
 		return type;
@@ -17660,61 +19547,73 @@ bool SQLCompiler::filterFunction(Type &type, size_t argCount) {
 	}
 }
 
-void SQLCompiler::resolveTimestampField(
-		const Plan &plan, Mode mode, Type type, const ExprList *inExprList,
-		Expr *&outExpr) {
-	outExpr = NULL;
-
-	switch (type) {
-	case SQLType::FUNC_EXTRACT:
-	case SQLType::FUNC_TIMESTAMP_ADD:
-	case SQLType::FUNC_TIMESTAMP_DIFF:
-	case SQLType::FUNC_TIMESTAMP_TRUNC:
-	case SQLType::FUNC_TIMESTAMPADD:
-	case SQLType::FUNC_TIMESTAMPDIFF:
-		break;
-	default:
+void SQLCompiler::arrangeFunctionArgs(Type type, Expr &expr) {
+	ExprList *exprList = expr.next_;
+	if (exprList == NULL) {
 		return;
 	}
-	const bool fillField = (type == SQLType::FUNC_EXTRACT);
 
-	if (inExprList == NULL || inExprList->empty() || inExprList->front() == NULL) {
-		assert(false);
-		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+	bool checkRequired = false;
+	for (size_t lastIndex = 0;;) {
+		size_t index;
+		ColumnType argType;
+		if (!ProcessorUtils::findConstantArgType(
+				type, lastIndex, index, argType)) {
+			break;
+		}
+
+		Expr *argExpr = (*exprList)[index];
+		const bool forConst = (argExpr->op_ == SQLType::EXPR_CONSTANT);
+		if (!forConst && argExpr->op_ != SQLType::EXPR_PLACEHOLDER) {
+			SQL_COMPILER_THROW_ERROR(
+					GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+					"The argument in the specified function must be constant "
+					"(function=" << SQLType::Coder()(type, "") << ")");
+		}
+		checkRequired |= forConst;
+
+		do {
+			TupleValue &argValue = argExpr->value_;
+			if (!forConst || argValue.getType() == argType) {
+				break;
+			}
+
+			const bool implicit = true;
+			argValue = ProcessorUtils::convertType(
+					getVarContext(), argValue, argType, implicit);
+			if (argValue.getType() == argType) {
+				argExpr->columnType_ = argValue.getType();
+				break;
+			}
+
+			if (!ColumnTypeUtils::isNull(argValue.getType())) {
+				SQL_COMPILER_THROW_ERROR(
+						GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+			}
+
+			SQL_COMPILER_THROW_ERROR(
+					GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
+					"The argument in the specified function must not be null "
+					"(function=" << SQLType::Coder()(type, "") << ")");
+		}
+		while (false);
+
+		lastIndex = index + 1;
 	}
 
-	const Expr &inExpr = *inExprList->front();
-	if (inExpr.op_ != SQLType::EXPR_CONSTANT) {
-		assert(false);
-		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_INTERNAL, NULL, "");
+	if (checkRequired) {
+		try {
+			Expr subExpr = expr;
+			subExpr.op_ = type;
+			ProcessorUtils::checkExprArgs(
+					getVarContext(), subExpr, getCompileOption());
+		}
+		catch (std::exception &e) {
+			SQL_COMPILER_RETHROW_ERROR(
+					e, NULL, GS_EXCEPTION_MESSAGE(e) <<
+					" (function=" << SQLType::Coder()(type, "") << ")");
+		}
 	}
-
-	util::DateTime::FieldType field =
-			static_cast<util::DateTime::FieldType>(inExpr.value_.get<int64_t>());
-	assert(field == util::DateTime::FIELD_YEAR ||
-			field == util::DateTime::FIELD_MONTH ||
-			field == util::DateTime::FIELD_DAY_OF_MONTH ||
-			field == util::DateTime::FIELD_HOUR ||
-			field == util::DateTime::FIELD_MINUTE ||
-			field == util::DateTime::FIELD_SECOND ||
-			field == util::DateTime::FIELD_MILLISECOND ||
-			field == util::DateTime::FIELD_DAY_OF_WEEK ||
-			field == util::DateTime::FIELD_DAY_OF_YEAR);
-
-	if (!fillField &&
-			(field == util::DateTime::FIELD_DAY_OF_WEEK ||
-			field == util::DateTime::FIELD_DAY_OF_YEAR)) {
-		SQL_COMPILER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, NULL,
-				"Specified function cannot accept timestamp field of "
-				"day of week or year (function=" <<
-				SQLType::Coder()(type, "") << ")");
-	}
-
-	outExpr = ALLOC_NEW(alloc_) Expr(genConstExpr(
-			plan, TupleValue(static_cast<int64_t>(field)), mode));
-	outExpr->qName_ = ALLOC_NEW(alloc_) QualifiedName(alloc_);
-	outExpr->qName_->name_ = SyntaxTree::tokenToString(
-			alloc_, inExpr.startToken_, true);
 }
 
 uint32_t SQLCompiler::genSourceId() {
@@ -17827,7 +19726,8 @@ bool SQLCompiler::isConstantEvaluable(const Expr &expr) {
 
 bool SQLCompiler::isConstantOnExecution(const Expr &expr) {
 	if (expr.op_ == SQLType::EXPR_CONSTANT ||
-			expr.op_ == SQLType::EXPR_PLACEHOLDER) {
+			expr.op_ == SQLType::EXPR_PLACEHOLDER ||
+			expr.op_ == SQLType::FUNC_NOW) {
 		return true;
 	}
 
@@ -17905,7 +19805,7 @@ SQLCompiler::Type SQLCompiler::getAggregationType(
 
 TupleList::TupleColumnType SQLCompiler::setColumnTypeNullable(
 		ColumnType type, bool nullable) {
-	if (TupleColumnTypeUtils::isNull(type) || TupleColumnTypeUtils::isAny(type)) {
+	if (ColumnTypeUtils::isNull(type) || ColumnTypeUtils::isAny(type)) {
 		return type;
 	}
 
@@ -17960,6 +19860,10 @@ const SQLCompiler::CompileOption& SQLCompiler::getCompileOption() {
 	return *compileOption_;
 }
 
+bool SQLCompiler::isIndexScanEnabledDefault() {
+	return true;
+}
+
 const SQLTableInfoList& SQLCompiler::getTableInfoList() const {
 	if (tableInfoList_ == NULL) {
 		assert(false);
@@ -17973,6 +19877,22 @@ SQLCompiler::SubqueryStack& SQLCompiler::getSubqueryStack() {
 	return *subqueryStack_;
 }
 
+util::AllocUniquePtr<SQLCompiler::SubqueryStack>::ReturnType
+SQLCompiler::makeSubqueryStack(
+		util::StackAllocator &alloc) {
+	util::AllocUniquePtr<SubqueryStack> stack;
+	stack = ALLOC_UNIQUE(alloc, SubqueryStack, alloc);
+	return stack;
+}
+
+util::AllocUniquePtr<SQLCompiler::OptimizationOption>::ReturnType
+SQLCompiler::makeOptimizationOption(
+		util::StackAllocator &alloc, const OptimizationOption &src) {
+	util::AllocUniquePtr<OptimizationOption> option;
+	option = ALLOC_UNIQUE(alloc, OptimizationOption, src);
+	return option;
+}
+
 util::StackAllocator& SQLCompiler::varContextToAllocator(
 		TupleValue::VarContext &varCxt) {
 	util::StackAllocator *alloc = varCxt.getStackAllocator();
@@ -17983,6 +19903,11 @@ util::StackAllocator& SQLCompiler::varContextToAllocator(
 	}
 
 	return *alloc;
+}
+
+template<typename T> T* SQLCompiler::emptyPtr() {
+	typedef T *Ptr;
+	return Ptr();
 }
 
 const char8_t SQLCompiler::Meta::SYSTEM_NAME_SEPARATOR[] = "#";
@@ -18175,13 +20100,14 @@ bool SQLCompiler::Meta::findCommonColumnId(
 void SQLCompiler::Meta::genDriverClusterInfo(
 		const Expr* &whereExpr, Plan &plan, const SystemTableInfo &info) {
 	static_cast<void>(whereExpr);
+	static_cast<void>(info);
 
 	PlanNode &node = plan.append(SQLType::EXEC_SELECT);
 
 	{
 		int32_t major;
 		int32_t minor;
-		SQLUtils::getDatabaseVersion(major, minor);
+		NoSQLCommonUtils::getDatabaseVersion(major, minor);
 		node.outputList_.push_back(genConstColumn(
 				plan, TupleValue(major), STR_DATABASE_MAJOR_VERSION));
 		node.outputList_.push_back(genConstColumn(
@@ -18606,7 +20532,7 @@ void SQLCompiler::Meta::SystemTableInfoList::addInfo(
 	info.columnCount_ = N;
 	info.metaId_ = UNDEF_CONTAINERID;
 	info.coreMetaId_ = (coreMetaType == MetaType::END_TYPE ?
-			UNDEF_CONTAINERID : coreMetaType);
+			UNDEF_CONTAINERID : static_cast<ContainerId>(coreMetaType));
 	info.tableGenFunc_ = tableGenFunc;
 	info.forDriver_ = forDriver;
 }
@@ -19133,7 +21059,6 @@ uint32_t SQLCompiler::SubPlanHasher::operator()(
 	hash = (*this)(value.aggPhase_, &hash);
 	hash = (*this)(value.joinType_, &hash);
 	hash = (*this)(value.unionType_, &hash);
-	hash = (*this)(value.tqlPred_, &hash);
 	return hash;
 }
 
@@ -19242,8 +21167,7 @@ bool SQLCompiler::SubPlanEq::operator()(
 			(*this)(value1.subLimit_, value2.subLimit_) &&
 			(*this)(value1.aggPhase_, value2.aggPhase_) &&
 			(*this)(value1.joinType_, value2.joinType_) &&
-			(*this)(value1.unionType_, value2.unionType_) &&
-			(*this)(value1.tqlPred_, value2.tqlPred_);
+			(*this)(value1.unionType_, value2.unionType_);
 }
 
 bool SQLCompiler::SubPlanEq::operator()(
@@ -19983,6 +21907,14 @@ SQLCompiler::TableNarrowingList::TableNarrowingList(
 		affinityRevList_(alloc) {
 }
 
+SQLCompiler::TableNarrowingList* SQLCompiler::TableNarrowingList::tryDuplicate(
+		const TableNarrowingList *src) {
+	if (src == NULL) {
+		return NULL;
+	}
+	return ALLOC_NEW(src->alloc_) TableNarrowingList(*src);
+}
+
 void SQLCompiler::TableNarrowingList::put(const TableInfo &tableInfo) {
 	const TableInfo::Id id = tableInfo.idInfo_.id_;
 	if (id >= entryList_.size()) {
@@ -20003,12 +21935,12 @@ void SQLCompiler::TableNarrowingList::put(const TableInfo &tableInfo) {
 	const TableInfo::PartitioningInfo *partitioning = tableInfo.partitioning_;
 	assert(partitioning != NULL);
 
-	if (partitioning->partitioningColumnId_ != UNDEF_COLUMNID) {
+	if (partitioning->partitioningColumnId_ >= 0) {
 		entry.columnId_ = partitioning->partitioningColumnId_;
 		assert(entry.keyList_.size() == partitioning->subInfoList_.size());
 	}
 
-	if (partitioning->subPartitioningColumnId_ != UNDEF_COLUMNID) {
+	if (partitioning->subPartitioningColumnId_ >= 0) {
 		entry.subColumnId_ = partitioning->subPartitioningColumnId_;
 		assert(entry.subKeyList_.size() == partitioning->subInfoList_.size());
 	}
@@ -20232,6 +22164,8 @@ const util::NameCoderEntry<SQLCompiler::OptimizationUnitType>
 	UTIL_NAME_CODER_ENTRY(OPT_REMOVE_REDUNDANCY),
 	UTIL_NAME_CODER_ENTRY(OPT_REMOVE_INPUT_REDUNDANCY),
 	UTIL_NAME_CODER_ENTRY(OPT_ASSIGN_JOIN_PRIMARY_COND),
+	UTIL_NAME_CODER_ENTRY(OPT_MAKE_SCAN_COST_HINTS),
+	UTIL_NAME_CODER_ENTRY(OPT_MAKE_JOIN_PUSH_DOWN_HINTS),
 	UTIL_NAME_CODER_ENTRY(OPT_MAKE_INDEX_JOIN),
 	UTIL_NAME_CODER_ENTRY(OPT_FACTORIZE_PREDICATE),
 	UTIL_NAME_CODER_ENTRY(OPT_REORDER_JOIN),
@@ -20253,6 +22187,8 @@ SQLCompiler::OptimizationUnit::~OptimizationUnit() {
 
 bool SQLCompiler::OptimizationUnit::operator()() {
 	SQLCompiler &compiler = cxt_.getCompiler();
+
+	compiler.checkOptimizationUnitSupport(type_);
 
 	if (!compiler.isOptimizationUnitEnabled(type_)) {
 		return false;
@@ -20280,9 +22216,93 @@ bool SQLCompiler::OptimizationUnit::operator()(bool optimized) {
 	return optimized;
 }
 
+bool SQLCompiler::OptimizationUnit::isCheckOnly() const {
+	SQLCompiler &compiler = cxt_.getCompiler();
+
+	if (!compiler.isOptimizationUnitCheckOnly(type_)) {
+		return false;
+	}
+
+	return true;
+}
+
+SQLCompiler::OptimizationOption::OptimizationOption(ProfilerManager *manager) :
+		supportFlags_(manager == NULL ? 0 : getFullFlags()),
+		enablementFlags_(manager == NULL ? 0 : manager->getOptimizationFlags()),
+		checkOnlyFlags_(0) {
+	UTIL_STATIC_ASSERT(OPT_END < sizeof(OptimizationFlags) * CHAR_BIT);
+}
+
+bool SQLCompiler::OptimizationOption::isEnabled(
+		OptimizationUnitType type) const {
+	return isFlagOn(enablementFlags_, type);
+}
+
+bool SQLCompiler::OptimizationOption::isSupported(
+		OptimizationUnitType type) const {
+	return isFlagOn(supportFlags_, type);
+}
+
+bool SQLCompiler::OptimizationOption::isCheckOnly(
+		OptimizationUnitType type) const {
+	return isFlagOn(checkOnlyFlags_, type);
+}
+
+bool SQLCompiler::OptimizationOption::isSomeEnabled() const {
+	return enablementFlags_ != 0;
+}
+
+SQLCompiler::OptimizationFlags
+SQLCompiler::OptimizationOption::getEnablementFlags() const {
+	return enablementFlags_;
+}
+
+bool SQLCompiler::OptimizationOption::isSomeCheckOnly() const {
+	return (checkOnlyFlags_ != 0);
+}
+
+void SQLCompiler::OptimizationOption::supportFull() {
+	supportFlags_ = getFullFlags();
+	enablementFlags_ = getFullFlags();
+}
+
+void SQLCompiler::OptimizationOption::support(
+		OptimizationUnitType type, bool enabled) {
+	setFlag(supportFlags_, type, true);
+	setFlag(enablementFlags_, type, enabled);
+}
+
+void SQLCompiler::OptimizationOption::setCheckOnly(OptimizationUnitType type) {
+	setFlag(checkOnlyFlags_, type, true);
+}
+
+SQLCompiler::OptimizationFlags SQLCompiler::OptimizationOption::getFullFlags() {
+	return ((static_cast<OptimizationFlags>(1) << OPT_END) - 1);
+}
+
+bool SQLCompiler::OptimizationOption::isFlagOn(
+		OptimizationFlags flags, OptimizationUnitType type) {
+	return (flags & (static_cast<OptimizationFlags>(1) << type)) != 0;
+}
+
+void SQLCompiler::OptimizationOption::setFlag(
+		OptimizationFlags &flags, OptimizationUnitType type, bool value) {
+	const OptimizationFlags mask = (static_cast<OptimizationFlags>(1) << type);
+	flags = (value ? (flags | mask) : (flags & (~mask)));
+}
+
 const SQLCompiler::CompileOption SQLCompiler::CompileOption::EMPTY_OPTION;
 
-SQLCompiler::CompileOption::CompileOption() {
+SQLCompiler::CompileOption::CompileOption(const CompilerSource *src) :
+		costBasedJoin_(false),
+		baseCompiler_(NULL) {
+	const SQLCompiler *baseCompiler = CompilerSource::findBaseCompiler(src);
+	if (baseCompiler != NULL) {
+		if (baseCompiler->compileOption_ != NULL) {
+			*this = *baseCompiler->compileOption_;
+		}
+		baseCompiler_ = baseCompiler;
+	}
 }
 
 void SQLCompiler::CompileOption::setTimeZone(const util::TimeZone &timeZone) {
@@ -20293,9 +22313,31 @@ const util::TimeZone& SQLCompiler::CompileOption::getTimeZone() const {
 	return timeZone_;
 }
 
+void SQLCompiler::CompileOption::setPlanningVersion(
+		const SQLPlanningVersion &version) {
+	planningVersion_ = version;
+}
+
+const SQLPlanningVersion& SQLCompiler::CompileOption::getPlanningVersion() const {
+	return planningVersion_;
+}
+
+void SQLCompiler::CompileOption::setCostBasedJoin(bool value) {
+	costBasedJoin_ = value;
+}
+
+bool SQLCompiler::CompileOption::isCostBasedJoin() const {
+	return costBasedJoin_;
+}
+
 const SQLCompiler::CompileOption&
 SQLCompiler::CompileOption::getEmptyOption() {
 	return EMPTY_OPTION;
+}
+
+const SQLCompiler* SQLCompiler::CompileOption::findBaseCompiler(
+		const CompileOption *option, CompilerInitializer&) {
+	return (option == NULL ? NULL : option->baseCompiler_);
 }
 
 SQLCompiler::Profiler::Profiler(util::StackAllocator &alloc) :
@@ -20304,6 +22346,19 @@ SQLCompiler::Profiler::Profiler(util::StackAllocator &alloc) :
 		tableInfoList_(alloc),
 		optimizationResult_(alloc),
 		target_(NULL) {
+}
+
+SQLCompiler::Profiler* SQLCompiler::Profiler::tryDuplicate(
+		const Profiler *src) {
+	if (src == NULL) {
+		return NULL;
+	}
+	Profiler *dest = ALLOC_NEW(src->alloc_) Profiler(src->alloc_);
+	dest->plan_ = src->plan_;
+	dest->tableInfoList_ = src->tableInfoList_;
+	dest->optimizationResult_ = src->optimizationResult_;
+	dest->target_ = src->target_;
+	return dest;
 }
 
 void SQLCompiler::Profiler::setPlan(const Plan &plan) {
@@ -20506,7 +22561,7 @@ void SQLCompiler::ProfilerManager::addProfiler(const Profiler &profiler) {
 }
 
 SQLCompiler::JoinNode::JoinNode(util::StackAllocator &alloc) :
-		edgeIdList_(alloc), approxSize_(0), cardinalityList_(alloc) {
+		edgeIdList_(alloc), approxSize_(-1), cardinalityList_(alloc) {
 }
 
 SQLCompiler::JoinEdge::JoinEdge() :
@@ -20554,7 +22609,10 @@ void SQLCompiler::JoinEdge::dump(std::ostream &os) const {
 }
 
 SQLCompiler::JoinOperation::JoinOperation() :
-		type_(SQLType::JOIN_INNER), hintType_(HINT_LEADING_NONE) {
+		type_(SQLType::JOIN_INNER),
+		hintType_(HINT_LEADING_NONE),
+		profile_(NULL),
+		tableCostAffected_(false) {
 	std::fill(
 			nodeIdList_ + 0, nodeIdList_ + JOIN_INPUT_COUNT,
 			std::numeric_limits<JoinNodeId>::max());
@@ -20721,13 +22779,13 @@ void SQLCompiler::JoinScore::dump(std::ostream &os) const {
 	dumpScore(os);
 }
 
-bool SQLCompiler::reorderJoinSub(
+bool SQLCompiler::reorderJoinSubLegacy(
 		util::StackAllocator &alloc,
 		const util::Vector<JoinNode> &joinNodeList,
 		const util::Vector<JoinEdge> &joinEdgeList,
 		const util::Vector<JoinOperation> &srcJoinOpList,
 		const util::Vector<SQLHintInfo::ParsedHint> &joinHintList,
-		util::Vector<JoinOperation> &destJoinOpList) {
+		util::Vector<JoinOperation> &destJoinOpList, bool profiling) {
 
 	destJoinOpList.clear();
 	if (joinNodeList.size() < 3 || joinEdgeList.size() == 0) {
@@ -20753,8 +22811,7 @@ bool SQLCompiler::reorderJoinSub(
 		JoinScoreKey key = std::make_pair(joinNodeId, UNDEF_JOIN_NODEID);
 		JoinScore joinScore(alloc, joinNodeId);
 
-		uint64_t approxSize = (joinNode.approxSize_ != 0) ?
-			joinNode.approxSize_ : JoinScore::DEFAULT_TABLE_ROW_APPROX_SIZE;
+		const uint64_t approxSize = JoinScore::DEFAULT_TABLE_ROW_APPROX_SIZE;
 		joinScore.setApproxTotalCount(approxSize);
 		joinScore.setApproxFilteredCount(approxSize);
 
@@ -21195,21 +23252,34 @@ bool SQLCompiler::reorderJoinSub(
 		}
 	}
 
+
+	bool reordered;
 	if (srcJoinOpList.size() == destJoinOpList.size()) {
+		reordered = false;
 		util::Vector<JoinOperation>::const_iterator srcItr = srcJoinOpList.begin();
 		util::Vector<JoinOperation>::const_iterator resultItr = destJoinOpList.begin();
 		for( ; srcItr != srcJoinOpList.end(); ++srcItr, ++resultItr) {
 			if (srcItr->nodeIdList_[0] != resultItr->nodeIdList_[0]
 					|| srcItr->nodeIdList_[1] != resultItr->nodeIdList_[1]
 					|| srcItr->type_ != resultItr->type_) {
-				return true;
+				reordered = true;
+				break;
 			}
 		}
-		return false;
 	}
 	else {
-		return true;
+		reordered = true;
 	}
+
+	if (profiling) {
+		SQLPreparedPlan::OptProfile::Join *profile =
+				ALLOC_NEW(alloc) SQLPreparedPlan::OptProfile::Join();
+		profile->reordered_ = reordered;
+		profile->costBased_ = false;
+		destJoinOpList.back().profile_ = profile;
+	}
+
+	return reordered;
 }
 
 void SQLCompiler::assignJoinGroupId(
@@ -21316,12 +23386,17 @@ SQLHint::Coder::NameTable::NameTable() : entryEnd_(entryList_) {
 	SQL_HINT_CODER_NAME_TABLE_ADD(START_ID);
 	SQL_HINT_CODER_NAME_TABLE_ADD(MAX_DEGREE_OF_PARALLELISM);
 	SQL_HINT_CODER_NAME_TABLE_ADD(MAX_DEGREE_OF_EXPANSION);
+	SQL_HINT_CODER_NAME_TABLE_ADD(MAX_GENERATED_ROWS);
 	SQL_HINT_CODER_NAME_TABLE_ADD(DISTRIBUTED_POLICY);
 	SQL_HINT_CODER_NAME_TABLE_ADD(INDEX_SCAN);
 	SQL_HINT_CODER_NAME_TABLE_ADD(NO_INDEX_SCAN);
 	SQL_HINT_CODER_NAME_TABLE_ADD(INDEX_JOIN);
 	SQL_HINT_CODER_NAME_TABLE_ADD(NO_INDEX_JOIN);
 	SQL_HINT_CODER_NAME_TABLE_ADD(LEADING);
+	SQL_HINT_CODER_NAME_TABLE_ADD(LEGACY_PLAN);
+	SQL_HINT_CODER_NAME_TABLE_ADD(COST_BASED_JOIN);
+	SQL_HINT_CODER_NAME_TABLE_ADD(NO_COST_BASED_JOIN);
+	SQL_HINT_CODER_NAME_TABLE_ADD(OPTIMIZER_FAILURE_POINT);
 	SQL_HINT_CODER_NAME_TABLE_ADD(TABLE_ROW_COUNT);
 #undef SQL_HINT_CODER_NAME_TABLE_ADD
 
@@ -21409,12 +23484,17 @@ const SQLHintInfo::HintTableId SQLHintInfo::START_HINT_TABLEID = 0;
 const SQLHintInfo::HintTableId SQLHintInfo::UNDEF_HINT_TABLEID =
 		std::numeric_limits<SQLHintInfo::HintTableId>::max();
 
-SQLHintInfo::SQLHintInfo(util::StackAllocator &alloc)
-: alloc_(alloc), hintExprMap_(alloc), statisticalHintMap_(alloc),
-  hintTableIdMap_(alloc), joinHintMap_(alloc),
-  tableInfoIdMap_(alloc), scanHintMap_(alloc),
-  joinMethodHintMap_(alloc),
-  reportLevel_(REPORT_WARNING) { 
+SQLHintInfo::SQLHintInfo(util::StackAllocator &alloc) :
+		alloc_(alloc),
+		hintExprMap_(alloc),
+		statisticalHintMap_(alloc),
+		hintTableIdMap_(alloc),
+		joinHintMap_(alloc),
+		tableInfoIdMap_(alloc),
+		scanHintMap_(alloc),
+		joinMethodHintMap_(alloc),
+		symbolHintList_(alloc),
+		reportLevel_(REPORT_WARNING) { 
 }
 
 SQLHintInfo::~SQLHintInfo() {
@@ -21442,31 +23522,13 @@ void SQLHintInfo::parseStatisticalHint(SQLHint::Id hintId, const Expr &hintExpr)
 		assert(hintArg0.qName_ != NULL);
 		const util::String* tableStr = hintArg0.qName_->table_;
 		const util::String* nameStr = hintArg0.qName_->name_;
+		assert(nameStr != NULL);
 		if (tableStr == NULL) {
-			assert(nameStr != NULL);
-			const char8_t *strTop = nameStr->c_str();
-			const size_t strLen = nameStr->size();
-			util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-			SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-			key.first = util::String(nameBuf.data(), strLen, alloc_);
+			key.first = normalizeName(alloc_, nameStr->c_str());
 		}
 		else {
-			{
-				const char8_t *strTop = tableStr->c_str();
-				const size_t strLen = tableStr->size();
-				util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-				SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-
-				key.first = util::String(nameBuf.data(), strLen, alloc_);
-			}
-			{
-				const char8_t *strTop = nameStr->c_str();
-				const size_t strLen = nameStr->size();
-				util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-				SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-
-				key.second = util::String(nameBuf.data(), strLen, alloc_);
-			}
+			key.first = normalizeName(alloc_, tableStr->c_str());
+			key.second = normalizeName(alloc_, nameStr->c_str());
 		}
 	}
 	else {
@@ -21506,30 +23568,11 @@ void SQLHintInfo::parseStatisticalHint(SQLHint::Id hintId, const Expr &hintExpr)
 	}
 }
 
-void SQLHintInfo::applyStatisticalHint(SQLTableInfo &tableInfo) {
-	const util::String &tableName = tableInfo.tableName_;
-	StatisticalHintKey key = std::make_pair(tableName, util::String(alloc_));
-	StatisticalHintMap::iterator hintMapItr = statisticalHintMap_.find(key);
-	if (hintMapItr != statisticalHintMap_.end()) {
-		const util::Vector<SQLHintValue> &hintValueList = hintMapItr->second;
-		util::Vector<SQLHintValue>::const_iterator hintItr = hintValueList.begin();
-		for ( ; hintItr != hintValueList.end(); ++hintItr) {
-			SQLHint::Id hintId = hintItr->getId();
-			switch(hintId) {
-			case SQLHint::TABLE_ROW_COUNT:
-				tableInfo.approxSize_ = static_cast<uint64_t>(hintItr->getInt64());
-				break;
-			default:
-				;
-			}
-		}
-	}
-}
-
 bool SQLHintInfo::checkHintArguments(SQLHint::Id hintId, const Expr &hintExpr) const {
 	switch(hintId) {
 	case SQLHint::MAX_DEGREE_OF_PARALLELISM:
 	case SQLHint::MAX_DEGREE_OF_TASK_INPUT:
+	case SQLHint::MAX_GENERATED_ROWS:
 		{
 			if (!checkArgCount(hintExpr, 1, false) ||
 				!checkArgSQLOpType(hintExpr, SQLType::EXPR_CONSTANT) ||
@@ -21585,7 +23628,7 @@ bool SQLHintInfo::checkHintArguments(SQLHint::Id hintId, const Expr &hintExpr) c
 				return false;
 			}
 			if (hintExpr.next_->size() == 1) {
-				if (!checkLeadingTreeArgmentsType(*hintExpr.next_->at(0))) {
+				if (!checkLeadingTreeArgumentsType(*hintExpr.next_->at(0))) {
 					return false;
 				}
 			}
@@ -21600,6 +23643,36 @@ bool SQLHintInfo::checkHintArguments(SQLHint::Id hintId, const Expr &hintExpr) c
 						return false;
 					}
 				}
+			}
+		}
+		break;
+	case SQLHint::LEGACY_PLAN:
+		{
+			if (!checkArgCount(hintExpr, 2, true) ||
+					!checkArgSQLOpType(hintExpr, SQLType::EXPR_CONSTANT) ||
+					!checkAllArgsValueType(
+							hintExpr, TupleList::TYPE_LONG,
+							0, std::numeric_limits<int32_t>::max())) {
+				return false;
+			}
+		}
+		break;
+	case SQLHint::COST_BASED_JOIN:
+		if (!checkArgCount(hintExpr, 0, false)) {
+			return false;
+		}
+		break;
+	case SQLHint::NO_COST_BASED_JOIN:
+		if (!checkArgCount(hintExpr, 0, false)) {
+			return false;
+		}
+		break;
+	case SQLHint::OPTIMIZER_FAILURE_POINT:
+		{
+			if (!checkArgCount(hintExpr, 2, false) ||
+				!checkArgIsTable(hintExpr, 0, true) ||
+				!checkArgValueType(hintExpr, 1, TupleList::TYPE_LONG, 0, 1)) {
+				return false;
 			}
 		}
 		break;
@@ -21619,9 +23692,7 @@ bool SQLHintInfo::checkHintArguments(SQLHint::Id hintId, const Expr &hintExpr) c
 	return true;
 }
 
-void SQLHintInfo::makeHintMap(
-		const SyntaxTree::ExprList* hintList,
-		SQLTableInfoList &tableInfoList) {
+void SQLHintInfo::makeHintMap(const SyntaxTree::ExprList *hintList) {
 	if (hintList) {
 		SyntaxTree::ExprList::const_iterator itr = hintList->begin();
 		for ( ; itr != hintList->end(); ++itr) {
@@ -21649,8 +23720,12 @@ void SQLHintInfo::makeHintMap(
 						case SQLHint::MAX_DEGREE_OF_PARALLELISM:
 						case SQLHint::MAX_DEGREE_OF_TASK_INPUT:
 						case SQLHint::MAX_DEGREE_OF_EXPANSION:
+						case SQLHint::MAX_GENERATED_ROWS:
 						case SQLHint::DISTRIBUTED_POLICY:
 						case SQLHint::TASK_ASSIGNMENT:
+						case SQLHint::LEGACY_PLAN:
+						case SQLHint::COST_BASED_JOIN:
+						case SQLHint::NO_COST_BASED_JOIN:
 							{
 								util::NormalOStringStream strstrm;
 								strstrm << "Hint(" << hintKey->c_str() <<
@@ -21664,6 +23739,7 @@ void SQLHintInfo::makeHintMap(
 						case SQLHint::INDEX_JOIN:
 						case SQLHint::NO_INDEX_JOIN:
 						case SQLHint::LEADING:
+						case SQLHint::OPTIMIZER_FAILURE_POINT:
 						case SQLHint::TABLE_ROW_COUNT:
 						default:
 							break;
@@ -21676,6 +23752,10 @@ void SQLHintInfo::makeHintMap(
 					if (hintId >= SQLHint::TABLE_ROW_COUNT
 						&& hintId < SQLHint::END_ID) {
 						parseStatisticalHint(hintId, *hintExpr);
+					}
+
+					if (hintId == SQLHint::OPTIMIZER_FAILURE_POINT) {
+						parseSymbolHint(hintId, hintExpr);
 					}
 				}
 				else {
@@ -21698,65 +23778,121 @@ void SQLHintInfo::makeHintMap(
 				++hintMapItr;
 			}
 		}
-		tableInfoList.applyStatisticalHint(*this);
+		checkExclusiveHints(
+				SQLHint::COST_BASED_JOIN, SQLHint::NO_COST_BASED_JOIN);
 	}
 }
 
-void SQLCompiler::makeJoinHintMap(const SQLPreparedPlan &plan) {
+void SQLCompiler::makeJoinHintMap(Plan &plan) {
 	typedef uint32_t HintTableId;
 
 	if (plan.hintInfo_ == NULL) {
 		return;
 	}
+
+	SQLHintInfo *hintInfo = ALLOC_NEW(alloc_) SQLHintInfo(*plan.hintInfo_);
 	HintTableId hintTableId = SQLHintInfo::START_HINT_TABLEID;
 	for (SQLPreparedPlan::NodeList::const_iterator itr = plan.nodeList_.begin();
 			itr != plan.nodeList_.end(); ++itr) {
 		if (itr->qName_ && itr->qName_->table_) {
-			const util::String &origStr = *itr->qName_->table_;
-			const char8_t *strTop = origStr.c_str();
-			const size_t strLen = origStr.size();
-			util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-			SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-			util::String normName = util::String(nameBuf.data(), strLen, alloc_);
+			const SyntaxTree::QualifiedName &qName = *itr->qName_;
+			hintInfo->insertHintTableIdMap(*qName.table_, hintTableId);
 
-			plan.hintInfo_->insertHintTableIdMap(normName, hintTableId);
 			++hintTableId;
 		}
 		if (itr->type_ == SQLType::EXEC_SCAN) {
-			const util::String &origStr =
-					getTableInfoList().resolve(itr->tableIdInfo_.id_).tableName_;
-			const char8_t *strTop = origStr.c_str();
-			const size_t strLen = origStr.size();
-			util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-			SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-			util::String normName = util::String(nameBuf.data(), strLen, alloc_);
+			const SQLTableInfo& tableInfo = getTableInfoList().resolve(itr->tableIdInfo_.id_);
+			hintInfo->insertHintTableIdMap(tableInfo.tableName_, hintTableId);
 
-			plan.hintInfo_->insertHintTableIdMap(normName, hintTableId);
 			++hintTableId;
 
-			plan.hintInfo_->insertTableInfoIdMap(normName, itr->tableIdInfo_.id_);
+			hintInfo->insertTableInfoIdMap(tableInfo.tableName_, itr->tableIdInfo_.id_);
 		}
 	}
-	plan.hintInfo_->makeJoinHintMap(plan);
+	hintInfo->makeJoinHintMap(plan);
+	plan.hintInfo_ = hintInfo;
 }
 
 SQLHintInfo::HintTableId SQLHintInfo::getHintTableId(const util::String& name) const {
-	HintTableIdMap::const_iterator hintTableIdMapItr = hintTableIdMap_.find(name);
+	const util::String &normName = normalizeName(alloc_, name.c_str());
+	HintTableIdMap::const_iterator hintTableIdMapItr = hintTableIdMap_.find(normName);
+
 	if (hintTableIdMapItr == hintTableIdMap_.end()) {
 		return UNDEF_HINT_TABLEID;
 	}
 	else {
-		return hintTableIdMapItr->second;
+		return hintTableIdMapItr->second.id_;
 	}
 }
 
+void SQLHintInfo::parseSymbolHint(SQLHint::Id hintId, const Expr *hintExpr) {
+	assert(hintExpr != NULL);
+
+	ParsedHint parsedHint(alloc_);
+	parsedHint.hintId_ = hintId;
+	parsedHint.hintExpr_ = hintExpr;
+
+	do {
+		const ExprList *exprList = hintExpr->next_;
+		if (exprList == NULL || exprList->empty()) {
+			break;
+		}
+
+		const Expr *argExpr = exprList->front();
+		if (argExpr == NULL) {
+			break;
+		}
+
+		const SyntaxTree::QualifiedName *name = argExpr->qName_;
+		if (name == NULL) {
+			break;
+		}
+
+		util::NameCoderOptions options;
+		options.setCaseSensitive(false);
+
+		size_t pos = 0;
+		const size_t count = SymbolList::SYMBOL_LIST_SIZE;
+		for (; pos < count; pos++) {
+			const util::String *nameElem = (
+					pos == 0 ? name->db_ :
+					(pos == 1 ? name->table_ : name->name_));
+			if (nameElem == NULL) {
+				break;
+			}
+
+			StringConstant str;
+			if (!SQLPreparedPlan::Constants::CONSTANT_CODER(
+					nameElem->c_str(), str, options)) {
+				break;
+			}
+			parsedHint.symbolList_.setValue(pos, str);
+		}
+
+		if (pos != count) {
+			break;
+		}
+		symbolHintList_.push_back(parsedHint);
+		return;
+	}
+	while (false);
+
+	util::String token(alloc_);
+	util::NormalOStringStream strstrm;
+	assert(hintExpr->qName_ && hintExpr->qName_->name_);
+	strstrm << "Invalid symbol argument for hint(" <<
+			hintExpr->qName_->name_->c_str() << ")";
+	getExprToken(*hintExpr, token);
+	if (token.size() > 0) {
+		strstrm << " at or near \"" << token.c_str() << "\"";
+	}
+	reportWarning(strstrm.str().c_str());
+}
+
 SQLHintInfo::HintTableId SQLHintInfo::getHintTableId(const Expr &hintArgExpr) const {
-	const util::String &origStr = *hintArgExpr.qName_->name_;
-	const char8_t *strTop = origStr.c_str();
-	const size_t strLen = origStr.size();
-	util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-	SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-	util::String normName = util::String(nameBuf.data(), strLen, alloc_);
+	assert(hintArgExpr.qName_ && hintArgExpr.qName_->name_);
+	const SyntaxTree::QualifiedName &qName = *hintArgExpr.qName_;
+	const util::String &normName = normalizeName(alloc_, qName.name_->c_str());
 	HintTableIdMap::const_iterator hintTableIdMapItr = hintTableIdMap_.find(normName);
 
 
@@ -21764,17 +23900,20 @@ SQLHintInfo::HintTableId SQLHintInfo::getHintTableId(const Expr &hintArgExpr) co
 		return UNDEF_HINT_TABLEID;
 	}
 	else {
-		return hintTableIdMapItr->second;
+		if (qName.nameCaseSensitive_) {
+			if (strcmp(qName.name_->c_str(), hintTableIdMapItr->second.origName_.c_str()) != 0) {
+				return UNDEF_HINT_TABLEID;
+			}
+		}
+		return hintTableIdMapItr->second.id_;
 	}
 }
 
 SQLHintInfo::HintTableId SQLHintInfo::getTableInfoId(const Expr &hintArgExpr) const {
-	const util::String &origStr = *hintArgExpr.qName_->name_;
-	const char8_t *strTop = origStr.c_str();
-	const size_t strLen = origStr.size();
-	util::XArray<char8_t> nameBuf(strTop, strTop + strLen, alloc_);
-	SQLProcessor::ValueUtils::toUpper(nameBuf.data(), strLen);
-	util::String normName = util::String(nameBuf.data(), strLen, alloc_);
+	assert(hintArgExpr.qName_ && hintArgExpr.qName_->name_);
+	const SyntaxTree::QualifiedName &qName = *hintArgExpr.qName_;
+	const util::String &normName = normalizeName(alloc_, qName.name_->c_str());
+
 	TableInfoIdMap::const_iterator tableInfoIdMapItr = tableInfoIdMap_.find(normName);
 
 
@@ -21782,7 +23921,12 @@ SQLHintInfo::HintTableId SQLHintInfo::getTableInfoId(const Expr &hintArgExpr) co
 		return UNDEF_HINT_TABLEID;
 	}
 	else {
-		return tableInfoIdMapItr->second;
+		if (qName.nameCaseSensitive_) {
+			if (strcmp(qName.name_->c_str(), tableInfoIdMapItr->second.origName_.c_str()) != 0) {
+				return UNDEF_HINT_TABLEID;
+			}
+		}
+		return tableInfoIdMapItr->second.id_;
 	}
 }
 
@@ -21972,15 +24116,17 @@ void SQLHintInfo::setJoinMethodHintMap(
 }
 
 void SQLHintInfo::insertHintTableIdMap(
-		const util::String& name, HintTableId id) {
-	std::pair<HintTableIdMap::iterator, bool> result =
-			hintTableIdMap_.insert(std::make_pair(name, id));
+		const util::String& origName, HintTableId id) {
+	const util::String &normName = normalizeName(alloc_, origName.c_str());
+	HintTableIdMapValue val(id, origName);
+	hintTableIdMap_.insert(std::make_pair(normName, val));
 }
 
 void SQLHintInfo::insertTableInfoIdMap(
-		const util::String& name, TableInfoId id) {
-	std::pair<TableInfoIdMap::iterator, bool> result =
-			tableInfoIdMap_.insert(std::make_pair(name, id));
+		const util::String& origName, TableInfoId id) {
+	const util::String &normName = normalizeName(alloc_, origName.c_str());
+	TableInfoIdMapValue val(id, origName);
+	tableInfoIdMap_.insert(std::make_pair(normName, val));
 }
 
 bool SQLHintInfo::resolveScanHintArg(
@@ -22077,7 +24223,7 @@ void SQLHintInfo::setJoinHintMap(
 }
 
 void SQLHintInfo::makeJoinHintMap(const SQLPreparedPlan &plan) {
-
+	static_cast<void>(plan);
 	for (HintExprMap::iterator hintMapItr = hintExprMap_.begin();
 			hintMapItr != hintExprMap_.end(); ++hintMapItr) {
 		SQLHint::Id hintId = hintMapItr->first;
@@ -22143,6 +24289,15 @@ void SQLHintInfo::makeJoinHintMap(const SQLPreparedPlan &plan) {
 			;
 		}
 	}
+}
+
+bool SQLHintInfo::hasHint(SQLHint::Id id) const {
+	HintExprMap::const_iterator it = hintExprMap_.find(id);
+	if (it == hintExprMap_.end()) {
+		return false;
+	}
+	const SQLHintInfo::HintExprArray *exprList = it->second;
+	return !exprList->empty();
 }
 
 const SQLHintInfo::HintExprArray* SQLHintInfo::getHintList(SQLHint::Id id) const {
@@ -22318,7 +24473,7 @@ bool SQLHintInfo::findJoinHintList(
 		if (*itr != NULL) {
 			HintTableIdMap::const_iterator idMapItr = hintTableIdMap_.find(**itr);
 			if (idMapItr != hintTableIdMap_.end()) {
-				hintTableId = idMapItr->second;
+				hintTableId = idMapItr->second.id_;
 			}
 			else {
 			}
@@ -22383,6 +24538,29 @@ bool SQLHintInfo::findJoinHintList(
 	return hintList.size() > 0;
 }
 
+const SQLHintValue* SQLHintInfo::findStatisticalHint(
+		SQLHint::Id hintId, const char8_t *tableName) const {
+	assert(tableName != NULL);
+	StatisticalHintKey key(
+			normalizeName(alloc_, tableName), util::String(alloc_));
+
+	StatisticalHintMap::const_iterator mapIt = statisticalHintMap_.find(key);
+	if (mapIt == statisticalHintMap_.end()) {
+		return NULL;
+	}
+
+	const util::Vector<SQLHintValue> &values = mapIt->second;
+	for (util::Vector<SQLHintValue>::const_iterator it = values.begin();
+			it != values.end(); ++it) {
+		if (it->getId() != hintId) {
+			continue;
+		}
+		return &(*it);
+	}
+
+	return NULL;
+}
+
 bool SQLHintInfo::findScanHint(const TableInfoId tableInfoId, const SimpleHint* &scanHint) const {
 	scanHint = NULL;
 	ScanHintMap::const_iterator itr = scanHintMap_.find(tableInfoId);
@@ -22440,6 +24618,11 @@ bool SQLHintInfo::findJoinMethodHint(
 	return (hint != NULL);
 }
 
+const util::Vector<SQLHintInfo::ParsedHint>&
+SQLHintInfo::getSymbolHintList() const {
+	return symbolHintList_;
+}
+
 void SQLHintInfo::dumpList(std::ostream &os, const HintTableIdList &target) const {
 	os << "{";
 	HintTableIdList::const_iterator itr = target.begin();
@@ -22466,6 +24649,21 @@ void SQLHintInfo::getExprToken(const Expr &expr, util::String &exprToken) const 
 			exprTokenLen = expr.startToken_.size_;
 			exprToken = util::String(expr.startToken_.value_, exprTokenLen, alloc_);
 		}
+	}
+}
+
+void SQLHintInfo::checkExclusiveHints(
+		SQLHint::Id hintId1, SQLHint::Id hintId2) const {
+	const SQLHintInfo::HintExprArray *list1 = getHintList(hintId1);
+	const SQLHintInfo::HintExprArray *list2 = getHintList(hintId2);
+	if ((list1 != NULL && !list1->empty()) &&
+			(list2 != NULL && !list2->empty())) {
+		const util::String *name1 = list1->front()->qName_->name_;
+		const util::String *name2 = list2->front()->qName_->name_;
+		util::NormalOStringStream strstrm;
+		strstrm << "Hint(" << *name1 << ") and hint(" << *name2 << ") "
+				"can not specified both";
+		reportWarning(strstrm.str().c_str());
 	}
 }
 
@@ -22547,8 +24745,8 @@ bool SQLHintInfo::checkArgSQLOpType(
 }
 
 bool SQLHintInfo::checkAllArgsValueType(
-		const Expr &hintExpr,
-		TupleList::TupleColumnType valueType, int64_t minValue) const {
+		const Expr &hintExpr, TupleList::TupleColumnType valueType,
+		int64_t minValue, int64_t maxValue) const {
 	util::String token(alloc_);
 	if (hintExpr.op_ != SQLType::EXPR_LIST) {
 		assert(hintExpr.qName_ && hintExpr.qName_->name_);
@@ -22565,7 +24763,7 @@ bool SQLHintInfo::checkAllArgsValueType(
 	assert(hintExpr.next_);
 	const ExprList &hintArgList = *(hintExpr.next_);
 	for (size_t pos = 0; pos < hintArgList.size(); ++pos) {
-		if (!checkArgValueType(hintExpr, pos, valueType, minValue)) {
+		if (!checkArgValueType(hintExpr, pos, valueType, minValue, maxValue)) {
 			return false;
 		}
 	}
@@ -22573,8 +24771,8 @@ bool SQLHintInfo::checkAllArgsValueType(
 }
 
 bool SQLHintInfo::checkArgValueType(
-		const Expr &hintExpr, size_t pos,
-		TupleList::TupleColumnType valueType, int64_t minValue) const {
+		const Expr &hintExpr, size_t pos, TupleList::TupleColumnType valueType,
+		int64_t minValue, int64_t maxValue) const {
 	util::String token(alloc_);
 	if (hintExpr.op_ != SQLType::EXPR_LIST) {
 		assert(hintExpr.qName_ && hintExpr.qName_->name_);
@@ -22593,27 +24791,19 @@ bool SQLHintInfo::checkArgValueType(
 	if (hintArg.op_ == SQLType::EXPR_CONSTANT) {
 		switch(valueType) {
 		case TupleList::TYPE_LONG:
-			if (hintArg.value_.getType() == TupleList::TYPE_LONG) {
-				if (minValue != std::numeric_limits<int64_t>::min()) {
-					if (hintArg.value_.get<int64_t>() >= minValue) {
-						return true;
-					}
-				}
-				else {
-					return true;
-				}
+			if (hintArg.value_.getType() == TupleList::TYPE_LONG &&
+					checkValueRange(
+							hintArg.value_.get<int64_t>(),
+							minValue, maxValue)) {
+				return true;
 			}
 			break;
 		case TupleList::TYPE_DOUBLE:
-			if (hintArg.value_.getType() == TupleList::TYPE_DOUBLE) {
-				if (minValue != std::numeric_limits<int64_t>::min()) {
-					if (hintArg.value_.get<double>() >= minValue) {
-						return true;
-					}
-				}
-				else {
-					return true;
-				}
+			if (hintArg.value_.getType() == TupleList::TYPE_DOUBLE &&
+					checkValueRange(
+							static_cast<int64_t>(hintArg.value_.get<double>()),
+							minValue, maxValue)) {
+				return true;
 			}
 			break;
 		case TupleList::TYPE_STRING:
@@ -22652,16 +24842,34 @@ bool SQLHintInfo::checkArgValueType(
 	}
 }
 
+bool SQLHintInfo::checkValueRange(
+		int64_t value, int64_t min, int64_t max) const {
+	if (min != std::numeric_limits<int64_t>::min()) {
+		if (!(value >= min)) {
+			return false;
+		}
+	}
+
+	if (max != std::numeric_limits<int64_t>::max()) {
+		if (!(value <= max)) {
+			return false;
+		}
+	}
+
+	return true;
+}
+
 bool SQLHintInfo::checkArgIsTable(
-		const Expr &hintExpr, size_t pos) const
+		const Expr &hintExpr, size_t pos, bool forSymbol) const
 {
+	const char8_t *category = (forSymbol ? "symbol" : "table");
 	util::String token(alloc_);
 	assert(hintExpr.op_ == SQLType::EXPR_LIST);
 	const Expr &hintArgExpr = *hintExpr.next_->at(pos);
 	if (hintArgExpr.op_ != SQLType::EXPR_COLUMN) {
 		util::NormalOStringStream strstrm;
 		assert(hintExpr.qName_ && hintExpr.qName_->name_);
-		strstrm << "Invalid argument type for hint(" <<
+		strstrm << "Invalid " << category << " type of argument for hint(" <<
 				hintExpr.qName_->name_->c_str() << ")";
 		getExprToken(hintExpr, token);
 		if (token.size() > 0) {
@@ -22671,12 +24879,13 @@ bool SQLHintInfo::checkArgIsTable(
 		return false;
 	}
 	if ((hintArgExpr.qName_ == NULL) ||
-			(hintArgExpr.qName_->db_ != NULL) ||
-			(hintArgExpr.qName_->table_ != NULL) ||
+			(!forSymbol &&
+					((hintArgExpr.qName_->db_ != NULL) ||
+					(hintArgExpr.qName_->table_ != NULL))) ||
 			(hintArgExpr.qName_->name_ == NULL)) {
 		util::NormalOStringStream strstrm;
 		assert(hintExpr.qName_ && hintExpr.qName_->name_);
-		strstrm << "Invalid argument for hint(" <<
+		strstrm << "Invalid " << category << " name of argument for hint(" <<
 				hintExpr.qName_->name_->c_str() << ")";
 		getExprToken(hintExpr, token);
 		if (token.size() > 0) {
@@ -22688,7 +24897,7 @@ bool SQLHintInfo::checkArgIsTable(
 	return true;
 }
 
-bool SQLHintInfo::checkLeadingTreeArgmentsType(const Expr &expr) const {
+bool SQLHintInfo::checkLeadingTreeArgumentsType(const Expr &expr) const {
 	util::String token(alloc_);
 	if (expr.op_ == SQLType::EXPR_LIST) {
 		assert(expr.next_);
@@ -22704,7 +24913,7 @@ bool SQLHintInfo::checkLeadingTreeArgmentsType(const Expr &expr) const {
 		}
 		for (size_t pos = 0; pos < expr.next_->size(); ++pos) {
 			if (expr.next_->at(pos)->op_ == SQLType::EXPR_LIST) {
-				if (!checkLeadingTreeArgmentsType(*expr.next_->at(pos))) {
+				if (!checkLeadingTreeArgumentsType(*expr.next_->at(pos))) {
 					return false;
 				}
 			}
@@ -22749,6 +24958,20 @@ bool SQLHintInfo::checkLeadingTreeArgmentsType(const Expr &expr) const {
 	}
 }
 
+SQLHintInfo::SymbolElement::SymbolElement() :
+		value_(SQLPreparedPlan::Constants::END_STR) {
+}
+
+void SQLHintInfo::SymbolList::setValue(size_t pos, StringConstant value) {
+	elems_[pos].value_ = value;
+}
+
+SQLHintInfo::StringConstant SQLHintInfo::SymbolList::getValue(
+		size_t pos) const {
+	assert(pos < SYMBOL_LIST_SIZE);
+	return elems_[pos].value_;
+}
+
 SQLHintInfo::ParsedHint& SQLHintInfo::ParsedHint::operator=(
 		const SQLHintInfo::ParsedHint &another) {
 	hintId_ = another.hintId_;
@@ -22758,10 +24981,68 @@ SQLHintInfo::ParsedHint& SQLHintInfo::ParsedHint::operator=(
 	return *this;
 }
 
-void SQLTableInfo::setPartitionCount(uint32_t partitionCount) {
-	if (partitioning_) {
-		partitioning_->clusterPartitionCount_ = partitionCount;
-	}
+SQLHintInfo::HintTableIdMapValue::HintTableIdMapValue(
+		SQLHintInfo::HintTableId id, const util::String &origName)
+: origName_(origName), id_(id) {
 }
 
+SQLHintInfo::TableInfoIdMapValue::TableInfoIdMapValue(
+		SQLHintInfo::TableInfoId id, const util::String &origName)
+: origName_(origName), id_(id) {
+}
 
+void SQLCompiler::dumpExprList(const PlanExprList &list) {
+	for (size_t i = 0; i < list.size(); ++i) {
+		const Expr &expr = list[i];
+		std::cout << "(" << i << "," << expr.srcId_;
+		if (expr.qName_ && expr.qName_->name_) {
+			std::cout << "," << "name:" << expr.qName_->name_->c_str();
+		}
+		if (expr.aliasName_) {
+			std::cout << "," << "alias:" << expr.aliasName_->c_str();
+		}
+		std::cout << "),";
+	}
+	std::cout << std::endl;
+}
+
+SQLCompiler::CompilerInitializer::CompilerInitializer(
+		const CompileOption *option) :
+		baseOption_(option) {
+}
+
+SQLCompiler::CompilerInitializer::operator bool() {
+	assert(baseOption_ != &InitializerConstants::INVALID_OPTION);
+	return (CompileOption::findBaseCompiler(baseOption_, *this) != NULL);
+}
+
+const SQLCompiler* SQLCompiler::CompilerInitializer::operator->() {
+	assert(baseOption_ != &InitializerConstants::INVALID_OPTION);
+	return CompileOption::findBaseCompiler(baseOption_, *this);
+}
+
+SQLCompiler::ProfilerManager&
+SQLCompiler::CompilerInitializer::profilerManager() {
+	return ProfilerManager::getInstance();
+}
+
+void SQLCompiler::CompilerInitializer::close() {
+	assert(baseOption_ != &InitializerConstants::INVALID_OPTION);
+	baseOption_ = &InitializerConstants::INVALID_OPTION;
+}
+
+SQLCompiler::CompilerInitializer::End::End(CompilerInitializer &init) {
+	init.close();
+}
+
+SQLCompiler::CompileOption
+SQLCompiler::CompilerInitializer::InitializerConstants::INVALID_OPTION;
+
+SQLCompiler::CompilerSource::CompilerSource(const SQLCompiler *baseCompiler) :
+		baseCompiler_(baseCompiler) {
+}
+
+const SQLCompiler* SQLCompiler::CompilerSource::findBaseCompiler(
+		const CompilerSource *src) {
+	return (src == NULL ? NULL : src->baseCompiler_);
+}

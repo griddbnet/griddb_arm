@@ -14,6 +14,10 @@
 	You should have received a copy of the GNU Affero General Public License
 	along with this program.  If not, see <http://www.gnu.org/licenses/>.
 */
+/*!
+ * @file sql_parser.h
+ * @brief SQLパーサ関連クラスの定義
+ */
 
 #ifndef SQL_PARSER_H_
 #define SQL_PARSER_H_
@@ -34,7 +38,7 @@ typedef util::VariableSizeAllocator<> SQLVarSizeAllocator;
 
 class SQLExecution;
 struct SQLExpandViewContext;
-class SQLConnectionEnvironment ;
+class SQLConnectionControl;
 class SQLParserContext;
 struct OptionParam;
 
@@ -49,6 +53,8 @@ struct DDLWithParameter {
 		EXPIRATION_TYPE,
 		DATA_AFFINITY,
 		DATA_AFFINITY_POLICY,
+		INTERVAL_WORKER_GROUP,
+		INTERVAL_WORKER_GROUP_POSITION,
 		END_ID
 	};
 };
@@ -90,6 +96,7 @@ public:
 	struct TableColumn;
 	struct PartitioningOption;
 	struct ColumnInfo;
+	struct TypeInfo;
 	struct WindowOption;
 
 	typedef TupleList::TupleColumnType ColumnType;
@@ -153,37 +160,67 @@ public:
 		int32_t ifNotExist, CreateIndexOption *usingOption);
 
 	static TableColumn* makeCreateTableColumn(
-		SQLAllocator &alloc, SQLToken *name, SQLToken *type,
+		SQLAllocator &alloc, SQLToken *name, TupleList::TupleColumnType type,
+		SyntaxTree::ColumnInfo *colInfo);
+	static TableColumn* makeCreateTableColumn(
+		SQLAllocator &alloc, SQLToken *name,
 		SyntaxTree::ColumnInfo *colInfo);
 
-	static TupleList::TupleColumnType toColumnType(const char8_t *name);
+	static ExprList* makeRangeGroupOption(
+			SQLAllocator &alloc, SyntaxTree::Expr *baseKey,
+			SyntaxTree::Expr *fillExpr, int64_t interval, int64_t intervalUnit,
+			int64_t offset, int64_t timeZone, bool withTimeZone);
+
+	static bool resolveRangeGroupOffset(
+			const SQLToken &token, int64_t &offset);
+	static bool resolveRangeGroupTimeZone(
+			SQLAllocator &alloc, const SQLToken &token, int64_t &timeZone);
+
+	static TupleList::TupleColumnType toColumnType(
+			SQLAllocator &alloc, const SQLToken &type, const int64_t *num1,
+			const int64_t *num2);
+	static TupleList::TupleColumnType toColumnType(
+			const char8_t *name, const int64_t *num1,const int64_t *num2);
 	static TupleList::TupleColumnType determineType(const char *zIn);
+
+	static bool checkPartitioningIntervalTimeField(
+			util::DateTime::FieldType type);
+	static bool checkGroupIntervalTimeField(util::DateTime::FieldType type);
+
 	static int32_t gsDequote(SQLAllocator &alloc, util::String &str);
 	static void tokenToString(SQLAllocator &alloc, const SQLToken &token,
 			bool dequote, util::String* &out, bool &isQuoted);
 	static util::String* tokenToString(
 			SQLAllocator &alloc, const SQLToken &token, bool dequote);
 
+	static bool toSignedValue(
+			const SQLToken &token, bool minus, int64_t &value);
+
 	static void countLineAndColumnFromToken(
-		const char* srcSqlStr, const SQLToken &token, size_t &line, size_t &column);
+			const char* srcSqlStr, const SQLToken &token, size_t &line, size_t &column);
 
 	static void countLineAndColumn(
-		const char* srcSqlStr, const Expr* expr, size_t &line, size_t &column);
+			const char* srcSqlStr, const Expr* expr, size_t &line, size_t &column);
 
+	static Expr* makeConst(SQLAllocator& alloc, const TupleValue &value);
+
+	static TupleValue makeNanoTimestampValue(
+			SQLAllocator& alloc, const NanoTimestamp &ts);
 	static TupleValue makeStringValue(
-		SQLAllocator& alloc, const char* str, size_t strLen);
+			SQLAllocator& alloc, const char* str, size_t strLen);
 
 	static TupleValue makeBlobValue(
-		TupleValue::VarContext& cxt, const void* src, size_t byteLen);
+			TupleValue::VarContext& cxt, const void* src, size_t byteLen);
 
 	static void calcPositionInfo(const char *top, const char *cursor,
-		int32_t &line, int32_t &charPos);
+			int32_t &line, int32_t &charPos);
 
 	enum SQLCommandType {
 		COMMAND_SELECT,
 		COMMAND_DML,
 		COMMAND_DDL,
-		COMMAND_NONE
+		COMMAND_NONE,
+		COMMAND_DCL
 	};
 
 	enum CommandType {
@@ -201,10 +238,12 @@ public:
 		CMD_DROP_INDEX,
 		CMD_ALTER_TABLE_DROP_PARTITION,   
 		CMD_ALTER_TABLE_ADD_COLUMN,       
+		CMD_ALTER_TABLE_RENAME_COLUMN,    
 		CMD_CREATE_VIEW,  
 		CMD_DROP_VIEW,    
 
 		CMD_CREATE_USER,
+		CMD_CREATE_ROLE, 
 		CMD_DROP_USER,
 		CMD_SET_PASSWORD,
 		CMD_GRANT,
@@ -266,7 +305,7 @@ public:
 	}
 
 	template<typename T>
-	static bool isInlcludeHashPartitioningType(T typeVal) {
+	static bool isIncludeHashPartitioningType(T typeVal) {
 		TablePartitionType type = static_cast<TablePartitionType>(typeVal);
 		return (type == TABLE_PARTITION_TYPE_HASH
 				|| type ==TABLE_PARTITION_TYPE_RANGE_HASH);
@@ -303,7 +342,8 @@ public:
 
 		UTIL_OBJECT_CODER_ALLOC_CONSTRUCTOR;
 		UTIL_OBJECT_CODER_MEMBERS(
-				nsId_, db_, table_, name_,
+				UTIL_OBJECT_CODER_OPTIONAL(nsId_, 0),
+				db_, table_, name_,
 				UTIL_OBJECT_CODER_OPTIONAL(dbCaseSensitive_, false),
 				UTIL_OBJECT_CODER_OPTIONAL(tableCaseSensitive_, false),
 				UTIL_OBJECT_CODER_OPTIONAL(nameCaseSensitive_, false));
@@ -329,6 +369,10 @@ public:
 		bool isDDL();
 		int32_t calcCommandType();
 		CommandType getCommandType();
+		bool isDropOnlyCommand();
+
+		const char* dumpCommandType();
+		int32_t dumpCategoryType();
 
 		SQLAllocator& alloc_;
 		CommandType cmdType_; 
@@ -576,10 +620,10 @@ public:
 		bool isVirtual_;
 		bool isTimeSeries_;
 
-		bool isPartitioning() {
+		bool isPartitioning() const {
 			return (partitionType_ != TABLE_PARTITION_TYPE_UNDEF);
 		}
-		bool isTimeSeries() {
+		bool isTimeSeries() const {
 			return isTimeSeries_;
 		}
 
@@ -611,14 +655,46 @@ public:
 	};
 };
 
+class SQLPlanningVersion {
+public:
+	SQLPlanningVersion();
+	SQLPlanningVersion(int32_t major, int32_t minor);
+
+	bool isEmpty() const;
+
+	int32_t getMajor() const;
+	int32_t getMinor() const;
+
+	void parse(const char8_t *str);
+
+	int32_t compareTo(int32_t major, int32_t minor) const;
+	int32_t compareTo(const SQLPlanningVersion &another) const;
+
+private:
+	int32_t major_;
+	int32_t minor_;
+};
+
 namespace lemon_SQLParser{ class SQLParser; };
 
 
+/*!
+	@brief 解析情報
+*/
 struct SQLParsedInfo {
 	typedef SyntaxTree::Expr Expr;
 
+	/*!
+		@brief バインド情報
+		@note prepare時に生成、bind時にBindInfoSetと対応してpPlanをiPlanに変更する
+	*/
 	struct BindInfo {
 
+	/*!
+		@brief コンストラクタ
+		@param [in] varName 変数名
+		@param [in] Expr エクスプレッション
+	*/
 		BindInfo(util::String &varName, Expr *bindExpr) :
 				varName_(varName), bindExpr_(bindExpr) {}
 
@@ -626,6 +702,10 @@ struct SQLParsedInfo {
 		Expr *bindExpr_;
 	};
 
+	/*!
+		@brief コンストラクタ
+		@param [in] alloc アロケータ
+	*/
 	SQLParsedInfo(util::StackAllocator &alloc) : alloc_(alloc),
 			syntaxTreeList_(alloc), tableList_(alloc), bindList_(alloc),
 			inputSql_(NULL),
@@ -633,8 +713,14 @@ struct SQLParsedInfo {
 			pragmaType_(SQLPragma::PRAGMA_NONE), pragmaValue_(NULL),
 			createForceView_(false)
 			{}
+	/*!
+		@brief デストラクタ
+	*/
 	~SQLParsedInfo() {}
 
+	/*!
+		@brief 解析済みコマンド数の取得
+	*/
 	int32_t getCommandNum() {
 		return static_cast<int32_t>(syntaxTreeList_.size());
 	}
@@ -663,6 +749,9 @@ struct SQLParsedInfo {
 };
 
 
+/*!
+ * @brief SQLParserContext object
+ */
 struct SQLTableInfo;
 class SQLTableInfoList;
 class SQLParserContext {

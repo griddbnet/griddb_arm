@@ -26,7 +26,7 @@
 #include "data_store_common.h"
 #include "data_type.h"
 #include "gs_error.h"
-#include "object_manager.h"
+#include "object_manager_v4.h"
 #include <math.h>
 #include <vector>
 
@@ -44,20 +44,22 @@ class BaseObject;
 */
 class ValueProcessor {
 public:
+	template<typename T> class RawTimestampFormatter;
+
 	static int32_t compare(TransactionContext &txn,
-		ObjectManager &objectManager, ColumnId columnId,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, ColumnId columnId,
 		MessageRowStore *messageRowStore, uint8_t *objectRowField);
 
 	static int32_t compare(TransactionContext &txn,
-		ObjectManager &objectManager, ColumnType type,
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, ColumnType type,
 		uint8_t *srcObjectRowField, uint8_t *targetObjectRowField);
 
-	static void getField(TransactionContext &txn, ObjectManager &objectManager,
-		ColumnId columnId, const Value *objectValue,
+	static void getField(TransactionContext &txn, ObjectManagerV4 &objectManager,
+		AllocateStrategy& strategy, ColumnId columnId, const Value *objectValue,
 		MessageRowStore *outputMessageRowStore);
 
-	static void getField(TransactionContext &txn, ObjectManager &objectManager,
-		ColumnId columnId, uint32_t recordNth, Value *objectValue,
+	static void getField(TransactionContext &txn, ObjectManagerV4 &objectManager,
+		AllocateStrategy& strategy, ColumnId columnId, uint32_t recordNth, Value *objectValue,
 		MessageRowStore *outputMessageRowStore);  
 
 	/*
@@ -269,21 +271,6 @@ public:
 	}
 
 	/*!
-		@brief Validate Column type for array type
-	*/
-	static bool isValidArrayAndType(bool isArray, ColumnType type) {
-		if (isArray && (type <= COLUMN_TYPE_TIMESTAMP)) {
-			return true;
-		}
-		else if (!isArray && (type < COLUMN_TYPE_OID)) {
-			return true;
-		}
-		else {
-			return false;
-		}
-	}
-
-	/*!
 		@brief Validate Row key type
 	*/
 	static bool validateRowKeyType(bool isArray, ColumnType type) {
@@ -294,6 +281,8 @@ public:
 			case COLUMN_TYPE_INT:
 			case COLUMN_TYPE_LONG:
 			case COLUMN_TYPE_TIMESTAMP:
+			case COLUMN_TYPE_MICRO_TIMESTAMP:
+			case COLUMN_TYPE_NANO_TIMESTAMP:
 				isValid = true;
 				break;
 			default:
@@ -304,41 +293,47 @@ public:
 	}
 
 	/*!
-		@brief Validate Column type except for array typte
-	*/
-	static bool isValidColumnType(int8_t type) {
-		return (type >= COLUMN_TYPE_STRING && type <= COLUMN_TYPE_BLOB);
-	}
-	/*!
 		@brief Check if Column type is simple (except variable type)
 	*/
 	static bool isSimple(ColumnType type) {
-		return (type >= COLUMN_TYPE_BOOL && type <= COLUMN_TYPE_TIMESTAMP);
+		return (type >= COLUMN_TYPE_SIMPLE_BEGIN1 &&
+				type <= COLUMN_TYPE_SIMPLE_TAIL1) ||
+				(type >= COLUMN_TYPE_SIMPLE_BEGIN2 &&
+				type <= COLUMN_TYPE_SIMPLE_TAIL2);
 	}
 	/*!
 		@brief Check if Column type is numerical
 	*/
 	static bool isNumerical(ColumnType type) {
-		return (type >= COLUMN_TYPE_BYTE && type <= COLUMN_TYPE_DOUBLE);
+		return (type >= COLUMN_TYPE_NUMERIC_BEGIN &&
+				type <= COLUMN_TYPE_NUMERIC_TAIL);
 	}
 	/*!
 		@brief Check if Column type is integer(byte, short, int, long)
 	*/
 	static bool isInteger(ColumnType type) {
-		return (type >= COLUMN_TYPE_BYTE && type <= COLUMN_TYPE_LONG);
+		return (type >= COLUMN_TYPE_INTEGRAL_BEGIN &&
+				type <= COLUMN_TYPE_INTEGRAL_TAIL);
 	}
 	/*!
 		@brief Check if Column type is floating-point(float, double)
 	*/
 	static bool isFloat(ColumnType type) {
-		return (type >= COLUMN_TYPE_FLOAT && type <= COLUMN_TYPE_DOUBLE);
+		return (type >= COLUMN_TYPE_FLOATING_BEGIN &&
+				type <= COLUMN_TYPE_FLOATING_TAIL);
 	}
 	/*!
 		@brief Check if Column type is array
 	*/
 	static bool isArray(ColumnType type) {
-		return (type >= COLUMN_TYPE_STRING_ARRAY &&
-				type <= COLUMN_TYPE_TIMESTAMP_ARRAY);
+		return (type >= COLUMN_TYPE_ARRAY_BEGIN &&
+				type <= COLUMN_TYPE_ARRAY_TAIL);
+	}
+
+	static bool isVariable(ColumnType type) {
+		return (type <= COLUMN_TYPE_PRIMITIVE_TAIL1 &&
+				!(type >= COLUMN_TYPE_SIMPLE_BEGIN1 &&
+				type <= COLUMN_TYPE_SIMPLE_TAIL1)) || isArray(type);
 	}
 
 	/*!
@@ -347,17 +342,111 @@ public:
 	static bool isNestStructure(ColumnType type) {
 		return (type == COLUMN_TYPE_BLOB || type == COLUMN_TYPE_STRING_ARRAY);
 	}
+
+	/*!
+		@brief Check if Column type is timestamp family(milli, micro, nano)
+	*/
+	static bool isTimestampFamily(ColumnType type) {
+		return (type == COLUMN_TYPE_TIMESTAMP ||
+				type == COLUMN_TYPE_MICRO_TIMESTAMP ||
+				type == COLUMN_TYPE_NANO_TIMESTAMP);
+	}
+
+	static SchemaFeatureLevel getSchemaFeatureLevel(ColumnType type) {
+		if (type >= COLUMN_TYPE_PRIMITIVE_BEGIN2 &&
+				type <= COLUMN_TYPE_TOTAL_TAIL) {
+			return 2;
+		}
+		return 1;
+	}
+
 	/*!
 		@brief Get element Column type from Array Column type
 	*/
-	static ColumnType getSimpleColumnType(ColumnType type) {
+	static ColumnType getArrayElementType(ColumnType type) {
 		if (isArray(type)) {
-			return static_cast<ColumnType>(type - COLUMN_TYPE_OID - 1);
+			return static_cast<ColumnType>(type - COLUMN_TYPE_ARRAY_BEGIN);
 		}
 		else {
 			return type;
 		}
 	}
+
+	static bool findArrayTypeByElement(
+			ColumnType type, ColumnType &outType) {
+		if (type > COLUMN_TYPE_SIMPLE_TAIL1) {
+			outType = COLUMN_TYPE_ANY;
+			return false;
+		}
+		else {
+			outType = static_cast<ColumnType>(type + COLUMN_TYPE_ARRAY_BEGIN);
+			return true;
+		}
+	}
+
+	static int8_t getPrimitiveColumnTypeOrdinal(
+			ColumnType type, bool withAny) {
+		int8_t ordinal;
+		if (!findPrimitiveColumnTypeOrdinal(type, withAny, ordinal)) {
+			assert(false);
+		}
+		return ordinal;
+	}
+
+	static bool findPrimitiveColumnTypeOrdinal(
+			ColumnType type, bool withAny, int8_t &ordinal) {
+		if (type > COLUMN_TYPE_PRIMITIVE_TAIL1) {
+			if (isArray(type)) {
+				ordinal = static_cast<int8_t>(type - COLUMN_TYPE_ARRAY_BEGIN);
+				return true;
+			}
+			else if (type < COLUMN_TYPE_PRIMITIVE_BEGIN2 ||
+					type > COLUMN_TYPE_PRIMITIVE_TAIL2) {
+				ordinal = static_cast<int8_t>(COLUMN_TYPE_ANY);
+				if (withAny && type == COLUMN_TYPE_ANY) {
+					return true;
+				}
+				return false;
+			}
+			ordinal = static_cast<int8_t>(type - COLUMN_TYPE_PRIMITIVE_BEGIN2 +
+					COLUMN_TYPE_PRIMITIVE_TAIL1 + 1);
+			return true;
+		}
+		ordinal = static_cast<int8_t>(type);
+		return true;
+	}
+
+	static bool findColumnTypeByPrimitiveOrdinal(
+			int8_t ordinal, bool forArray, bool withAny, ColumnType &outType) {
+
+		ColumnType elemType;
+		if (withAny && ordinal == static_cast<int8_t>(COLUMN_TYPE_ANY)) {
+			elemType = COLUMN_TYPE_ANY;
+		}
+		else if (ordinal < 0 || static_cast<ColumnType>(ordinal) >=
+				COLUMN_TYPE_PRIMITIVE_COUNT) {
+			outType = COLUMN_TYPE_ANY;
+			return false;
+		}
+		else if (static_cast<ColumnType>(ordinal) > COLUMN_TYPE_PRIMITIVE_TAIL1) {
+			elemType = static_cast<ColumnType>(
+					static_cast<ColumnType>(ordinal) -
+					COLUMN_TYPE_PRIMITIVE_TAIL1 - 1 +
+					COLUMN_TYPE_PRIMITIVE_BEGIN2);
+		}
+		else {
+			elemType = static_cast<ColumnType>(ordinal);
+		}
+
+		if (forArray) {
+			return findArrayTypeByElement(elemType, outType);
+		}
+		else {
+			outType = elemType;
+			return true;
+		}
+	}
+
 	/*!
 		@brief Cast boolean value
 	*/
@@ -542,23 +631,219 @@ public:
 		@brief Cast Timestamp value
 	*/
 	static Timestamp getTimestamp(ColumnType type, const void *field) {
-		if (type == COLUMN_TYPE_TIMESTAMP) {
-			return (*static_cast<const Timestamp *>(field));
-		}
-		else {
-			GS_THROW_SYSTEM_ERROR(GS_ERROR_DS_TYPE_INVALID, "");
+		switch (type) {
+		case COLUMN_TYPE_TIMESTAMP:
+			return *static_cast<const Timestamp*>(field);
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+			return getTimestamp(*static_cast<const MicroTimestamp*>(field));
+		case COLUMN_TYPE_NANO_TIMESTAMP:
+			return getTimestamp(*static_cast<const NanoTimestamp*>(field));
+		default:
+			return errorTimestampType();
 		}
 	}
 
+	static Timestamp getTimestamp(const MicroTimestamp &src) {
+		return src.value_ / 1000;
+	}
+
+	static Timestamp getTimestamp(const NanoTimestamp &src) {
+		const int64_t unit = NanoTimestamp::HIGH_MICRO_UNIT;
+		return src.getHigh() / (1000 * unit);
+	}
+
+	static Timestamp getTimestamp(const util::DateTime &src) {
+		return src.getUnixTime();
+	}
+
+	static MicroTimestamp getMicroTimestamp(ColumnType type, const void *field) {
+		switch (type) {
+		case COLUMN_TYPE_TIMESTAMP:
+			return getMicroTimestamp(*static_cast<const Timestamp*>(field));
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+			return*static_cast<const MicroTimestamp*>(field);
+		case COLUMN_TYPE_NANO_TIMESTAMP:
+			return getMicroTimestamp(*static_cast<const NanoTimestamp*>(field));
+		default:
+			return errorMicroTimestampType();
+		}
+	}
+
+	static MicroTimestamp getMicroTimestamp(const Timestamp &src) {
+		MicroTimestamp dest;
+		dest.value_ = src * 1000;
+		return dest;
+	}
+
+	static MicroTimestamp getMicroTimestamp(const NanoTimestamp &src) {
+		const int64_t unit = NanoTimestamp::HIGH_MICRO_UNIT;
+		MicroTimestamp dest;
+		dest.value_ = src.getHigh() / unit;
+		return dest;
+	}
+
+	static MicroTimestamp getMicroTimestamp(const util::PreciseDateTime &src) {
+		MicroTimestamp dest;
+		dest.value_ =
+				src.getBase().getUnixTime() * 1000 +
+				src.getNanoSeconds() / 1000;
+		return dest;
+	}
+
+	static NanoTimestamp getNanoTimestamp(ColumnType type, const void *field) {
+		switch (type) {
+		case COLUMN_TYPE_TIMESTAMP:
+			return getNanoTimestamp(*static_cast<const Timestamp*>(field));
+		case COLUMN_TYPE_MICRO_TIMESTAMP:
+			return getNanoTimestamp(*static_cast<const MicroTimestamp*>(field));
+		case COLUMN_TYPE_NANO_TIMESTAMP:
+			return *static_cast<const NanoTimestamp*>(field);
+		default:
+			return errorNanoTimestampType();
+		}
+	}
+
+	static NanoTimestamp getNanoTimestamp(const Timestamp &src) {
+		const int64_t unit = NanoTimestamp::HIGH_MICRO_UNIT;
+		NanoTimestamp dest;
+		dest.assign(src * (1000 * unit), 0);
+		return dest;
+	}
+
+	static NanoTimestamp getNanoTimestamp(const MicroTimestamp &src) {
+		const int64_t unit = NanoTimestamp::HIGH_MICRO_UNIT;
+		NanoTimestamp dest;
+		dest.assign(src.value_ * unit, 0);
+		return dest;
+	}
+
+	static NanoTimestamp getNanoTimestamp(const util::PreciseDateTime &src) {
+		const int64_t unit = NanoTimestamp::HIGH_MICRO_UNIT;
+		const int64_t revUnit = 1000 / unit;
+		const int64_t base = src.getBase().getUnixTime();
+		const int64_t nanos = static_cast<int64_t>(src.getNanoSeconds());
+		NanoTimestamp dest;
+		dest.assign(
+				base * (1000 * unit) + nanos / revUnit,
+				static_cast<uint8_t>(nanos % revUnit));
+		return dest;
+	}
+
+	static util::DateTime toDateTime(const Timestamp &src) {
+		return util::DateTime(src);
+	}
+
+	static util::PreciseDateTime toDateTime(const MicroTimestamp &src) {
+		return util::PreciseDateTime::ofNanoSeconds(
+				util::DateTime(getTimestamp(src)),
+				static_cast<uint32_t>(src.value_ % 1000) * 1000);
+	}
+
+	static util::PreciseDateTime toDateTime(const NanoTimestamp &src) {
+		const int64_t unit = NanoTimestamp::HIGH_MICRO_UNIT;
+		const int64_t revUnit = 1000 / unit;
+		return util::PreciseDateTime::ofNanoSeconds(
+				util::DateTime(getTimestamp(src)),
+				static_cast<uint32_t>(
+						src.getHigh() % (1000 * unit) * revUnit) +
+				src.getLow());
+	}
+
+	static int32_t compareTimestamp(
+			const Timestamp &ts1, const Timestamp &ts2) {
+		if (ts1 != ts2) {
+			return (ts1 < ts2 ? -1 : 1);
+		}
+		return 0;
+	}
+
+	static int32_t compareTimestamp(
+			const MicroTimestamp &ts1, const MicroTimestamp &ts2) {
+		return compareTimestamp(ts1.value_, ts2.value_);
+	}
+
+	static int32_t compareTimestamp(
+			const NanoTimestamp &ts1, const NanoTimestamp &ts2) {
+		if (ts1.getHigh() != ts2.getHigh()) {
+			return (ts1.getHigh() < ts2.getHigh() ? -1 : 1);
+		}
+		if (ts1.getLow() != ts2.getLow()) {
+			return (ts1.getLow() < ts2.getLow() ? -1 : 1);
+		}
+		return 0;
+	}
+
+	static RawTimestampFormatter<Timestamp> getRawTimestampFormatter(
+			const Timestamp &ts);
+	static RawTimestampFormatter<MicroTimestamp> getRawTimestampFormatter(
+			const MicroTimestamp &ts);
+	static RawTimestampFormatter<NanoTimestamp> getRawTimestampFormatter(
+			const NanoTimestamp &ts);
+
+	template<typename T>
+	static util::DateTime::Formatter getTimestampFormatter(
+			const T &ts, const util::DateTime::ZonedOption &option) {
+		util::DateTime::Formatter formatter =
+				toDateTime(ts).getFormatter(option);
+		return formatter.withDefaultPrecision(getTimestampPrecision(ts));
+	}
+
+	static util::DateTime::FieldType getTimestampPrecision(
+			const Timestamp&) {
+		return util::DateTime::FIELD_MILLISECOND;
+	}
+
+	static util::DateTime::FieldType getTimestampPrecision(
+			const MicroTimestamp&) {
+		return util::DateTime::FIELD_MICROSECOND;
+	}
+
+	static util::DateTime::FieldType getTimestampPrecision(
+			const NanoTimestamp&) {
+		return util::DateTime::FIELD_NANOSECOND;
+	}
+
+	static void dumpRawTimestamp(std::ostream &os, const Timestamp &ts);
+	static void dumpRawTimestamp(std::ostream &os, const MicroTimestamp &ts);
+	static void dumpRawTimestamp(std::ostream &os, const NanoTimestamp &ts);
+
 	/*!
-		@brief Validatet Timestamp value
+		@brief Validate Timestamp value
 	*/
-	static bool validateTimestamp(Timestamp val) {
+	static bool validateTimestamp(const Timestamp &val) {
 		if ((val < 0) || (val > SUPPORT_MAX_TIMESTAMP)) {
 			return false;
 		}
 		return true;
 	}
+
+	static bool validateTimestamp(const MicroTimestamp &val) {
+		if (val.value_ < 0 || compareTimestamp(
+				val, SUPPORT_MAX_MICRO_TIMESTAMP) > 0) {
+			return false;
+		}
+		return true;
+	}
+
+	static bool validateTimestamp(const NanoTimestamp &val) {
+		if (val.getHigh() < 0 ||
+				val.getLow() >= static_cast<uint32_t>(
+						1000 / NanoTimestamp::HIGH_MICRO_UNIT) ||
+				compareTimestamp(
+						val, SUPPORT_MAX_NANO_TIMESTAMP) > 0) {
+			return false;
+		}
+		return true;
+	}
+
+	static Timestamp makeMaxTimestamp(bool fractionTrimming);
+	static MicroTimestamp makeMaxMicroTimestamp(bool fractionTrimming);
+	static NanoTimestamp makeMaxNanoTimestamp(bool fractionTrimming);
+
+	static Timestamp errorTimestampType();
+	static MicroTimestamp errorMicroTimestampType();
+	static NanoTimestamp errorNanoTimestampType();
+
 	/*!
 		@brief Convert to Upper case
 	*/
@@ -595,17 +880,45 @@ public:
 		@brief Get Typed-name
 	*/
 	static std::string getTypeName(ColumnType type);
-	static const char8_t* getTypeNameChars(ColumnType type);
+	static const char8_t* getTypeNameChars(
+			ColumnType type, bool precisionIgnorable = false);
 
 	static void dumpSimpleValue(util::NormalOStringStream &stream, 
 		ColumnType columnType, const void *data, uint32_t size, bool withType = false);
 
+	static int32_t getValuePrecision(ColumnType type);
+	static int32_t getValueStringLength(ColumnType type);
+
 	static const Timestamp
 		SUPPORT_MAX_TIMESTAMP;  
+	static const MicroTimestamp SUPPORT_MAX_MICRO_TIMESTAMP;
+	static const NanoTimestamp SUPPORT_MAX_NANO_TIMESTAMP;
 
 	static std::string dumpMemory(
 		const std::string &name, const uint8_t *addr, uint64_t size);
 };
+
+template<typename T>
+class ValueProcessor::RawTimestampFormatter {
+public:
+	explicit RawTimestampFormatter(const T &value) : value_(value) {
+	}
+
+	std::ostream& operator()(std::ostream &os) const {
+		dumpRawTimestamp(os, value_);
+		return os;
+	}
+
+private:
+	T value_;
+};
+
+template<typename T>
+inline std::ostream& operator<<(
+		std::ostream &os,
+		const ValueProcessor::RawTimestampFormatter<T> &formatter) {
+	return formatter(os);
+}
 
 /*!
 	@brief Represents the type of interpolation of Rows
@@ -634,8 +947,8 @@ class VariableArrayCursor : public BaseObject {
 public:  
 public:  
 public:  
-	VariableArrayCursor(TransactionContext &txn, ObjectManager &objectManager,
-		OId oId, AccessMode accessMode);
+	VariableArrayCursor(ObjectManagerV4 &objectManager,
+		AllocateStrategy &strategy, OId oId, AccessMode accessMode);
 	VariableArrayCursor(uint8_t *addr);
 
 	void finalize();
@@ -655,7 +968,7 @@ public:
 	*/
 	void reset() {
 		if (getBaseOId() != rootOId_) {
-			curObject_.load(rootOId_);
+			curObject_.load(rootOId_, false);
 		}
 		else {
 			resetCursor();
@@ -665,7 +978,7 @@ public:
 		elemCursor_ = UNDEF_CURSOR_POS;
 	}
 
-	OId clone(TransactionContext &txn, const AllocateStrategy &allocateStrategy,
+	OId clone(AllocateStrategy &allocateStrategy,
 		OId neighborOId);
 
 	/*!
@@ -685,7 +998,7 @@ public:
 	}
 
 	static void checkVarDataSize(TransactionContext &txn,
-		ObjectManager &objectManager,
+		ObjectManagerV4 &objectManager,
 		const util::XArray< std::pair<uint8_t *, uint32_t> > &varList,
 		const util::XArray<ColumnType> &columnTypeList,
 		bool isConvertSpecialType,
@@ -693,8 +1006,8 @@ public:
 		util::XArray<uint32_t> &varDataObjectPosList);
 
 	static OId createVariableArrayCursor(TransactionContext &txn,
-		ObjectManager &objectManager,
-		const AllocateStrategy &allocateStrategy,
+		ObjectManagerV4 &objectManager,
+		AllocateStrategy &allocateStrategy,
 		const util::XArray< std::pair<uint8_t *, uint32_t> > &varList,
 		const util::XArray<ColumnType> &columnTypeList,
 		bool isConvertSpecialType,
@@ -715,7 +1028,6 @@ private:
 	BaseObject &curObject_;
 	OId rootOId_;
 	uint32_t elemNum_;
-	uint32_t currentSize_;
 	uint32_t
 		elemCursor_;  
 	AccessMode accessMode_;
@@ -733,14 +1045,17 @@ public:
 public:  
 public:  
 	StringCursor(
-		TransactionContext &txn, ObjectManager &objectManager, OId oId);
+		ObjectManagerV4 &objectManager, AllocateStrategy &strategy, OId oId);
 
 	StringCursor(uint8_t *binary);
 
-	StringCursor(TransactionContext &txn, const uint8_t *str,
+	StringCursor(util::StackAllocator& alloc, const uint8_t *str,
 		uint32_t strLength);  
 
-	StringCursor(TransactionContext &txn, const char *str);
+	StringCursor(util::StackAllocator& alloc, const char *str);
+
+	StringCursor(
+			util::XArray<uint8_t> &buf, const uint8_t *str, uint32_t strLength);
 
 	/*!
 		@brief Free StringCursor Object
@@ -788,10 +1103,10 @@ private:
 */
 class BinaryObject : public BaseObject {
 public:
-	BinaryObject(PartitionId pId, ObjectManager &objectManager)
-		: BaseObject(pId, objectManager) {}
-	BinaryObject(PartitionId pId, ObjectManager &objectManager, OId oId)
-		: BaseObject(pId, objectManager, oId) {}
+	BinaryObject(ObjectManagerV4 &objectManager, AllocateStrategy &strategy)
+		: BaseObject(objectManager, strategy) {}
+	BinaryObject(ObjectManagerV4 &objectManager, AllocateStrategy& strategy, OId oId)
+		: BaseObject(objectManager, strategy, oId) {}
 	BinaryObject(uint8_t *addr) : BaseObject(addr) {}
 
 	/*!
@@ -816,7 +1131,7 @@ public:
 	}
 	/*!
 		@brief Get value pointer
-		@note return head of blob-bainary
+		@note return head of blob-binary
 	*/
 	const uint8_t *data() const {
 		uint32_t sizeLen = ValueProcessor::getEncodedVarSize(getBaseAddr());
@@ -837,10 +1152,10 @@ public:
 */
 class ArrayObject : public BaseObject {
 public:
-	ArrayObject(PartitionId pId, ObjectManager &objectManager)
-		: BaseObject(pId, objectManager) {}
-	ArrayObject(PartitionId pId, ObjectManager &objectManager, OId oId)
-		: BaseObject(pId, objectManager, oId) {}
+	ArrayObject(ObjectManagerV4 &objectManager, AllocateStrategy& strategy)
+		: BaseObject(objectManager, strategy) {}
+	ArrayObject(ObjectManagerV4 &objectManager, AllocateStrategy& strategy, OId oId)
+		: BaseObject(objectManager, strategy, oId) {}
 	ArrayObject(uint8_t *addr) : BaseObject(addr) {}
 
 	/*!
@@ -1026,28 +1341,29 @@ private:
 class LogDevide {
 public:
 	static const int32_t MAX_DIVIDED_NUM = 3;
-	LogDevide(ObjectManager &objectManager) 
+	LogDevide(ObjectManagerV4 &objectManager) 
 		: objectManager_(objectManager), constElemNum_(0), dividedElemNum_(0),
-		blobSubBlockUnitSize_(objectManager.getRecommendtLimitObjectSize()) {
+		sizeList_{ 0, 0, 0 },
+		blobSubBlockUnitSize_(objectManager.getRecommendedLimitObjectSize()) {
 	}
 	void initialize(uint64_t inputSize);
 	uint32_t getElemNum() {
 		return static_cast<uint32_t>(constElemNum_ + dividedElemNum_);
 	}
-	uint32_t getAllocateSize(int32_t curentElemNum) {
-		if (curentElemNum < static_cast<int32_t>(constElemNum_)) {
+	uint32_t getAllocateSize(int32_t currentElemNum) {
+		if (currentElemNum < static_cast<int32_t>(constElemNum_)) {
 			return blobSubBlockUnitSize_;
 		} else {
-			return sizeList_[curentElemNum - constElemNum_];
+			return sizeList_[currentElemNum - constElemNum_];
 		}
 	}
 
 
 private:
-	static const double EFFICENCY_THRESHOLD;
-	static const uint32_t	DIVIED_SIZE_LIMIT = ((1 << 7) - ObjectAllocator::BLOCK_HEADER_SIZE); 
+	static const double EFFICIENCY_THRESHOLD;
+	static const uint32_t	DIVIDED_SIZE_LIMIT = ((1 << 7) - ObjectManagerV4::OBJECT_HEADER_SIZE); 
 
-	ObjectManager &objectManager_;
+	ObjectManagerV4 &objectManager_;
 	uint32_t constElemNum_;
 	uint32_t dividedElemNum_;
 	uint32_t sizeList_[MAX_DIVIDED_NUM];
@@ -1055,8 +1371,9 @@ private:
 
 	uint32_t calcSizeOfBuddy(uint32_t size) {
 		uint32_t buddySize = objectManager_.estimateAllocateSize(size);
-		return buddySize + ObjectAllocator::BLOCK_HEADER_SIZE;
+		return buddySize + ObjectManagerV4::OBJECT_HEADER_SIZE;
 	}
+	void initializeDevide(uint32_t restSize);
 };
 
 class BlobCursor {
@@ -1067,10 +1384,10 @@ public:
 		CREATE
 	};
 	static uint64_t getTotalSize(const uint8_t *addr);
-	static uint32_t getPrefixDataSize(ObjectManager &objectManager, uint64_t totalSize);
+	static uint32_t getPrefixDataSize(ObjectManagerV4 &objectManager, uint64_t totalSize);
 public:
-	BlobCursor(PartitionId pId, ObjectManager &objectManager, const uint8_t * const ptr);
-	BlobCursor(PartitionId pId, ObjectManager &objectManager, const AllocateStrategy &allocateStrategy, const uint8_t *ptr, OId neighborOId);
+	BlobCursor(ObjectManagerV4 &objectManager, AllocateStrategy &allocateStrategy, const uint8_t * const ptr);
+	BlobCursor(ObjectManagerV4 &objectManager, AllocateStrategy &allocateStrategy, const uint8_t *ptr, OId neighborOId);
 	~BlobCursor() {}
 	uint32_t initialize(uint8_t *destAddr,  uint64_t totalSize);
 	void finalize();
@@ -1095,7 +1412,7 @@ private:
 		BlobArrayObject() : ArrayObject(NULL), curPos_(-1) {
 		}
 		void load(OId oId) {
-			BaseObject::load(oId);
+			BaseObject::load(oId, false);
 			resetArrayCursor();
 		}
 		inline void loadNeighbor(OId oId, AccessMode mode) {
@@ -1103,18 +1420,18 @@ private:
 			resetArrayCursor();
 		}
 		template <class T>
-		T *allocate(Size_t requestSize, const AllocateStrategy &allocateStrategy,
+		T *allocate(DSObjectSize requestSize,
 			OId &oId, ObjectType objectType) {
-			T *addr = BaseObject::allocate<T>(requestSize, allocateStrategy,
+			T *addr = BaseObject::allocate<T>(requestSize,
 					oId, objectType);
 			resetArrayCursor();
 			return addr;
 		}
 		template <class T>
-		T *allocateNeighbor(Size_t requestSize,
-			const AllocateStrategy &allocateStrategy, OId &oId, OId neighborOId,
+		T *allocateNeighbor(DSObjectSize requestSize,
+			OId &oId, OId neighborOId,
 			ObjectType objectType) {
-			T *addr = BaseObject::allocateNeighbor<T>(requestSize, allocateStrategy,
+			T *addr = BaseObject::allocateNeighbor<T>(requestSize,
 					oId, neighborOId, objectType);
 			resetArrayCursor();
 			return addr;
@@ -1134,8 +1451,8 @@ private:
 				reinterpret_cast<const uint8_t *>(data));
 		}
 		bool next() {
-			uint32_t lengh = getArrayLength();
-			if (lengh != 0  && curPos_ + 1 < static_cast<int32_t>(lengh)) {
+			uint32_t length = getArrayLength();
+			if (length != 0  && curPos_ + 1 < static_cast<int32_t>(length)) {
 				curPos_++;
 				return true;
 			} else {
@@ -1178,20 +1495,20 @@ private:
 	bool isDivided() {
 		return isDivided(maxDepth_);
 	}
-	static uint32_t calcDepth(ObjectManager &objectManager, uint64_t totalSize, uint32_t elemNum, uint32_t &topArrayNum);
-	static uint32_t getMaxArrayNum(ObjectManager &objectManager);
+	static uint32_t calcDepth(ObjectManagerV4 &objectManager, uint64_t totalSize, uint32_t elemNum, uint32_t &topArrayNum);
+	static uint32_t getMaxArrayNum(ObjectManagerV4 &objectManager);
+	void nextBlock(CURSOR_MODE mode);
 	void down(CURSOR_MODE mode);
 private:
 	static const uint32_t MAX_DEPTH = 4;  
 	static const uint32_t MIN_DIVIDED_SIZE = 119;
-	PartitionId pId_;
-	ObjectManager &objectManager_;
-	AllocateStrategy allocateStrategy_;
+	ObjectManagerV4 &objectManager_;
+	AllocateStrategy &allocateStrategy_;
 	const uint8_t *baseAddr_;
 	const uint8_t *topArrayAddr_;
 	BaseObject curObj_;
 	BlobArrayObject *arrayCursor_;
-	BlobArrayObject stackCusor_[MAX_DEPTH];
+	BlobArrayObject stackCursor_[MAX_DEPTH];
 	int32_t currentElem_;
 	int32_t maxElem_;
 	uint32_t currentDepth_;
@@ -1199,5 +1516,6 @@ private:
 	LogDevide logDevide_;
 	OId neighborOId_;
 };
+
 
 #endif

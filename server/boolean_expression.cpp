@@ -30,7 +30,9 @@
 #include <cassert>
 #include <iostream>
 
+#if !WIN32
 const ColumnId ColumnInfo::ROW_KEY_COLUMN_ID;
+#endif
 
 /*!
 * @brief Constructor. Boolean expressions passed by the arguments are copied as
@@ -151,11 +153,11 @@ BoolExpr::BoolExpr(TrivalentLogicType b, TransactionContext &txn)
 * @param txn The transaction context
 * @param txn Object manager
 */
-BoolExpr *BoolExpr::dup(TransactionContext &txn, ObjectManager &objectManager) {
+BoolExpr *BoolExpr::dup(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
 	BoolExpr *b = NULL;
 
 	if (opeType_ == UNARY) {
-		b = QP_NEW BoolExpr(unary_->dup(txn, objectManager), txn);
+		b = QP_NEW BoolExpr(unary_->dup(txn, objectManager, strategy), txn);
 		b->noEval_ = noEval_;
 	}
 	else {
@@ -164,7 +166,7 @@ BoolExpr *BoolExpr::dup(TransactionContext &txn, ObjectManager &objectManager) {
 		b->noEval_ = noEval_;
 		for (BoolTerms::const_iterator it = operands_.begin();
 			 it != operands_.end(); it++) {
-			b->operands_.push_back((*it)->dup(txn, objectManager));
+			b->operands_.push_back((*it)->dup(txn, objectManager, strategy));
 		}
 		b->unary_ = NULL;
 	}
@@ -198,7 +200,7 @@ BoolExpr::~BoolExpr() {
 *
 * @return Evaluation result
 */
-TrivalentLogicType BoolExpr::eval(TransactionContext &txn, ObjectManager &objectManager,
+TrivalentLogicType BoolExpr::eval(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	ContainerRowWrapper *column_values, FunctionMap *function_map,
 	TrivalentLogicType default_return) {
 	TrivalentLogicType x;
@@ -214,7 +216,7 @@ TrivalentLogicType BoolExpr::eval(TransactionContext &txn, ObjectManager &object
 			 it != operands_.end(); it++) {
 			try {
 				util::StackAllocator::Scope scope(txn.getDefaultAllocator());
-				x = (*it)->eval(txn, objectManager, column_values, function_map,
+				x = (*it)->eval(txn, objectManager, strategy, column_values, function_map,
 					TRI_TRUE);  
 				if (x == TRI_FALSE) {
 					return TRI_FALSE;
@@ -240,7 +242,7 @@ TrivalentLogicType BoolExpr::eval(TransactionContext &txn, ObjectManager &object
 				if ((*it)->noEval_ == false) {
 					util::StackAllocator::Scope scope(
 						txn.getDefaultAllocator());
-					x = (*it)->eval(txn, objectManager, column_values,
+					x = (*it)->eval(txn, objectManager, strategy, column_values,
 						function_map, TRI_FALSE);  
 					if (x == TRI_TRUE) {
 						return TRI_TRUE;
@@ -262,14 +264,14 @@ TrivalentLogicType BoolExpr::eval(TransactionContext &txn, ObjectManager &object
 	case NOT: {
 		util::StackAllocator::Scope scope(txn.getDefaultAllocator());
 		x = operands_[0]->eval(
-			txn, objectManager, column_values, function_map, default_return);
+			txn, objectManager, strategy, column_values, function_map, default_return);
 		return notTrivalentLogic(x);
 	}
 	case UNARY: {
 		Expr *e;
 		util::StackAllocator::Scope scope(txn.getDefaultAllocator());
 		e = unary_->eval(
-			txn, objectManager, column_values, function_map, EVAL_MODE_NORMAL);
+			txn, objectManager, strategy, column_values, function_map, EVAL_MODE_NORMAL);
 		x = e->castTrivalentLogicValue();
 		QP_DELETE(e);
 		return x;
@@ -290,19 +292,19 @@ TrivalentLogicType BoolExpr::eval(TransactionContext &txn, ObjectManager &object
 * DNF of this expression.
 */
 BoolExpr *BoolExpr::makeDNF(
-	TransactionContext &txn, ObjectManager &objectManager) {
+	TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
 	BoolTerms cExprs(txn.getDefaultAllocator());
 	BoolTerms::const_iterator it1, it2, it3, it4;
 
 	if (opeType_ == UNARY) {
-		return this->dup(txn, objectManager);
+		return this->dup(txn, objectManager, strategy);
 	}
 	else if (opeType_ == NOT) {
 		if (operands_[0]->opeType_ == UNARY) {
-			return this->dup(txn, objectManager);
+			return this->dup(txn, objectManager, strategy);
 		}
 		else if (operands_[0]->opeType_ == NOT) {
-			return operands_[0]->operands_[0]->makeDNF(txn, objectManager);
+			return operands_[0]->operands_[0]->makeDNF(txn, objectManager, strategy);
 		}
 		else {
 		}
@@ -311,7 +313,7 @@ BoolExpr *BoolExpr::makeDNF(
 	}
 
 	for (it1 = operands_.begin(); it1 != operands_.end(); it1++) {
-		BoolExpr *b = (*it1)->makeDNF(txn, objectManager);
+		BoolExpr *b = (*it1)->makeDNF(txn, objectManager, strategy);
 		b->checkDNF();
 		cExprs.push_back(b);
 	}
@@ -320,7 +322,7 @@ BoolExpr *BoolExpr::makeDNF(
 		BoolExpr *b = QP_NEW BoolExpr(txn);
 		b->opeType_ = opeType_;
 		for (it1 = cExprs.begin(); it1 != cExprs.end(); it1++) {
-			b->addOperand(txn, objectManager, *it1);
+			b->addOperand(txn, objectManager, strategy, *it1);
 			QP_DELETE(*it1);
 		}
 		b->checkDNF();
@@ -332,10 +334,10 @@ BoolExpr *BoolExpr::makeDNF(
 		b->opeType_ = AND;
 		for (it1 = cExprs.begin(); it1 != cExprs.end(); it1++) {
 			if ((*it1)->opeType_ == UNARY || (*it1)->opeType_ == NOT) {
-				b->addOperand(txn, objectManager, *it1);
+				b->addOperand(txn, objectManager, strategy, *it1);
 			}
 			else {
-				b->addOperandsDNF(txn, objectManager, (*it1)->operands_);
+				b->addOperandsDNF(txn, objectManager, strategy, (*it1)->operands_);
 			}
 			QP_DELETE(*it1);
 		}
@@ -348,10 +350,10 @@ BoolExpr *BoolExpr::makeDNF(
 		b->opeType_ = OR;
 		for (it1 = cExprs.begin(); it1 != cExprs.end(); it1++) {
 			if ((*it1)->opeType_ == UNARY || (*it1)->opeType_ == NOT) {
-				b->addOperand(txn, objectManager, *it1);
+				b->addOperand(txn, objectManager, strategy, *it1);
 			}
 			else {
-				b->addOperandsDNF(txn, objectManager, (*it1)->operands_);
+				b->addOperandsDNF(txn, objectManager, strategy, (*it1)->operands_);
 			}
 			QP_DELETE(*it1);
 		}
@@ -369,7 +371,7 @@ BoolExpr *BoolExpr::makeDNF(
 				 it1 != cExprs[0]->operands_.end(); it1++) {
 				BoolExpr *x = QP_NEW BoolExpr(NOT, *it1, NULL, txn);
 				b->addOperand(
-					txn, objectManager, x->makeDNF(txn, objectManager));
+					txn, objectManager, strategy, x->makeDNF(txn, objectManager, strategy));
 				QP_DELETE(x);
 			}
 
@@ -385,10 +387,10 @@ BoolExpr *BoolExpr::makeDNF(
 			for (it1 = cExprs[0]->operands_.begin();
 				 it1 != cExprs[0]->operands_.end(); it1++) {
 				BoolExpr *x = QP_NEW BoolExpr(NOT, *it1, NULL, txn);
-				b->addOperand(txn, objectManager, x);
+				b->addOperand(txn, objectManager, strategy, x);
 				QP_DELETE(x);
 			}
-			BoolExpr *r = b->makeDNF(txn, objectManager);
+			BoolExpr *r = b->makeDNF(txn, objectManager, strategy);
 			for (it1 = cExprs.begin(); it1 != cExprs.end(); it1++) {
 				QP_DELETE(*it1);
 			}
@@ -425,18 +427,18 @@ BoolExpr *BoolExpr::makeDNF(
 
 			for (it3 = tmpTerms1.begin(); it3 != tmpTerms1.end(); it3++) {
 				for (it4 = tmpTerms2.begin(); it4 != tmpTerms2.end(); it4++) {
-					BoolExpr *e = (*it3)->makeDNF(txn, objectManager);
-					BoolExpr *f = (*it4)->makeDNF(txn, objectManager);
+					BoolExpr *e = (*it3)->makeDNF(txn, objectManager, strategy);
+					BoolExpr *f = (*it4)->makeDNF(txn, objectManager, strategy);
 					if (e->opeType_ == AND) {
-						e->addOperand(txn, objectManager, f);
-						tmpTerms3.push_back(e->makeDNF(txn, objectManager));
+						e->addOperand(txn, objectManager, strategy, f);
+						tmpTerms3.push_back(e->makeDNF(txn, objectManager, strategy));
 					}
 					else {
 						BoolExpr *b = QP_NEW BoolExpr(txn);
 						b->opeType_ = AND;
-						b->addOperand(txn, objectManager, e);
-						b->addOperand(txn, objectManager, f);
-						tmpTerms3.push_back(b->makeDNF(txn, objectManager));
+						b->addOperand(txn, objectManager, strategy, e);
+						b->addOperand(txn, objectManager, strategy, f);
+						tmpTerms3.push_back(b->makeDNF(txn, objectManager, strategy));
 						QP_DELETE(b);
 					}
 					QP_DELETE(e);
@@ -461,10 +463,10 @@ BoolExpr *BoolExpr::makeDNF(
 			case UNARY:
 			case NOT:
 			case AND:
-				b->addOperand(txn, objectManager, *it1);
+				b->addOperand(txn, objectManager, strategy, *it1);
 				break;
 			case OR:
-				b->addOperandsDNF(txn, objectManager, (*it1)->operands_);
+				b->addOperandsDNF(txn, objectManager, strategy, (*it1)->operands_);
 				break;
 			}
 			QP_DELETE(*it1);
@@ -486,8 +488,8 @@ BoolExpr *BoolExpr::makeDNF(
 * @param os Output stream
 */
 void BoolExpr::dumpTree(
-	TransactionContext &txn, ObjectManager &objectManager, std::ostream &os) {
-	dumpTreeSub(txn, objectManager, os, 0, "", NULL, NULL);
+	TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy, std::ostream &os) {
+	dumpTreeSub(txn, objectManager, strategy, os, 0, "", NULL, NULL);
 }
 
 /*!
@@ -499,10 +501,10 @@ void BoolExpr::dumpTree(
 * @param column_values Binding environment
 * @param function_map Function list
 */
-void BoolExpr::dumpTree(TransactionContext &txn, ObjectManager &objectManager,
+void BoolExpr::dumpTree(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	std::ostream &os, ContainerRowWrapper *column_values,
 	FunctionMap *function_map) {
-	dumpTreeSub(txn, objectManager, os, 0, "", column_values, function_map);
+	dumpTreeSub(txn, objectManager, strategy, os, 0, "", column_values, function_map);
 }
 
 /*!
@@ -517,7 +519,7 @@ void BoolExpr::dumpTree(TransactionContext &txn, ObjectManager &objectManager,
 * @param function_map Function list
 */
 void BoolExpr::dumpTreeSub(TransactionContext &txn,
-	ObjectManager &objectManager, std::ostream &os, int level, const char *head,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, std::ostream &os, int level, const char *head,
 	ContainerRowWrapper *column_values, FunctionMap *function_map) {
 	os << head << ':';
 	switch (opeType_) {
@@ -533,7 +535,7 @@ void BoolExpr::dumpTreeSub(TransactionContext &txn,
 	case UNARY: {
 		util::StackAllocator::Scope scope(txn.getDefaultAllocator());
 		Expr *e = unary_->eval(
-			txn, objectManager, column_values, function_map, EVAL_MODE_PRINT);
+			txn, objectManager, strategy, column_values, function_map, EVAL_MODE_PRINT);
 		os << "UNARY: " << e->getValueAsString(txn) << std::endl;
 		QP_DELETE(e);
 		break;
@@ -546,7 +548,7 @@ void BoolExpr::dumpTreeSub(TransactionContext &txn,
 		}
 		for (BoolTerms::iterator it = operands_.begin(); it != operands_.end();
 			 it++) {
-			(*it)->dumpTreeSub(txn, objectManager, os, level + 1,
+			(*it)->dumpTreeSub(txn, objectManager, strategy, os, level + 1,
 				(x + "--").c_str(), column_values, function_map);
 		}
 	}
@@ -568,15 +570,15 @@ void BoolExpr::dumpTreeSub(TransactionContext &txn,
 * @return Optimized expression.
 */
 BoolExpr *BoolExpr::makeOptimizedExpr(TransactionContext &txn,
-	ObjectManager &objectManager, ContainerRowWrapper *column_values,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, ContainerRowWrapper *column_values,
 	FunctionMap *function_map) {
 	try {
 		checkDNF();
 	}
 	catch (util::Exception &) {
-		BoolExpr *e = makeDNF(txn, objectManager);
+		BoolExpr *e = makeDNF(txn, objectManager, strategy);
 		BoolExpr *f = e->makeOptimizedExpr(
-			txn, objectManager, column_values, function_map);
+			txn, objectManager, strategy, column_values, function_map);
 
 		QP_DELETE(e);
 		return f;
@@ -589,7 +591,7 @@ BoolExpr *BoolExpr::makeOptimizedExpr(TransactionContext &txn,
 		BoolTerms newOps(txn.getDefaultAllocator());
 		for (it = operands_.begin(); it != operands_.end(); it++) {
 			BoolExpr *bExpr = (*it)->makeOptimizedExpr(
-				txn, objectManager, column_values, function_map);
+				txn, objectManager, strategy, column_values, function_map);
 			newOps.push_back(bExpr);
 		}
 		return QP_NEW BoolExpr(AND, newOps, txn);
@@ -599,7 +601,7 @@ BoolExpr *BoolExpr::makeOptimizedExpr(TransactionContext &txn,
 		BoolTerms newOps(txn.getDefaultAllocator());
 		for (it = operands_.begin(); it != operands_.end(); it++) {
 			BoolExpr *bExpr = (*it)->makeOptimizedExpr(
-				txn, objectManager, column_values, function_map);
+				txn, objectManager, strategy, column_values, function_map);
 			newOps.push_back(bExpr);
 		}
 		return QP_NEW BoolExpr(OR, newOps, txn);
@@ -607,20 +609,20 @@ BoolExpr *BoolExpr::makeOptimizedExpr(TransactionContext &txn,
 	}
 	else if (opeType_ == NOT) {
 		BoolExpr *bExpr = operands_[0]->makeOptimizedExpr(
-			txn, objectManager, column_values, function_map);
+			txn, objectManager, strategy, column_values, function_map);
 		try {
 			TrivalentLogicType b;
 			{
 				util::StackAllocator::Scope scope(txn.getDefaultAllocator());
 				b = bExpr->eval(
-					txn, objectManager, column_values, function_map, TRI_TRUE);
+					txn, objectManager, strategy, column_values, function_map, TRI_TRUE);
 				QP_DELETE(bExpr);
 			}
 			return QP_NEW BoolExpr(notTrivalentLogic(b), txn);
 		}
 		catch (util::Exception &) {
 			BoolExpr *p = QP_NEW BoolExpr(NOT, bExpr, NULL, txn);
-			BoolExpr *r = p->makeDNF(txn, objectManager);
+			BoolExpr *r = p->makeDNF(txn, objectManager, strategy);
 			QP_DELETE(p);
 			return r;
 		}
@@ -628,7 +630,7 @@ BoolExpr *BoolExpr::makeOptimizedExpr(TransactionContext &txn,
 	}
 	else if (opeType_ == UNARY) {
 		Expr *e = NULL;
-		e = unary_->eval(txn, objectManager, column_values, function_map,
+		e = unary_->eval(txn, objectManager, strategy, column_values, function_map,
 			EVAL_MODE_CONTRACT);
 		return QP_NEW BoolExpr(e, txn);
 	}
@@ -699,16 +701,20 @@ void BoolExpr::toAndList(util::XArray<BoolExpr *> &andList) {
  *
  * @return true : success, false : fail to get
  */
-bool BoolExpr::getCondition(TransactionContext &txn, MapType type,
-	Query &queryObj, TermCondition *&cond) {
+bool BoolExpr::getCondition(
+		TransactionContext &txn, MapType type, Query &queryObj,
+		TermCondition *&cond, bool &semiFiltering) {
+	cond = NULL;
+	semiFiltering = false;
+
 	Expr *unary;
 	if (this->opeType_ == UNARY) {
 		unary = this->unary_;
-		cond = unary->toCondition(txn, type, queryObj, false);
+		cond = unary->toCondition(txn, type, queryObj, false, semiFiltering);
 	}
 	else if (this->opeType_ == NOT) {
 		unary = this->operands_[0]->unary_;
-		cond = unary->toCondition(txn, type, queryObj, true);
+		cond = unary->toCondition(txn, type, queryObj, true, semiFiltering);
 	}
 	else {
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_CRITICAL_LOGIC_ERROR,
@@ -727,82 +733,48 @@ void BoolExpr::toSearchContext(TransactionContext &txn,
 	QueryForCollection &queryObj, BtreeMap::SearchContext *&sc,
 	uint32_t &restEval, ResultSize limit) {
 	util::StackAllocator &alloc = txn.getDefaultAllocator();
+
 	if (indexData != NULL) {
 		sc = ALLOC_NEW(alloc) BtreeMap::SearchContext (alloc, *(indexData->columnIds_));
-	} else {
+	}
+	else {
 		util::Vector<ColumnId> columnIds(alloc);
 		columnIds.push_back(queryObj.collection_->getRowIdColumnId());
 		sc = ALLOC_NEW(alloc) BtreeMap::SearchContext (alloc, columnIds);
 	}
 	sc->reserveCondition(andList.size());
 	restEval = 0;
-	util::Vector<ColumnId>::const_iterator columnIdItr;
+
 	const util::Vector<ColumnId> &columnIds = sc->getColumnIds();
 	for (size_t i = 0; i < andList.size(); i++) {
-		TermCondition *c = NULL;
-		andList[i]->getCondition(txn, MAP_TYPE_BTREE, queryObj, c);
-		if (c == NULL) {
-			restEval++;
-		} else {
+		TermCondition *c;
+		bool semiFiltering;
+		const bool conditionDealed = andList[i]->getCondition(
+				txn, MAP_TYPE_BTREE, queryObj, c, semiFiltering);
+
+		if (conditionDealed && !semiFiltering) {
 			andList[i]->enableEvaluationFilter();
-			columnIdItr = std::find(columnIds.begin(), 
-				columnIds.end(), c->columnId_);
-			bool isKey = false;
-			if (columnIdItr != columnIds.end()) {
-				isKey = true;
-				if (c->opType_ == DSExpression::IS && sc->getKeyColumnNum() == 1) {
-					sc->setNullCond(BaseIndex::SearchContext::IS_NULL);
-				}
-			}
-			sc->addCondition(*c, isKey);
-		}
-	}
-	sc->setLimit((0 == restEval) ? limit : MAX_RESULT_SIZE);
-}
-
-/*!
- * @brief transform and expressions into HashMap's SearchContext
- *
- */
-void BoolExpr::toSearchContext(TransactionContext &txn,
-	util::XArray<BoolExpr *> &andList, IndexData *indexData,
-	QueryForCollection &queryObj, HashMap::SearchContext *&sc,
-	uint32_t &restEval, ResultSize limit) {
-	util::StackAllocator &alloc = txn.getDefaultAllocator();
-	if (indexData != NULL) {
-		sc = ALLOC_NEW(alloc) HashMap::SearchContext (alloc, *(indexData->columnIds_));
-	} else {
-		util::Vector<ColumnId> columnIds(alloc);
-		columnIds.push_back(queryObj.collection_->getRowIdColumnId());
-		sc = ALLOC_NEW(alloc) HashMap::SearchContext (alloc, columnIds);
-	}
-	sc->reserveCondition(andList.size());
-	restEval = 0;
-
-	bool conditionDealed = false;
-	const util::Vector<ColumnId> &columnIds = sc->getColumnIds();
-
-	for (size_t i = 0; i < andList.size(); i++) {
-		TermCondition *c = NULL;
-		conditionDealed = andList[i]->getCondition(txn, MAP_TYPE_HASH,
-			queryObj, c);
-		if (conditionDealed) {
-			andList[i]->enableEvaluationFilter();
-
-			util::Vector<ColumnId>::const_iterator columnIdItr = 
-				std::find(columnIds.begin(), 
-				columnIds.end(), c->columnId_);
-			bool isKey = false;
-			if (columnIdItr != columnIds.end()) {
-				isKey = true;
-				if (c->opType_ == DSExpression::IS && sc->getKeyColumnNum() == 1) {
-					sc->setNullCond(BaseIndex::SearchContext::IS_NULL);
-				}
-			}
-			sc->addCondition(*c, isKey);
 		}
 		else {
 			restEval++;
+		}
+
+		if (conditionDealed) {
+			util::Vector<ColumnId>::const_iterator columnIdItr = std::find(
+					columnIds.begin(), columnIds.end(), c->columnId_);
+			bool isKey = false;
+			if (columnIdItr != columnIds.end()) {
+				if (sc->getKeyColumnNum() == 1) {
+					if (sc->getNullCond() != BaseIndex::SearchContext::IS_NULL && c->isRangeCondition()) {
+						isKey = true;
+					} else if (c->opType_ == DSExpression::IS) {
+						sc->setNullCond(BaseIndex::SearchContext::IS_NULL);
+					}
+				} else {
+					isKey = true;
+				}
+			}
+			sc->addCondition(txn, *c, isKey);
 		}
 	}
 	sc->setLimit((0 == restEval) ? limit : MAX_RESULT_SIZE);
@@ -820,7 +792,8 @@ void BoolExpr::toSearchContext(TransactionContext &txn,
 
 	if (indexData != NULL) {
 		sc = ALLOC_NEW(alloc) RtreeMap::SearchContext (alloc, *(indexData->columnIds_));
-	} else {
+	}
+	else {
 		util::Vector<ColumnId> columnIds(alloc);
 		columnIds.push_back(queryObj.collection_->getRowIdColumnId());
 		sc = ALLOC_NEW(alloc) RtreeMap::SearchContext (alloc, columnIds);
@@ -828,28 +801,33 @@ void BoolExpr::toSearchContext(TransactionContext &txn,
 	sc->reserveCondition(andList.size());
 	restEval = 0;
 
-	int32_t conditionDealed;
 	const util::Vector<ColumnId> &columnIds = sc->getColumnIds();
 	for (size_t i = 0; i < andList.size(); i++) {
-		TermCondition *c = NULL;
-		conditionDealed = andList[i]->getCondition(txn, MAP_TYPE_SPATIAL,
-			queryObj, c);
-		if (conditionDealed) {
+		TermCondition *c;
+		bool semiFiltering;
+		const bool conditionDealed = andList[i]->getCondition(
+				txn, MAP_TYPE_SPATIAL, queryObj, c, semiFiltering);
+
+		if (conditionDealed && !semiFiltering) {
 			andList[i]->enableEvaluationFilter();
-			util::Vector<ColumnId>::const_iterator columnIdItr = 
-				std::find(columnIds.begin(), 
-				columnIds.end(), c->columnId_);
-			bool isKey = false;
-			if (columnIdItr != columnIds.end()) {
-				isKey = true;
-				if (c->opType_ == DSExpression::IS && sc->getKeyColumnNum() == 1) {
-					sc->setNullCond(BaseIndex::SearchContext::IS_NULL);
-				}
-			}
-			sc->addCondition(*c, isKey);
 		}
 		else {
 			restEval++;
+		}
+
+		if (conditionDealed) {
+			util::Vector<ColumnId>::const_iterator columnIdItr = std::find(
+					columnIds.begin(), columnIds.end(), c->columnId_);
+			bool isKey = false;
+			if (columnIdItr != columnIds.end()) {
+				if (sc->getNullCond() != BaseIndex::SearchContext::IS_NULL) {
+					isKey = true;
+				}
+				if (c->opType_ == DSExpression::IS) {
+					sc->setNullCond(BaseIndex::SearchContext::IS_NULL);
+				}
+			}
+			sc->addCondition(txn, *c, isKey);
 		}
 	}
 	sc->setLimit((0 == restEval) ? limit : MAX_RESULT_SIZE);
@@ -860,13 +838,15 @@ void BoolExpr::toSearchContext(TransactionContext &txn,
  *
  */
 void BoolExpr::toSearchContext(TransactionContext &txn,
-	util::XArray<BoolExpr *> &andList, Timestamp &expireTs,
+	util::XArray<BoolExpr *> &andList,
 	IndexData *indexData, QueryForTimeSeries &queryObj,
 	BtreeMap::SearchContext *&sc, uint32_t &restEval, ResultSize limit) {
 	util::StackAllocator &alloc = txn.getDefaultAllocator();
+
 	if (indexData != NULL) {
 		sc = ALLOC_NEW(alloc) BtreeMap::SearchContext (alloc, *(indexData->columnIds_));
-	} else {
+	}
+	else {
 		util::Vector<ColumnId> columnIds(alloc);
 		columnIds.push_back(queryObj.timeSeries_->getRowIdColumnId());
 		sc = ALLOC_NEW(alloc) BtreeMap::SearchContext (alloc, columnIds);
@@ -874,32 +854,37 @@ void BoolExpr::toSearchContext(TransactionContext &txn,
 	sc->reserveCondition(andList.size() + 1);  
 	restEval = 0;
 
-	util::Vector<ColumnId>::const_iterator columnIdItr;
 	const util::Vector<ColumnId> &columnIds = sc->getColumnIds();
 	for (size_t i = 0; i < andList.size(); i++) {
-		TermCondition *c = NULL;
-		andList[i]->getCondition(txn, MAP_TYPE_BTREE, queryObj, c);
-		if (c == NULL) {
-			restEval++;
-		} else {
+		TermCondition *c;
+		bool semiFiltering;
+		const bool conditionDealed = andList[i]->getCondition(
+				txn, MAP_TYPE_BTREE, queryObj, c, semiFiltering);
+
+		if (conditionDealed && !semiFiltering) {
 			andList[i]->enableEvaluationFilter();
-			columnIdItr = std::find(columnIds.begin(), 
-				columnIds.end(), c->columnId_);
+		}
+		else {
+			restEval++;
+		}
+
+		if (conditionDealed) {
+			util::Vector<ColumnId>::const_iterator columnIdItr = std::find(
+					columnIds.begin(), columnIds.end(), c->columnId_);
 			bool isKey = false;
 			if (columnIdItr != columnIds.end()) {
-				isKey = true;
-				if (c->opType_ == DSExpression::IS && sc->getKeyColumnNum() == 1) {
-					sc->setNullCond(BaseIndex::SearchContext::IS_NULL);
+				if (sc->getKeyColumnNum() == 1) {
+					if (sc->getNullCond() != BaseIndex::SearchContext::IS_NULL && c->isRangeCondition()) {
+						isKey = true;
+					} else if (c->opType_ == DSExpression::IS) {
+						sc->setNullCond(BaseIndex::SearchContext::IS_NULL);
+					}
+				} else {
+					isKey = true;
 				}
 			}
-			sc->addCondition(*c, isKey);
+			sc->addCondition(txn, *c, isKey);
 		}
-	}
-
-	if (expireTs != MINIMUM_EXPIRED_TIMESTAMP) {
-		TermCondition newCond(COLUMN_TYPE_TIMESTAMP, COLUMN_TYPE_TIMESTAMP, 
-			DSExpression::GT, ColumnInfo::ROW_KEY_COLUMN_ID, &expireTs, sizeof(Timestamp));
-		sc->updateCondition(txn, newCond);
 	}
 
 	sc->setLimit((0 == restEval) ? limit : MAX_RESULT_SIZE);
@@ -926,7 +911,7 @@ void BoolExpr::getIndexBitmapAndInfo(TransactionContext &txn,
 				str += unary->getValueAsString(txn);
 				str += ")";
 				queryObj.addExplain(
-					1, "INDEX_DISABLE", "INDEX_TYPE", "HASH", str.c_str());
+					1, "INDEX_DISABLE", "INDEX_TYPE", "BTREE", str.c_str());
 			}
 		}
 	}
@@ -942,7 +927,7 @@ void BoolExpr::getIndexBitmapAndInfo(TransactionContext &txn,
 }
 
 /*!
- * @brief Create new expression to optimized expresion.
+ * @brief Create new expression to optimized expression.
  *
  * @param txn The transaction context
  * @param txn Object manager
@@ -952,7 +937,7 @@ void BoolExpr::getIndexBitmapAndInfo(TransactionContext &txn,
  *
  * @return Evaluation result as expression.
  */
-Expr *BoolExpr::eval(TransactionContext &txn, ObjectManager &objectManager,
+Expr *BoolExpr::eval(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	ContainerRowWrapper *column_values, FunctionMap *function_map,
 	EvalMode mode) {
 	switch (mode) {
@@ -960,7 +945,7 @@ Expr *BoolExpr::eval(TransactionContext &txn, ObjectManager &objectManager,
 		TrivalentLogicType b;
 		{
 			util::StackAllocator::Scope scope(txn.getDefaultAllocator());
-			b = this->eval(txn, objectManager, column_values, function_map, TRI_TRUE);
+			b = this->eval(txn, objectManager, strategy, column_values, function_map, TRI_TRUE);
 		}
 		if (b == TRI_NULL) {
 			return Expr::newNullValue(txn);
@@ -971,12 +956,12 @@ Expr *BoolExpr::eval(TransactionContext &txn, ObjectManager &objectManager,
 
 	case EVAL_MODE_PRINT: {
 		util::NormalOStringStream os;
-		dumpTreeSub(txn, objectManager, os, 0, "", column_values, function_map);
+		dumpTreeSub(txn, objectManager, strategy, os, 0, "", column_values, function_map);
 		return Expr::newStringValue(os.str().c_str(), txn);
 	}
 	case EVAL_MODE_CONTRACT:
 		return makeOptimizedExpr(
-			txn, objectManager, column_values, function_map);
+			txn, objectManager, strategy, column_values, function_map);
 	}
 
 	GS_THROW_USER_ERROR(GS_ERROR_TQ_CRITICAL_LOGIC_ERROR,

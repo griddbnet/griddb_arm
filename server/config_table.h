@@ -312,7 +312,7 @@ public:
 
 	virtual void operator()(T&) = 0;
 
-	static void setUpAll(T &patamTable);
+	static void setUpAll(T &paramTable);
 
 private:
 	static std::vector<BasicSetUpHandler*>& handlerList();
@@ -345,7 +345,7 @@ public:
 private:
 	friend class ParamTable;
 	PathFormatter(
-			ParamId id, const EntryMap &enrtyMap, const SubPath *subPath);
+			ParamId id, const EntryMap &entryMap, const SubPath *subPath);
 
 	ParamId id_;
 	const EntryMap &entryMap_;
@@ -701,6 +701,270 @@ public:
 	virtual bool operator()(StatTable &table) = 0;
 };
 
+struct LocalStatTypes {
+	enum MergeMode {
+		MERGE_DEFAULT,
+		MERGE_SUM,
+		MERGE_MIN,
+		MERGE_MAX
+	};
+};
+
+struct LocalStatValue {
+public:
+	typedef ParamTable::ParamId ParamId;
+	typedef std::pair<LocalStatValue*, LocalStatValue*> Range;
+	typedef std::pair<const LocalStatValue*, const LocalStatValue*> RangeRef;
+
+	LocalStatValue();
+	void assign(const LocalStatValue &another);
+
+	uint64_t get() const;
+	void set(uint64_t value);
+
+	void increment();
+	void decrement();
+
+	void add(uint64_t amount);
+	void subtract(uint64_t amount);
+
+	static Range toRange(LocalStatValue *it, size_t count);
+	static RangeRef toRangeRef(const LocalStatValue *it, size_t count);
+	static RangeRef toRangeRef(const Range &src);
+	static size_t countOf(const RangeRef &range);
+
+	static LocalStatValue& at(const Range &range, ParamId id);
+	static const LocalStatValue& at(const RangeRef &range, ParamId id);
+
+private:
+	LocalStatValue(const LocalStatValue&);
+	LocalStatValue& operator=(const LocalStatValue&);
+
+	uint64_t value_;
+};
+
+class BasicLocalStatMapper {
+public:
+	typedef ParamTable::ParamId ParamId;
+	typedef ConfigTable::ValueUnit ValueUnit;
+	typedef StatTable::DisplayOption DisplayOption;
+	typedef LocalStatTypes::MergeMode MergeMode;
+	typedef LocalStatValue::Range ValueRange;
+	typedef LocalStatValue::RangeRef ValueRangeRef;
+
+	struct Source;
+	class Options;
+	class Cursor;
+
+	BasicLocalStatMapper(
+			const util::StdAllocator<void, void> &alloc, size_t paramCount);
+	~BasicLocalStatMapper();
+
+	Source getSource();
+
+	void addSub(const BasicLocalStatMapper &sub);
+	void addFilter(DisplayOption option);
+
+	Options defaultOptions();
+	Options bind(ParamId id, ParamId targetId);
+	void setFraction(ParamId id, ParamId denomId);
+
+	void applyValue(
+			ParamId id, const LocalStatValue &src1, const LocalStatValue &src2,
+			StatTable &dest) const;
+	static void mergeValue(
+			const BasicLocalStatMapper *mapper, ParamId id,
+			const LocalStatValue &src, LocalStatValue &dest);
+	bool findRelatedParam(ParamId id, ParamId &relatedId) const;
+
+	static void setAllValues(
+			const ValueRangeRef &src, const ValueRange &dest);
+	static void applyAllValues(
+			const BasicLocalStatMapper *mapper, const ValueRangeRef &src,
+			StatTable &dest);
+	static void mergeAllValues(
+			const BasicLocalStatMapper *mapper, const ValueRangeRef &src,
+			const ValueRange &dest);
+
+private:
+	struct Entry;
+	struct Group;
+	class OptionResolver;
+	class ValueProducer;
+
+	typedef util::AllocSet<ParamId> IdSet;
+	typedef util::AllocVector<Entry*> EntryList;
+	typedef util::AllocVector<Group*> GroupList;
+
+	typedef std::pair<const Entry*, const Entry*> EntryPair;
+
+	BasicLocalStatMapper(const BasicLocalStatMapper&);
+	BasicLocalStatMapper& operator=(const BasicLocalStatMapper&);
+
+	Entry& resolveEntry(ParamId id);
+	Entry& newEntry(ParamId id);
+
+	Group& prepareDefaultGroup();
+	Group& addGroup(size_t &groupIndex);
+
+	EntryPair getEntries(ParamId id) const;
+	Group& getGroup(size_t groupIndex);
+	const Group& getGroup(size_t groupIndex) const;
+	size_t checkGroupIndex(size_t groupIndex) const;
+
+	template<typename E>
+	void clearList(util::AllocVector<E*> &list);
+
+	size_t resolveEntryIndex(ParamId id) const;
+	bool isEntryAssigned(ParamId id) const;
+
+	void checkParamId(ParamId id) const;
+	static void checkParamIdBasic(ParamId id);
+
+	void checkParamCount(size_t count) const;
+	static void checkParamCount(size_t count1, size_t count2);
+
+	util::StdAllocator<void, void> alloc_;
+	EntryList entryList_;
+	GroupList groupList_;
+	size_t paramCount_;
+};
+
+struct BasicLocalStatMapper::Source {
+	Source(const util::StdAllocator<void, void> &alloc, size_t paramCount);
+
+	const util::StdAllocator<void, void> &alloc_;
+	size_t paramCount_;
+};
+
+class BasicLocalStatMapper::Options {
+public:
+	Options(util::StdAllocator<void, void> &alloc, Entry &entry);
+
+	const Options& setMergeMode(MergeMode mode) const;
+
+	const Options& setValueType(ParamValue::Type type) const;
+	const Options& setDateTimeType(bool withDefaults = true) const;
+	const Options& setDefaultValue(
+			const ParamValue &value, const uint64_t *srcValue = NULL) const;
+
+	const Options& setTimeUnit(ValueUnit unit) const;
+	const Options& setConversionUnit(uint64_t unit, bool dividing) const;
+	const Options& setNameCoder(const util::GeneralNameCoder &coder) const;
+	template<typename C> const Options& setNameCoder(const C *coder) const;
+
+private:
+	util::StdAllocator<void, void> &alloc_;
+	Entry &entry_;
+};
+
+template<typename T, size_t C>
+class LocalStatMapper {
+public:
+	typedef ParamTable::ParamId ParamId;
+	typedef StatTable::DisplayOption DisplayOption;
+	typedef BasicLocalStatMapper::Source Source;
+	typedef BasicLocalStatMapper::Options Options;
+
+	explicit LocalStatMapper(const util::StdAllocator<void, void> &alloc);
+	explicit LocalStatMapper(const Source &source);
+
+	Source getSource();
+
+	void addSub(const LocalStatMapper &sub);
+	void addFilter(DisplayOption option);
+
+	Options defaultOptions();
+	Options bind(T srcId, ParamId targetId);
+	void setFraction(T id, T denomId);
+
+	static const BasicLocalStatMapper* findBase(const LocalStatMapper *mapper);
+
+private:
+	LocalStatMapper(const LocalStatMapper&);
+	LocalStatMapper& operator=(const LocalStatMapper&);
+
+	BasicLocalStatMapper base_;
+};
+
+template<typename T, size_t C>
+class LocalStatTable {
+public:
+	typedef LocalStatMapper<T, C> Mapper;
+
+	explicit LocalStatTable(const Mapper *mapper);
+
+	void assign(const LocalStatTable &src);
+	void apply(StatTable &statTable) const;
+	void merge(const LocalStatTable &src);
+
+	const LocalStatValue& operator()(T id) const;
+	LocalStatValue& operator()(T id);
+
+private:
+	LocalStatTable(const LocalStatTable&);
+	LocalStatTable& operator=(const LocalStatTable&);
+
+	LocalStatValue values_[C];
+	const Mapper *mapper_;
+};
+
+class StatStopwatch {
+public:
+	class Holder;
+	class NonStat;
+
+	void start();
+	uint32_t stop();
+
+private:
+	StatStopwatch(const StatStopwatch&);
+	StatStopwatch& operator=(const StatStopwatch&);
+
+	explicit StatStopwatch(LocalStatValue *value);
+
+	util::Stopwatch base_;
+	LocalStatValue *value_;
+};
+
+class StatStopwatch::Holder {
+public:
+	Holder();
+
+	void initialize(LocalStatValue &value);
+	StatStopwatch& get();
+
+private:
+	StatStopwatch watch_;
+};
+
+class StatStopwatch::NonStat {
+public:
+	NonStat();
+	StatStopwatch& get();
+
+private:
+	LocalStatValue nonStatValue_;
+	StatStopwatch watch_;
+};
+
+template<typename T, size_t C>
+class TimeStatTable {
+public:
+	typedef LocalStatTable<T, C> BaseTable;
+
+	explicit TimeStatTable(BaseTable &baseTable);
+
+	StatStopwatch& operator()(T id);
+
+private:
+private:
+	TimeStatTable(const TimeStatTable&);
+	TimeStatTable& operator=(const TimeStatTable&);
+
+	StatStopwatch::Holder watchList_[C];
+};
+
 /*!
 	@brief Represents config of Partition group
 */
@@ -720,7 +984,7 @@ public:
 
 	PartitionGroupId getPartitionGroupId(PartitionId pId) const;
 
-	uint32_t getGroupPartitonCount(PartitionGroupId pgId) const;
+	uint32_t getGroupPartitionCount(PartitionGroupId pgId) const;
 
 private:
 	static void checkParams(uint32_t partitionNum, uint32_t concurrency);
@@ -828,11 +1092,11 @@ inline ParamTable::BasicSetUpHandler<T>::~BasicSetUpHandler() {
 }
 
 template<typename T>
-inline void ParamTable::BasicSetUpHandler<T>::setUpAll(T &patamTable) {
+inline void ParamTable::BasicSetUpHandler<T>::setUpAll(T &paramTable) {
 	static const std::vector<BasicSetUpHandler*> list = handlerList();
 	for (typename std::vector<BasicSetUpHandler*>::const_iterator it = list.begin();
 			it != list.end(); ++it) {
-		(**it)(patamTable);
+		(**it)(paramTable);
 	}
 }
 
@@ -848,8 +1112,195 @@ inline void StatTable::set(ParamId id, const T &value) {
 	set(id, ParamValue(value));
 }
 
+
+inline LocalStatValue::LocalStatValue() : value_(0) {
+}
+
+inline void LocalStatValue::assign(const LocalStatValue &another) {
+	set(another.value_);
+}
+
+inline uint64_t LocalStatValue::get() const {
+	return value_;
+}
+
+inline void LocalStatValue::set(uint64_t value) {
+	value_ = value;
+}
+
+inline void LocalStatValue::increment() {
+	++value_;
+}
+
+inline void LocalStatValue::decrement() {
+	--value_;
+}
+
+inline void LocalStatValue::add(uint64_t amount) {
+	value_ += amount;
+}
+
+inline void LocalStatValue::subtract(uint64_t amount) {
+	value_ -= amount;
+}
+
+
+template<typename C>
+inline const BasicLocalStatMapper::Options&
+BasicLocalStatMapper::Options::setNameCoder(const C *coder) const {
+	return setNameCoder(util::GeneralNameCoder(coder));
+}
+
+
+template<typename T, size_t C>
+inline LocalStatMapper<T, C>::LocalStatMapper(
+		const util::StdAllocator<void, void> &alloc) :
+		base_(alloc, C) {
+}
+
+template<typename T, size_t C>
+inline LocalStatMapper<T, C>::LocalStatMapper(const Source &source) :
+		base_(source.alloc_, C) {
+	assert(source.paramCount_ == C);
+}
+
+template<typename T, size_t C>
+inline BasicLocalStatMapper::Source LocalStatMapper<T, C>::getSource() {
+	return base_.getSource();
+}
+
+template<typename T, size_t C>
+inline void LocalStatMapper<T, C>::addSub(const LocalStatMapper &sub) {
+	return base_.addSub(sub.base_);
+}
+
+template<typename T, size_t C>
+inline void LocalStatMapper<T, C>::addFilter(DisplayOption option) {
+	return base_.addFilter(option);
+}
+
+template<typename T, size_t C>
+inline BasicLocalStatMapper::Options LocalStatMapper<T, C>::defaultOptions() {
+	return base_.defaultOptions();
+}
+
+template<typename T, size_t C>
+inline BasicLocalStatMapper::Options LocalStatMapper<T, C>::bind(
+		T srcId, ParamId targetId) {
+	return base_.bind(srcId, targetId);
+}
+
+template<typename T, size_t C>
+inline void LocalStatMapper<T, C>::setFraction(T id, T denomId) {
+	base_.setFraction(id, denomId);
+}
+
+template<typename T, size_t C>
+inline const BasicLocalStatMapper* LocalStatMapper<T, C>::findBase(
+		const LocalStatMapper *mapper) {
+	if (mapper == NULL) {
+		return NULL;
+	}
+	return &mapper->base_;
+}
+
+
+template<typename T, size_t C>
+inline LocalStatTable<T, C>::LocalStatTable(const Mapper *mapper) :
+		mapper_(mapper) {
+}
+
+template<typename T, size_t C>
+inline void LocalStatTable<T, C>::assign(const LocalStatTable &src) {
+	BasicLocalStatMapper::setAllValues(
+			LocalStatValue::toRangeRef(src.values_, C),
+			LocalStatValue::toRange(values_, C));
+}
+
+template<typename T, size_t C>
+inline void LocalStatTable<T, C>:: apply(StatTable &statTable) const {
+	BasicLocalStatMapper::applyAllValues(
+			Mapper::findBase(mapper_),
+			LocalStatValue::toRangeRef(values_, C), statTable);
+}
+
+template<typename T, size_t C>
+inline void LocalStatTable<T, C>::merge(const LocalStatTable &src) {
+	BasicLocalStatMapper::mergeAllValues(
+			Mapper::findBase(mapper_),
+			LocalStatValue::toRangeRef(src.values_, C),
+			LocalStatValue::toRange(values_, C));
+}
+
+template<typename T, size_t C>
+const LocalStatValue& LocalStatTable<T, C>::operator()(T id) const {
+	assert(0 <= id && static_cast<size_t>(id) < C);
+	return values_[id];
+}
+
+template<typename T, size_t C>
+LocalStatValue& LocalStatTable<T, C>::operator()(T id) {
+	assert(0 <= id && static_cast<size_t>(id) < C);
+	return values_[id];
+}
+
+
+inline void StatStopwatch::start() {
+	base_.start();
+}
+
+inline uint32_t StatStopwatch::stop() {
+	const uint32_t intervalMillis = base_.stop();
+	const uint64_t microTime = base_.elapsedNanos() / 1000;
+	assert(value_ != NULL);
+	value_->set(microTime);
+	return intervalMillis;
+}
+
+inline StatStopwatch::StatStopwatch(LocalStatValue *value) :
+		value_(value) {
+}
+
+
+inline StatStopwatch::Holder::Holder() :
+		watch_(NULL) {
+}
+
+inline void StatStopwatch::Holder::initialize(LocalStatValue &value) {
+	assert(watch_.value_ == NULL);
+	watch_.value_ = &value;
+}
+
+inline StatStopwatch& StatStopwatch::Holder::get() {
+	assert(watch_.value_ != NULL);
+	return watch_;
+}
+
+
+inline StatStopwatch::NonStat::NonStat() :
+		watch_(&nonStatValue_) {
+}
+
+inline StatStopwatch& StatStopwatch::NonStat::get() {
+	return watch_;
+}
+
+
+template<typename T, size_t C>
+inline TimeStatTable<T, C>::TimeStatTable(BaseTable &baseTable) {
+	for (size_t i = 0; i < C; i++) {
+		watchList_[i].initialize(baseTable(static_cast<T>(i)));
+	}
+}
+
+template<typename T, size_t C>
+inline StatStopwatch& TimeStatTable<T, C>::operator()(T id) {
+	assert(0 <= id && static_cast<size_t>(id) < C);
+	return watchList_[id].get();
+}
+
 /*!
-	@brief Paramter ID of config table
+	@brief Parameter ID of config table
 */
 enum ConfigTableParamId {
 	CONFIG_TABLE_ROOT,
@@ -863,12 +1314,14 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_TRIG,
 	CONFIG_TABLE_TRACE,
 	CONFIG_TABLE_DEV,
+	CONFIG_TABLE_SEC,
 
 
 	CONFIG_TABLE_ROOT_NOTIFICATION_ADDRESS,
 
 	CONFIG_TABLE_DS_PARTITION_NUM,
 	CONFIG_TABLE_DS_STORE_BLOCK_SIZE,
+	CONFIG_TABLE_DS_STORE_BLOCK_EXTENT_SIZE, 
 
 	CONFIG_TABLE_CS_REPLICATION_NUM,
 	CONFIG_TABLE_CS_NOTIFICATION_ADDRESS,
@@ -909,6 +1362,10 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_SYNC_LONGTERM_HIGHLOAD_INTERVAL,
 	CONFIG_TABLE_SYNC_LONGTERM_CHECK_INTERVAL_COUNT,
 
+	CONFIG_TABLE_SYS_SERVER_SSL_MODE,
+	CONFIG_TABLE_SYS_CLUSTER_SSL_MODE,
+	CONFIG_TABLE_SYS_SSL_PROTOCOL_MAX_VERSION,
+
 	CONFIG_TABLE_TXN_NOTIFICATION_ADDRESS,
 	CONFIG_TABLE_TXN_NOTIFICATION_PORT,
 	CONFIG_TABLE_TXN_NOTIFICATION_INTERVAL,
@@ -926,6 +1383,23 @@ enum ConfigTableParamId {
 
 	CONFIG_TABLE_CS_ABNORMAL_AUTO_SHUTDOWN,
 
+	CONFIG_TABLE_CS_RACK_ZONE_AWARENESS,
+	CONFIG_TABLE_CS_RACK_ZONE_ID,
+
+	CONFIG_TABLE_SEC_AUTHENTICATION,
+	CONFIG_TABLE_SEC_LDAP_ROLE_MANAGEMENT,
+	CONFIG_TABLE_SEC_LDAP_URL,
+	CONFIG_TABLE_SEC_LDAP_USER_DN_PREFIX,
+	CONFIG_TABLE_SEC_LDAP_USER_DN_SUFFIX,
+	CONFIG_TABLE_SEC_LDAP_BIND_DN,
+	CONFIG_TABLE_SEC_LDAP_BIND_PASSWORD,
+	CONFIG_TABLE_SEC_LDAP_BASE_DN,
+	CONFIG_TABLE_SEC_LDAP_SEARCH_ATTRIBUTE,
+	CONFIG_TABLE_SEC_LDAP_MEMBER_OF_ATTRIBUTE,
+	CONFIG_TABLE_SEC_LDAP_WAIT_TIME,
+	CONFIG_TABLE_SEC_LOGIN_WAIT_TIME,
+	CONFIG_TABLE_SEC_LOGIN_REPETITION_NUM,
+
 
 	CONFIG_TABLE_ROOT_SERVICE_ADDRESS,
 
@@ -937,7 +1411,6 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_DS_STORE_MEMORY_LIMIT,
 	CONFIG_TABLE_DS_CONCURRENCY,
 	CONFIG_TABLE_DS_LOG_WRITE_MODE,
-	CONFIG_TABLE_DS_STORE_WARM_START,
 	CONFIG_TABLE_DS_AFFINITY_GROUP_SIZE,
 	CONFIG_TABLE_DS_STORE_COMPRESSION_MODE,
 	CONFIG_TABLE_DS_STORE_MEMORY_REDISTRIBUTE_LOAD_CHECK_PERIOD,
@@ -952,12 +1425,12 @@ enum ConfigTableParamId {
 
 	CONFIG_TABLE_DS_BACKGROUND_MIN_RATE,
 	CONFIG_TABLE_DS_ERASABLE_EXPIRED_TIME,
-	CONFIG_TABLE_DS_AUTO_EXPIRE,
 	CONFIG_TABLE_DS_ESTIMATED_ERASABLE_EXPIRED_TIME,
 	CONFIG_TABLE_DS_BATCH_SCAN_NUM,
 	CONFIG_TABLE_DS_ROW_ARRAY_RATE_EXPONENT,
 	CONFIG_TABLE_DS_ROW_ARRAY_SIZE_CONTROL_MODE,
 	CONFIG_TABLE_DS_PARTITION_BATCH_FREE_CHECK_INTERVAL,
+	CONFIG_TABLE_DS_PARTITION_BATCH_FREE_CHECK_CONTAINER_COUNT,
 	CONFIG_TABLE_DS_STORE_MEMORY_AGING_SWAP_RATE,
 	CONFIG_TABLE_DS_STORE_MEMORY_COLD_RATE,
 	CONFIG_TABLE_DS_STORE_MEMORY_REDISTRIBUTE_SHIFTABLE_MEMORY_RATE,
@@ -965,17 +1438,18 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_DS_CHECKPOINT_FILE_FLUSH_SIZE,  
 	CONFIG_TABLE_DS_CHECKPOINT_FILE_AUTO_CLEAR_CACHE,  
 	CONFIG_TABLE_DS_STORE_BUFFER_TABLE_SIZE_RATE,  
-	CONFIG_TABLE_DS_DB_FILE_PATH_LIST,
 	CONFIG_TABLE_DS_DB_FILE_SPLIT_COUNT,
 	CONFIG_TABLE_DS_DB_FILE_SPLIT_STRIPE_SIZE,
 	CONFIG_TABLE_DS_LOG_FILE_CLEAR_CACHE_INTERVAL,  
+	CONFIG_TABLE_DS_TRANSACTION_LOG_PATH,  
+	CONFIG_TABLE_DS_LOG_MEMORY_LIMIT,  
 
 	CONFIG_TABLE_CP_CHECKPOINT_INTERVAL,
-	CONFIG_TABLE_CP_CHECKPOINT_MEMORY_LIMIT,
-	CONFIG_TABLE_CP_USE_PARALLEL_MODE,
 
 	CONFIG_TABLE_CP_CHECKPOINT_COPY_INTERVAL_MILLIS,
 	CONFIG_TABLE_CP_CHECKPOINT_COPY_INTERVAL,
+
+	CONFIG_TABLE_CP_PARTIAL_CHECKPOINT_INTERVAL,  
 
 	CONFIG_TABLE_CS_LISTEN_ADDRESS,
 	CONFIG_TABLE_CS_LISTEN_PORT,
@@ -997,7 +1471,9 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_SYS_LISTEN_PORT,
 	CONFIG_TABLE_SYS_SERVICE_ADDRESS,
 	CONFIG_TABLE_SYS_SERVICE_PORT,
+	CONFIG_TABLE_SYS_SERVICE_SSL_PORT,
 	CONFIG_TABLE_SYS_EVENT_LOG_PATH,
+	CONFIG_TABLE_SYS_SECURITY_PATH,
 	CONFIG_TABLE_SYS_STATS_INTERVAL,
 	CONFIG_TABLE_SYS_TRACE_MODE,
 
@@ -1020,16 +1496,25 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_TXN_KEEPALIVE_COUNT,
 
 	CONFIG_TABLE_TXN_LOCAL_SERVICE_ADDRESS,
-
+	CONFIG_TABLE_TXN_USE_MULTITENANT_MODE,
+	CONFIG_TABLE_TXN_USE_REQUEST_CONSTRAINT,
+	CONFIG_TABLE_TXN_CHECK_DATABASE_STATS_INTERVAL,
+	CONFIG_TABLE_TXN_LIMIT_DELAY_TIME,
+	CONFIG_TABLE_TXN_USE_SCAN_STAT,
 	CONFIG_TABLE_TRIG_TIMEOUT_INTERVAL,
 
 	CONFIG_TABLE_TRACE_OUTPUT_TYPE,
 	CONFIG_TABLE_TRACE_FILE_COUNT,
 
+	CONFIG_TABLE_TRACE_AUDIT_LOGS,
+	CONFIG_TABLE_TRACE_AUDIT_LOGS_PATH,
+	CONFIG_TABLE_TRACE_AUDIT_FILE_LIMIT,
+	CONFIG_TABLE_TRACE_AUDIT_MESSAGE_LIMIT,
+	CONFIG_TABLE_TRACE_AUDIT_FILE_COUNT,
+
 	CONFIG_TABLE_TRACE_TRACER_ID_START,
 	CONFIG_TABLE_TRACE_DEFAULT,
 	CONFIG_TABLE_TRACE_MAIN,
-	CONFIG_TABLE_TRACE_HASH_MAP,
 	CONFIG_TABLE_TRACE_BASE_CONTAINER,
 	CONFIG_TABLE_TRACE_DATA_STORE,
 	CONFIG_TABLE_TRACE_COLLECTION,
@@ -1076,7 +1561,25 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_TRACE_ZLIB_UTILS,
 	CONFIG_TABLE_TRACE_SIZE_MONITOR,
 	CONFIG_TABLE_TRACE_CLUSTER_DUMP,
+	CONFIG_TABLE_TRACE_AUTH_OPERATION,
+	CONFIG_TABLE_TRACE_PARTITION,
+	CONFIG_TABLE_TRACE_PARTITION_DETAIL,
+	CONFIG_TABLE_TRACE_DATA_EXPIRATION_DETAIL,
+
+	CONFIG_TABLE_TRACE_CONNECTION_DETAIL,
 	CONFIG_TABLE_TRACE_TRACER_ID_END,
+
+	CONFIG_TABLE_TRACE_AUDIT_TRACER_ID_START,
+	CONFIG_TABLE_TRACE_AUDIT_SYSTEM,
+	CONFIG_TABLE_TRACE_AUDIT_STAT,
+	CONFIG_TABLE_TRACE_AUDIT_SQL_READ,
+	CONFIG_TABLE_TRACE_AUDIT_SQL_WRITE,
+	CONFIG_TABLE_TRACE_AUDIT_NOSQL_READ,
+	CONFIG_TABLE_TRACE_AUDIT_NOSQL_WRITE,
+	CONFIG_TABLE_TRACE_AUDIT_CONNECT,
+	CONFIG_TABLE_TRACE_AUDIT_DDL,
+	CONFIG_TABLE_TRACE_AUDIT_DCL,
+	CONFIG_TABLE_TRACE_AUDIT_TRACER_ID_END,
 
 	CONFIG_TABLE_DEV_AUTO_JOIN_CLUSTER,
 	CONFIG_TABLE_DEV_RECOVERY,
@@ -1088,6 +1591,11 @@ enum ConfigTableParamId {
 	CONFIG_TABLE_DEV_SIMPLE_VERSION,
 	CONFIG_TABLE_DEV_FULL_VERSION,
 
+	
+	CONFIG_TABLE_SEC_USER_CACHE_SIZE,
+	CONFIG_TABLE_SEC_USER_CACHE_UPDATE_INTERVAL,
+	CONFIG_TABLE_TXN_PUBLIC_SERVICE_ADDRESS,
+	
 	CONFIG_TABLE_PARAM_END
 };
 
@@ -1142,7 +1650,7 @@ private:
 	while (false)
 
 /*!
-	@brief Paramter ID of statistics table
+	@brief Parameter ID of statistics table
 */
 enum StatTableParamId {
 	STAT_TABLE_ROOT = 0,
@@ -1162,6 +1670,7 @@ enum StatTableParamId {
 	STAT_TABLE_ROOT_VERSION,
 	STAT_TABLE_ROOT_SYNC,
 	STAT_TABLE_ROOT_PG_STORE_MEMORY_LIMIT,
+	STAT_TABLE_ROOT_SQL_TEMP_STORE,
 	STAT_TABLE_CS_STARTUP_TIME,
 	STAT_TABLE_CS_CLUSTER_STATUS,	
 	STAT_TABLE_CS_NODE_STATUS,	
@@ -1191,6 +1700,9 @@ enum StatTableParamId {
 	STAT_TABLE_CS_CLUSTER_REVISION_NO,
 
 	STAT_TABLE_CS_AUTO_GOAL,
+	STAT_TABLE_CS_RACKZONE_ID,
+	STAT_TABLE_CS_PARTITION_REPLICATION_PROGRESS,
+	STAT_TABLE_CS_PARTITION_GOAL_PROGRESS,
 
 	STAT_TABLE_PERF_OWNER_COUNT,
 	STAT_TABLE_PERF_BACKUP_COUNT,
@@ -1217,15 +1729,17 @@ enum StatTableParamId {
 	STAT_TABLE_PERF_PROCESS_MEMORY,	
 	STAT_TABLE_PERF_PEAK_PROCESS_MEMORY,	
 
-	STAT_TABLE_PERF_CHECKPOINT_FILE_SIZE,	
-	STAT_TABLE_PERF_CHECKPOINT_FILE_USAGE_RATE,	
+	STAT_TABLE_PERF_DATA_FILE_SIZE,	
+	STAT_TABLE_PERF_DATA_FILE_USAGE_RATE,	
 
 	STAT_TABLE_PERF_STORE_COMPRESSION_MODE,
-	STAT_TABLE_PERF_CHECKPOINT_FILE_ALLOCATE_SIZE,	
+	STAT_TABLE_PERF_DATA_FILE_ALLOCATE_SIZE,	
 
 	STAT_TABLE_PERF_CURRENT_CHECKPOINT_WRITE_BUFFER_SIZE,
+	STAT_TABLE_PERF_CHECKPOINT_WRITE, 
 	STAT_TABLE_PERF_CHECKPOINT_WRITE_SIZE,	
 	STAT_TABLE_PERF_CHECKPOINT_WRITE_TIME,
+	STAT_TABLE_PERF_CHECKPOINT_WRITE_COMPRESS_TIME, 
 	STAT_TABLE_PERF_CHECKPOINT_MEMORY_LIMIT,
 	STAT_TABLE_PERF_CHECKPOINT_MEMORY,
 
@@ -1253,6 +1767,9 @@ enum StatTableParamId {
 	STAT_TABLE_PERF_TXN_EE_SYNC,
 	STAT_TABLE_PERF_TXN_EE_TRANSACTION,
 	STAT_TABLE_PERF_TXN_EE_SQL,
+
+	STAT_TABLE_PERF_TXN_TOTAL_INTERNAL_CONNECTION_COUNT,
+	STAT_TABLE_PERF_TXN_TOTAL_EXTERNAL_CONNECTION_COUNT,
 
 	STAT_TABLE_PERF_DS_STORE_MEMORY_LIMIT,
 	STAT_TABLE_PERF_DS_STORE_MEMORY,	
@@ -1282,7 +1799,6 @@ enum StatTableParamId {
 	STAT_TABLE_PERF_DS_EXP,
 	STAT_TABLE_PERF_DS_EXP_ERASABLE_EXPIRED_TIME,
 	STAT_TABLE_PERF_DS_EXP_LATEST_EXPIRATION_CHECK_TIME,
-	STAT_TABLE_PERF_DS_EXP_AUTO_EXPIRE,
 	STAT_TABLE_PERF_DS_EXP_ESTIMATED_ERASABLE_EXPIRED_TIME,
 	STAT_TABLE_PERF_DS_EXP_ESTIMATED_BATCH_FREE,
 	STAT_TABLE_PERF_DS_EXP_LAST_BATCH_FREE,
@@ -1320,6 +1836,8 @@ enum StatTableParamId {
 
 	STAT_TABLE_PERF_MEM_ALL_TOTAL,	
 	STAT_TABLE_PERF_MEM_ALL_CACHED,	
+	STAT_TABLE_PERF_MEM_ALL_LOCAL_CACHED,
+	STAT_TABLE_PERF_MEM_ALL_ELEMENT_COUNT,
 	STAT_TABLE_PERF_MEM_PROCESS_MEMORY_GAP,	
 	STAT_TABLE_PERF_MEM_DS_STORE_TOTAL,
 	STAT_TABLE_PERF_MEM_DS_STORE_CACHED,
@@ -1341,6 +1859,8 @@ enum StatTableParamId {
 	STAT_TABLE_PERF_MEM_WORK_TRANSACTION_RESULT_CACHED,
 	STAT_TABLE_PERF_MEM_WORK_TRANSACTION_WORK_TOTAL,
 	STAT_TABLE_PERF_MEM_WORK_TRANSACTION_WORK_CACHED,
+	STAT_TABLE_PERF_MEM_WORK_TRANSACTION_STATE_TOTAL,
+	STAT_TABLE_PERF_MEM_WORK_TRANSACTION_STATE_CACHED,
 	STAT_TABLE_PARAM_END
 };
 
@@ -1363,7 +1883,9 @@ enum StatTableDisplayOption {
 	STAT_TABLE_DISPLAY_OPTIONAL_NOTIFICATION_MEMBER,
 	STAT_TABLE_DISPLAY_ADDRESS_CLUSTER,
 	STAT_TABLE_DISPLAY_ADDRESS_TRANSACTION,
-	STAT_TABLE_DISPLAY_ADDRESS_SYNC
+	STAT_TABLE_DISPLAY_ADDRESS_SYNC,
+	STAT_TABLE_DISPLAY_ADDRESS_SQL,
+	STAT_TABLE_DISPLAY_ADDRESS_SECURE
 };
 
 #define STAT_TABLE_EXTRACT_SYMBOL(id, depth) \
@@ -1393,7 +1915,7 @@ enum AllocatorGroupId {
 	ALLOCATOR_GROUP_TXN_MESSAGE,
 	ALLOCATOR_GROUP_TXN_RESULT,
 	ALLOCATOR_GROUP_TXN_WORK,
-	ALLOCATOR_GROUP_REPLICATION,
+	ALLOCATOR_GROUP_TXN_STATE,
 	ALLOCATOR_GROUP_ID_END
 };
 

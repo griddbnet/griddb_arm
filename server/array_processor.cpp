@@ -28,7 +28,7 @@
 /*!
 	@brief Compare message field value with object field value
 */
-int32_t ArrayProcessor::compare(TransactionContext &txn, ObjectManager &,
+int32_t ArrayProcessor::compare(TransactionContext &txn, ObjectManagerV4 &, AllocateStrategy &,
 	ColumnId columnId, MessageRowStore *messageRowStore,
 	uint8_t *objectRowField) {
 	const uint8_t *inputField;
@@ -49,7 +49,7 @@ int32_t ArrayProcessor::compare(TransactionContext &txn, ObjectManager &,
 /*!
 	@brief Compare object field values
 */
-int32_t ArrayProcessor::compare(TransactionContext &txn, ObjectManager &,
+int32_t ArrayProcessor::compare(TransactionContext &txn, ObjectManagerV4 &, AllocateStrategy &,
 	ColumnType, uint8_t *srcObjectRowField, uint8_t *targetObjectRowField) {
 	int32_t result;
 	uint32_t srcObjectRowFieldSize = 0;
@@ -76,30 +76,29 @@ int32_t ArrayProcessor::compare(TransactionContext &txn, ObjectManager &,
 /*!
 	@brief Set field value to message
 */
-void ArrayProcessor::getField(TransactionContext &, ObjectManager &,
+void ArrayProcessor::getField(TransactionContext &, ObjectManagerV4 &, AllocateStrategy &,
 	ColumnId columnId, const Value *objectValue, MessageRowStore *messageRowStore) {
 	messageRowStore->setArrayField(columnId);
 	if (objectValue->data() != NULL) {
 		const ArrayObject arrayObject(
 			const_cast<uint8_t *>(objectValue->data()));
-		ColumnType simpleType = messageRowStore->getColumnInfoList()[columnId]
-									.getSimpleColumnType();
-		uint32_t num = arrayObject.getArrayLength();
-		uint32_t totalSize = ValueProcessor::getEncodedVarSize(num) +
-							 FixedSizeOfColumnType[simpleType] * num;
-		messageRowStore->setVarDataHeaderField(
-			columnId, totalSize);		   
-		messageRowStore->setVarSize(num);  
+		const ColumnType elemType =
+				messageRowStore->getColumnInfoList()[columnId]
+				.getArrayElementType();
+		const uint32_t elemSize = FixedSizeOfColumnType[elemType];
+
+		const uint32_t num = arrayObject.getArrayLength();
+		const uint32_t totalSize =
+				ValueProcessor::getEncodedVarSize(num) + elemSize * num;
+		messageRowStore->setVarDataHeaderField(columnId, totalSize);
+		messageRowStore->setVarSize(num); 
 		for (uint32_t i = 0; i < num; i++) {
-			const uint8_t *elemData =
-				arrayObject.getArrayElement(i, FixedSizeOfColumnType[simpleType]);
-			messageRowStore->addArrayElement(
-				elemData, FixedSizeOfColumnType[simpleType]);
+			const uint8_t *elemData = arrayObject.getArrayElement(i, elemSize);
+			messageRowStore->addArrayElement(elemData, elemSize);
 		}
 	}
-	else {
-		messageRowStore->setVarDataHeaderField(
-			columnId, 1);  
-		messageRowStore->setVarSize(0);  
+	else { 
+		messageRowStore->setVarDataHeaderField(columnId, 1);
+		messageRowStore->setVarSize(0); 
 	}
 }

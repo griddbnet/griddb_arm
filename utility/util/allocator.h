@@ -61,6 +61,10 @@
 #define UTIL_ALLOCATOR_FIXED_ALLOCATOR_RESERVE_UNIT_SMALL 1
 #endif
 
+#ifndef UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
+#define UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING 1
+#endif
+
 #ifndef UTIL_ALLOCATOR_NO_CACHE
 #define UTIL_ALLOCATOR_NO_CACHE 0
 #endif
@@ -356,6 +360,31 @@ private:
 	ActivationState *state_;
 };
 
+class AllocatorCleanUpHandler {
+public:
+	void bind(AllocatorCleanUpHandler *&another, NoopMutex*);
+	void bind(AllocatorCleanUpHandler *&another, Mutex *mutex);
+
+	void unbind() throw();
+
+	static void cleanUpAll(AllocatorCleanUpHandler *&handler) throw();
+
+protected:
+	AllocatorCleanUpHandler();
+	virtual ~AllocatorCleanUpHandler() = 0;
+
+	virtual void operator()() throw() = 0;
+
+private:
+	AllocatorCleanUpHandler(const AllocatorCleanUpHandler&);
+	AllocatorCleanUpHandler& operator=(const AllocatorCleanUpHandler&);
+
+	AllocatorCleanUpHandler **prev_;
+	AllocatorCleanUpHandler *next_;
+
+	Mutex *mutex_;
+};
+
 /*!
 	@brief Allocates fixed size memory.
 */
@@ -381,6 +410,7 @@ public:
 	void setFreeElementLimit(size_t limit);
 
 	void setErrorHandler(AllocationErrorHandler *errorHandler);
+	void addCleanUpHandler(AllocatorCleanUpHandler &cleanUpHandler);
 
 	Mutex& getLock();
 
@@ -412,9 +442,7 @@ public:
 #endif
 
 private:
-	struct FreeLink {
-		FreeLink *next_;
-	};
+	typedef detail::FreeLink FreeLink;
 
 	FixedSizeAllocator(const FixedSizeAllocator&);
 	FixedSizeAllocator& operator=(const FixedSizeAllocator&);
@@ -450,18 +478,108 @@ private:
 	AllocatorDiffReporter::ActivationSaver activationSaver_;
 #endif
 
+	AllocatorCleanUpHandler *cleanUpHandler_;
+
 	AllocatorStats stats_;
 	AllocatorLimitter *limitter_;
 };
+
+class FixedSizeCachedAllocator {
+public:
+	typedef FixedSizeAllocator<> BaseAllocator;
+	typedef FixedSizeAllocator<Mutex> LockedBaseAllocator;
+
+	FixedSizeCachedAllocator(
+			const AllocatorInfo &localInfo, BaseAllocator *base,
+			Mutex *sharedMutex, bool locked, size_t elementSize);
+	~FixedSizeCachedAllocator();
+
+	template<typename L> void* allocate(L *mutex);
+	template<typename L> void deallocate(L *mutex, void *element);
+
+	void setErrorHandler(AllocationErrorHandler *errorHandler);
+
+	BaseAllocator* base(const NoopMutex*);
+	LockedBaseAllocator* base(const Mutex*);
+
+	size_t getElementSize();
+	size_t getTotalElementCount();
+	size_t getFreeElementCount();
+
+	template<typename L>
+	void setLimit(L *mutex, AllocatorStats::Type type, size_t value);
+
+	static void applyFreeElementLimit(BaseAllocator &baseAlloc, size_t scale);
+
+
+	void getStats(AllocatorStats &stats);
+	void setLimit(AllocatorStats::Type type, size_t value);
+	void setLimit(AllocatorStats::Type type, AllocatorLimitter *limitter);
+
+private:
+	typedef detail::FreeLink FreeLink;
+
+	bool findLocal(const NoopMutex*);
+	bool findLocal(const Mutex*);
+
+	void* allocateLocal(const NoopMutex*);
+	void* allocateLocal(const Mutex*);
+
+	void deallocateLocal(const NoopMutex*, void *element);
+	void deallocateLocal(const Mutex*, void *element);
+
+	void setLimitLocal(
+			const NoopMutex*, AllocatorStats::Type type, size_t value);
+	void setLimitLocal(const Mutex*, AllocatorStats::Type type, size_t value);
+
+	void reserve();
+	void shrink();
+	void clear(size_t preservedCount);
+
+	size_t getStableElementLimit();
+	static size_t resolveFreeElementLimit(BaseAllocator *base);
+
+	template<typename L>
+	static FixedSizeAllocator<L>* tryPrepareLocal(
+			const AllocatorInfo &info, BaseAllocator *base, bool locked,
+			size_t elementSize);
+
+	AllocatorStats stats_;
+
+	FreeLink *freeLink_;
+	size_t freeElementCount_;
+
+	size_t freeElementLimit_;
+
+	UTIL_UNIQUE_PTR<BaseAllocator> localAlloc_;
+	UTIL_UNIQUE_PTR<LockedBaseAllocator> localLockedAlloc_;
+
+	BaseAllocator *base_;
+	Mutex *sharedMutex_;
+	bool shared_;
+};
+
+class VariableSizeAllocatorPool;
 
 template<
 		size_t SmallSize = 128,
 		size_t MiddleSize = 1024 * 4,
 		size_t LargeSize = 1024 * 1024>
 struct VariableSizeAllocatorTraits {
+public:
+	explicit VariableSizeAllocatorTraits(
+			VariableSizeAllocatorPool *pool = NULL) :
+			pool_(pool) {
+	}
+
 	static const size_t FIXED_ALLOCATOR_COUNT = 3;
 	static size_t getFixedSize(size_t index);
 	static size_t selectFixedAllocator(size_t size);
+
+	VariableSizeAllocatorPool* getPool() const { return pool_; }
+
+private:
+	VariableSizeAllocatorPool *pool_;
 };
 
 /*!
@@ -499,6 +617,7 @@ public:
 
 
 	BaseAllocator* base(size_t index);
+	static size_t getElementHeadSize();
 
 	size_t getTotalElementSize();
 	size_t getFreeElementSize();
@@ -512,6 +631,8 @@ public:
 	void getStats(AllocatorStats &stats);
 	void setLimit(AllocatorStats::Type type, size_t value);
 	void setLimit(AllocatorStats::Type type, AllocatorLimitter *limitter);
+
+	void setBaseLimit(size_t index, AllocatorStats::Type type, size_t value);
 
 #if UTIL_ALLOCATOR_DIFF_REPORTER_TRACE_ENABLED
 	class ManagerTool {
@@ -528,13 +649,19 @@ public:
 #endif
 
 private:
+#if UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
+	typedef UTIL_UNIQUE_PTR<FixedSizeCachedAllocator> BaseAllocatorPtr;
+#else
+	typedef BaseAllocator *BaseAllocatorPtr;
+#endif
+
 	VariableSizeAllocator(const VariableSizeAllocator&);
 	VariableSizeAllocator& operator=(const VariableSizeAllocator&);
 
-	void initialize();
+	void initialize(const Traits &traits);
 	void clear();
 
-	BaseAllocator *baseList_[Traits::FIXED_ALLOCATOR_COUNT];
+	BaseAllocatorPtr baseList_[FIXED_ALLOCATOR_COUNT];
 
 	AllocationErrorHandler *errorHandler_;
 
@@ -557,11 +684,88 @@ private:
 	AllocatorLimitter *limitter_;
 };
 
+class VariableSizeAllocatorPool {
+public:
+	explicit VariableSizeAllocatorPool(const AllocatorInfo &info);
+	~VariableSizeAllocatorPool();
+
+	void setFreeElementLimitScale(size_t scale);
+
+	static void initializeSubAllocators(
+			const AllocatorInfo &localInfo, VariableSizeAllocatorPool *pool,
+			UTIL_UNIQUE_PTR<FixedSizeCachedAllocator> *allocList,
+			const size_t *elementSizeList, size_t count, bool locked);
+
+private:
+	typedef FixedSizeCachedAllocator::BaseAllocator BaseAllocator;
+
+	struct Entry {
+		Entry(const AllocatorInfo &info, size_t elementSize);
+
+		Entry *next_;
+		BaseAllocator alloc_;
+		Mutex allocMutex_;
+	};
+
+	VariableSizeAllocatorPool(const VariableSizeAllocatorPool&);
+	VariableSizeAllocatorPool& operator=(const VariableSizeAllocatorPool&);
+
+	static void initializeSubAllocatorsNoPool(
+			const AllocatorInfo &localInfo,
+			UTIL_UNIQUE_PTR<FixedSizeCachedAllocator> *allocList,
+			const size_t *elementSizeList, size_t count, bool locked);
+	void initializeSubAllocatorsWithPool(
+			const AllocatorInfo &localInfo,
+			UTIL_UNIQUE_PTR<FixedSizeCachedAllocator> *allocList,
+			const size_t *elementSizeList, size_t count);
+
+	Entry* prepareEntries(const size_t *elementSizeList, size_t count);
+
+	AllocatorInfo info_;
+	Mutex mutex_;
+	Entry *topEntry_;
+	size_t freeElementLimitScale_;
+};
+
 namespace detail {
+struct StdAllocatorHolder;
+typedef VariableSizeAllocator<> DefaultVariableSizeAllocator;
+typedef VariableSizeAllocator<Mutex> LockedVariableSizeAllocator;
 struct VariableSizeAllocatorUtils {
+#if UTIL_HAS_TEMPLATE_PLACEMENT_NEW
+	template<typename Mutex, typename Traits>
+	struct CheckResultOf {
+		typedef VariableSizeAllocator<Mutex, Traits>& Type;
+	};
 	template<typename Mutex, typename Traits>
 	static VariableSizeAllocator<Mutex, Traits>& checkType(
 			VariableSizeAllocator<Mutex, Traits> &allocator) { return allocator; }
+#else
+	template<typename Mutex, typename Traits>
+	struct CheckResultOf {
+		typedef StdAllocatorHolder Type;
+	};
+	template<typename Mutex>
+	struct CheckResultOf< Mutex, VariableSizeAllocatorTraits<> > {
+		typedef VariableSizeAllocator<
+				Mutex, VariableSizeAllocatorTraits<> >& Type;
+	};
+	static DefaultVariableSizeAllocator& checkType(
+			DefaultVariableSizeAllocator &allocator) { return allocator; }
+	static LockedVariableSizeAllocator& checkType(
+			LockedVariableSizeAllocator &allocator) { return allocator; }
+	template<typename Mutex, typename Traits>
+	static StdAllocatorHolder checkType(
+			VariableSizeAllocator<Mutex, Traits> &allocator);
+#endif 
+
+	template<typename Mutex>
+	static FixedSizeAllocator<Mutex>* errorBaseAllocator() {
+		typedef FixedSizeAllocator<Mutex> Alloc;
+		return static_cast<Alloc*>(errorBaseAllocatorDetail());
+	}
+
+	static void* errorBaseAllocatorDetail();
 };
 }
 }	
@@ -573,6 +777,7 @@ struct VariableSizeAllocatorUtils {
 		util::detail::VariableSizeAllocatorUtils::checkType( \
 				allocator).deleteObject(object)
 
+#if UTIL_HAS_TEMPLATE_PLACEMENT_NEW
 template<typename Mutex, typename Traits>
 inline void* operator new(
 		size_t size, util::VariableSizeAllocator<Mutex, Traits> &allocator) {
@@ -588,8 +793,41 @@ inline void operator delete(void *p,
 	catch (...) {
 	}
 }
+#else
+inline void* operator new(
+		size_t size, util::detail::DefaultVariableSizeAllocator &allocator) {
+	return allocator.allocate(size);
+}
+inline void operator delete(
+		void *p,
+		util::detail::DefaultVariableSizeAllocator &allocator) throw() {
+	try {
+		allocator.deallocate(p);
+	}
+	catch (...) {
+	}
+}
+
+inline void* operator new(
+		size_t size, util::detail::LockedVariableSizeAllocator &allocator) {
+	return allocator.allocate(size);
+}
+
+inline void operator delete(
+		void *p,
+		util::detail::LockedVariableSizeAllocator &allocator) throw() {
+	try {
+		allocator.deallocate(p);
+	}
+	catch (...) {
+	}
+}
+#endif 
 
 namespace util {
+
+template<typename T, typename BaseAllocator>
+class StdAllocator;
 
 /*!
 	@brief Allocates memory, which can be freed at once according to the scop.
@@ -601,6 +839,7 @@ class StackAllocator {
 public:
 	class Scope;
 	class ConfigScope;
+	struct Option;
 
 	typedef FixedSizeAllocator<Mutex> BaseAllocator;
 
@@ -608,7 +847,9 @@ public:
 	explicit StackAllocator(BaseAllocator &base);
 #endif
 
-	StackAllocator(const AllocatorInfo &info, BaseAllocator *base);
+	StackAllocator(
+			const AllocatorInfo &info, BaseAllocator *base,
+			const Option *option = NULL);
 
 	~StackAllocator();
 
@@ -644,6 +885,14 @@ public:
 	void setLimit(AllocatorStats::Type type, AllocatorLimitter *limitter);
 
 	BaseAllocator& base();
+
+	struct Option {
+		Option();
+
+		StdAllocator<void, void> *smallAlloc_;
+		size_t smallBlockSize_;
+		size_t smallBlockLimit_;
+	};
 
 	struct Tool {
 		static void forceReset(StackAllocator &alloc);
@@ -685,6 +934,7 @@ private:
 	void pop(BlockHead *lastBlock, size_t lastRestSize);
 
 	static void handleAllocationError(util::Exception &e);
+	static Option resolveOption(BaseAllocator *base, const Option *option);
 
 	static AllocationErrorHandler *defaultErrorHandler_;
 
@@ -707,6 +957,9 @@ private:
 
 	AllocationErrorHandler *errorHandler_;
 	UTIL_DETAIL_ALLOCATOR_DECLARE_REPORTER;
+
+	Option option_;
+	size_t smallCount_;
 
 	AllocatorStats stats_;
 	AllocatorLimitter *limitter_;
@@ -1197,9 +1450,11 @@ public:
 
 	template<typename U>
 	void deleteObject(U *object) {
-		util::StdAllocator<U, void> typed(*this);
-		typed.destroy(object, 1);
-		typed.deallocate(object, 1);
+		if (object != NULL) {
+			util::StdAllocator<U, void> typed(*this);
+			typed.destroy(object);
+			typed.deallocate(object, 1);
+		}
 	}
 
 	struct EmptyConstructor {
@@ -1219,6 +1474,29 @@ private:
 	void *base_;
 	WrapperFunc *wrapper_;
 };
+
+#if !UTIL_HAS_TEMPLATE_PLACEMENT_NEW
+namespace detail {
+struct StdAllocatorHolder {
+public:
+	explicit StdAllocatorHolder(const StdAllocator<void, void> &alloc) :
+			alloc_(alloc) {
+	}
+
+	StdAllocator<void, void> operator()() const {
+		return alloc_;
+	}
+
+private:
+	StdAllocator<void, void> alloc_;
+};
+template<typename Mutex, typename Traits>
+inline StdAllocatorHolder VariableSizeAllocatorUtils::checkType(
+		VariableSizeAllocator<Mutex, Traits> &allocator) {
+	return StdAllocatorHolder(StdAllocator<void, void>());
+}
+} 
+#endif 
 
 template<typename T, typename U, typename BaseAllocator>
 inline bool operator==(
@@ -1249,6 +1527,20 @@ inline void operator delete(
 	bytesAlloc.deallocate(static_cast<uint8_t*>(p), 0);
 }
 
+#if !UTIL_HAS_TEMPLATE_PLACEMENT_NEW
+inline void* operator new(
+		size_t size, const util::detail::StdAllocatorHolder &holder) {
+	util::StdAllocator<uint8_t, void> bytesAlloc(holder());
+	return bytesAlloc.allocate(size);
+}
+
+inline void operator delete(
+		void *p, const util::detail::StdAllocatorHolder &holder) throw() {
+	util::StdAllocator<uint8_t, void> bytesAlloc(holder());
+	bytesAlloc.deallocate(static_cast<uint8_t*>(p), 0);
+}
+#endif 
+
 namespace util {
 
 namespace detail {
@@ -1263,9 +1555,10 @@ struct AllocNewChecker {
 	}
 
 	template<typename Mutex, typename Traits>
-	static VariableSizeAllocator<Mutex, Traits>& check(
+	static typename VariableSizeAllocatorUtils::
+	template CheckResultOf<Mutex, Traits>::Type check(
 			VariableSizeAllocator<Mutex, Traits> &allocator) throw() {
-		return allocator;
+		return VariableSizeAllocatorUtils::checkType(allocator);
 	}
 };
 } 
@@ -1470,6 +1763,9 @@ public:
 	const D& base() const throw() { return deleter_; }
 
 	template<typename T> bool detectNonDeletable() const throw() {
+		if (typedDeleter_.get() == NULL) {
+			return true;
+		}
 		const TypeIdFunc type1 = typedDeleter_.get()(NULL, NULL);
 		const TypeIdFunc type2 = &typeId<T>;
 		return (type1 != type2);
@@ -1699,7 +1995,8 @@ public:
 	const char8_t* getName(GroupId id, const ManagerInside *inside = NULL);
 
 	void getGroupStats(
-			const GroupId *idList, size_t idCount, AllocatorStats *statsList);
+			const GroupId *idList, size_t idCount, AllocatorStats *statsList,
+			AllocatorStats *directStats = NULL);
 
 	template<typename InsertIterator>
 	void getAllocatorStats(
@@ -1719,6 +2016,9 @@ public:
 			void *requester, std::ostream *out);
 #endif
 
+	static int64_t estimateHeapUsage(
+			const AllocatorStats &rootStats, const AllocatorStats &directStats);
+
 	struct Initializer;
 
 private:
@@ -1734,9 +2034,12 @@ private:
 	template<typename Alloc> struct Accessor;
 	struct AccessorParams;
 	struct AllocatorEntry;
+	struct AllocatorMap;
 	struct GroupEntry;
 
 	typedef void (AccessorFunc)(void*, Command, const AccessorParams&);
+	typedef void (GroupIdInsertFunc)(void*, const GroupId&);
+	typedef void (StatsInsertFunc)(void*, const AllocatorStats&);
 
 	template<typename T> struct TinyList {
 	public:
@@ -1761,10 +2064,36 @@ private:
 			AllocatorEntry &entry, LimitType limitType,
 			GroupEntry &groupEntry);
 
+	bool addAllocatorDetail(GroupId id, const AllocatorEntry &allocEntry);
+	bool removeAllocatorDetail(GroupId id, void *alloc) throw();
+	void listSubGroupDetail(
+			GroupId id, void *insertIt, GroupIdInsertFunc insertFunc,
+			bool recursive);
+	void getAllocatorStatsDetail(
+			const GroupId *idList, size_t idCount, void *insertIt,
+			StatsInsertFunc insertFunc);
+
+	static void getDirectAllocationStats(AllocatorStats &stats);
+	static void getDirectAllocationStats(
+			void *insertIt, StatsInsertFunc insertFunc);
+
 	GroupEntry* getParentEntry(GroupId &id);
 	bool isDescendantOrSelf(GroupId id, GroupId subId);
 
-	AllocatorEntry *findAllocatorEntry(void *alloc, GroupEntry &groupEntry);
+	static AllocatorEntry* findAllocatorEntry(
+			GroupEntry &groupEntry, void *alloc);
+	static void addAllocatorEntry(
+			GroupEntry &groupEntry, const AllocatorEntry &allocEntry);
+	static void removeAllocatorEntry(
+			GroupEntry &groupEntry, const AllocatorEntry &allocEntry);
+
+	template<typename InsertIterator>
+	static void insertGroupId(void *insertIt, const GroupId &id);
+	template<typename InsertIterator>
+	static void insertStats(void *insertIt, const AllocatorStats &stats);
+
+	static void mergeStatsAsInserter(
+			void *insertIt, const AllocatorStats &stats);
 
 #if UTIL_ALLOCATOR_DIFF_REPORTER_TRACE_ENABLED
 	void operateReporterSnapshots(
@@ -1808,17 +2137,6 @@ struct AllocatorManager::AllocatorEntry {
 
 	void *allocator_;
 	AccessorFunc *accessor_;
-};
-
-struct AllocatorManager::GroupEntry {
-	GroupEntry();
-	~GroupEntry();
-
-	GroupId parentId_;
-	const char8_t *nameLiteral_;
-	TinyList<AllocatorEntry> allocatorList_;
-	AllocatorLimitter *totalLimitter_;
-	size_t limitList_[LIMIT_TYPE_END];
 };
 
 namespace detail {
@@ -2172,6 +2490,11 @@ typedef BasicString<
 		std::char_traits<char8_t>,
 		StdAllocator<char8_t, StackAllocator> > String;
 
+typedef BasicString<
+		char8_t,
+		std::char_traits<char8_t>,
+		StdAllocator<char8_t, void> > AllocString;
+
 
 
 namespace detail {
@@ -2214,6 +2537,7 @@ inline FixedSizeAllocator<Mutex>::FixedSizeAllocator(
 		freeLink_(NULL),
 		totalElementCount_(0),
 		freeElementCount_(0),
+		cleanUpHandler_(NULL),
 		stats_(AllocatorInfo()),
 		limitter_(NULL) {
 	assert(elementSize > 0);
@@ -2238,6 +2562,7 @@ inline FixedSizeAllocator<Mutex>::FixedSizeAllocator(
 		freeLink_(NULL),
 		totalElementCount_(0),
 		freeElementCount_(0),
+		cleanUpHandler_(NULL),
 		stats_(info),
 		limitter_(NULL) {
 	assert(elementSize > 0);
@@ -2247,6 +2572,8 @@ inline FixedSizeAllocator<Mutex>::FixedSizeAllocator(
 
 template<typename Mutex>
 inline FixedSizeAllocator<Mutex>::~FixedSizeAllocator() {
+	AllocatorCleanUpHandler::cleanUpAll(cleanUpHandler_);
+
 #if UTIL_ALLOCATOR_REPORTER_ENABLED2
 	std::map<void*, std::string>::iterator it = stackTraceMap_.begin();
 	for (;it != stackTraceMap_.end(); it++) {
@@ -2362,6 +2689,13 @@ template<typename Mutex>
 inline void FixedSizeAllocator<Mutex>::setErrorHandler(
 		AllocationErrorHandler *errorHandler) {
 	errorHandler_ = &errorHandler;
+}
+
+template<typename Mutex>
+void FixedSizeAllocator<Mutex>::addCleanUpHandler(
+		AllocatorCleanUpHandler &cleanUpHandler) {
+	LockGuard<Mutex> guard(mutex_);
+	cleanUpHandler.bind(cleanUpHandler_, &mutex_);
 }
 
 template<typename Mutex>
@@ -2496,8 +2830,19 @@ inline void FixedSizeAllocator<Mutex>::reserve() {
 		assert(count > 0);
 
 		const size_t allocSize = std::max(elementSize_, sizeof(FreeLink));
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+		FreeLink *elementLink = detail::DirectAllocationUtils::allocateBulk(
+				allocSize, true, true, count);
+		if (count <= 0) {
+			count = 1;
+		}
+#endif
 		for (size_t i = count; i > 0; --i) {
-			void *element = UTIL_MALLOC(allocSize);
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+			void *element = elementLink;
+#else
+			void *element = UTIL_MALLOC_MONITORING(allocSize);
+#endif
 
 			if (element == NULL) {
 				if (limitter_ != NULL) {
@@ -2511,6 +2856,10 @@ inline void FixedSizeAllocator<Mutex>::reserve() {
 						", totalElementCount=" << totalElementCount_ <<
 						", freeElementCount=" << freeElementCount_ << ")");
 			}
+
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+			elementLink = elementLink->next_;
+#endif
 
 			FreeLink *next = freeLink_;
 			freeLink_ = static_cast<FreeLink*>(element);
@@ -2531,7 +2880,6 @@ inline void FixedSizeAllocator<Mutex>::reserve() {
 				}
 			}
 #endif
-
 		}
 
 		const int64_t lastTotalSize = AllocatorStats::asStatValue(
@@ -2553,6 +2901,9 @@ template<typename Mutex>
 inline void FixedSizeAllocator<Mutex>::clear(size_t preservedCount) {
 	size_t releasedCount = 0;
 
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+	FreeLink *elementLink = NULL;
+#endif
 	for (; freeLink_ != NULL; --freeElementCount_, --totalElementCount_) {
 		if (freeElementCount_ <= preservedCount &&
 				totalElementCount_ <= stableElementLimit_) {
@@ -2560,10 +2911,20 @@ inline void FixedSizeAllocator<Mutex>::clear(size_t preservedCount) {
 		}
 
 		FreeLink *next = freeLink_->next_;
-		UTIL_FREE(freeLink_);
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+		freeLink_->next_ = elementLink;
+		elementLink = freeLink_;
+#else
+		UTIL_FREE_MONITORING(freeLink_);
+#endif
 		freeLink_ = next;
 		releasedCount++;
 	}
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+	const size_t allocSize = std::max(elementSize_, sizeof(FreeLink));
+	detail::DirectAllocationUtils::deallocateBulk(
+			elementLink, allocSize, true, true);
+#endif
 
 	if (releasedCount > 0) {
 		stats_.values_[AllocatorStats::STAT_CACHE_ADJUST_COUNT]++;
@@ -2574,6 +2935,78 @@ inline void FixedSizeAllocator<Mutex>::clear(size_t preservedCount) {
 		if (limitter_ != NULL) {
 			limitter_->release(elementSize_ * releasedCount);
 		}
+	}
+}
+
+
+template<typename L>
+inline void* FixedSizeCachedAllocator::allocate(L *mutex) {
+	if (findLocal(mutex)) {
+		return allocateLocal(mutex);
+	}
+
+	LockGuard<L> guard(*mutex);
+
+	if (freeLink_ == NULL) {
+		reserve();
+	}
+
+	FreeLink *element = freeLink_;
+	freeLink_ = freeLink_->next_;
+
+	assert(freeElementCount_ > 0);
+	--freeElementCount_;
+
+	return element;
+}
+
+template<typename L>
+inline void FixedSizeCachedAllocator::deallocate(L *mutex, void *element) {
+	if (element == NULL) {
+		return;
+	}
+
+	if (findLocal(mutex)) {
+		deallocateLocal(mutex, element);
+		return;
+	}
+
+	LockGuard<L> guard(*mutex);
+
+	FreeLink *next = freeLink_;
+	freeLink_ = static_cast<FreeLink*>(element);
+	freeLink_->next_ = next;
+
+	++freeElementCount_;
+	if (freeElementCount_ > freeElementLimit_) {
+		shrink();
+	}
+}
+
+inline bool FixedSizeCachedAllocator::findLocal(const NoopMutex*) {
+	return (localAlloc_.get() != NULL);
+}
+
+inline bool FixedSizeCachedAllocator::findLocal(const Mutex*) {
+	return (localLockedAlloc_.get() != NULL);
+}
+
+template<typename L>
+void FixedSizeCachedAllocator::setLimit(
+		 L *mutex, AllocatorStats::Type type, size_t value) {
+	if (findLocal(mutex)) {
+		setLimitLocal(mutex, type, value);
+		return;
+	}
+
+	LockGuard<L> guard(*mutex);
+
+	switch (type) {
+	case AllocatorStats::STAT_CACHE_LIMIT:
+		freeElementLimit_ = value / getElementSize();
+		break;
+	default:
+		break;
 	}
 }
 
@@ -2622,7 +3055,7 @@ inline VariableSizeAllocator<Mutex, Traits>::VariableSizeAllocator(
 		traits_(traits),
 		stats_(AllocatorInfo()),
 		limitter_(NULL) {
-	initialize();
+	initialize(traits);
 }
 #endif
 
@@ -2635,7 +3068,7 @@ inline VariableSizeAllocator<Mutex, Traits>::VariableSizeAllocator(
 		traits_(traits),
 		stats_(info),
 		limitter_(NULL) {
-	initialize();
+	initialize(traits);
 }
 
 template<typename Mutex, typename Traits>
@@ -2681,7 +3114,11 @@ inline void* VariableSizeAllocator<Mutex, Traits>::allocate(size_t size) {
 	void *ptr;
 	try {
 		if (index < FIXED_ALLOCATOR_COUNT) {
+#if UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
+			ptr = baseList_[index]->allocate(&mutex_);
+#else
 			ptr = baseList_[index]->allocate();
+#endif
 		}
 		else {
 			UTIL_DETAIL_ALLOCATOR_REPORT_MISS_HIT(
@@ -2694,7 +3131,7 @@ inline void* VariableSizeAllocator<Mutex, Traits>::allocate(size_t size) {
 				limitter_->acquire(totalSize, totalSize);
 			}
 
-			ptr = UTIL_MALLOC(totalSize);
+			ptr = UTIL_MALLOC_MONITORING(totalSize);
 			if (ptr == NULL) {
 				if (limitter_ != NULL) {
 					limitter_->release(totalSize);
@@ -2755,7 +3192,11 @@ inline void VariableSizeAllocator<Mutex, Traits>::deallocate(void *element) {
 	const size_t index = traits_.selectFixedAllocator(totalSize);
 
 	if (index < FIXED_ALLOCATOR_COUNT) {
+#if UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
+		baseList_[index]->deallocate(&mutex_, ptr);
+#else
 		baseList_[index]->deallocate(ptr);
+#endif
 	}
 	else {
 		LockGuard<Mutex> guard(mutex_);
@@ -2771,10 +3212,10 @@ inline void VariableSizeAllocator<Mutex, Traits>::deallocate(void *element) {
 #endif
 
 #if UTIL_ALLOCATOR_DIFF_REPORTER_TRACE_ENABLED
-	activationSaver_.onDeallocated(ptr);
+		activationSaver_.onDeallocated(ptr);
 #endif
 
-		UTIL_FREE(ptr);
+		UTIL_FREE_MONITORING(ptr);
 
 		--hugeElementCount_;
 		hugeElementSize_ -= totalSize;
@@ -2812,7 +3253,16 @@ template<typename Mutex, typename Traits>
 inline typename VariableSizeAllocator<Mutex, Traits>::BaseAllocator*
 VariableSizeAllocator<Mutex, Traits>::base(size_t index) {
 	assert(index < FIXED_ALLOCATOR_COUNT);
+#if UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
+	return baseList_[index]->base(&mutex_);
+#else
 	return baseList_[index];
+#endif
+}
+
+template<typename Mutex, typename Traits>
+size_t VariableSizeAllocator<Mutex, Traits>::getElementHeadSize() {
+	return detail::AlignedSizeOf<size_t>::VALUE;
 }
 
 template<typename Mutex, typename Traits>
@@ -2900,7 +3350,40 @@ void VariableSizeAllocator<Mutex, Traits>::setLimit(
 }
 
 template<typename Mutex, typename Traits>
-inline void VariableSizeAllocator<Mutex, Traits>::initialize() {
+void VariableSizeAllocator<Mutex, Traits>::setBaseLimit(
+		size_t index, AllocatorStats::Type type, size_t value) {
+	assert(index < FIXED_ALLOCATOR_COUNT);
+#if UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
+	baseList_[index]->setLimit(&mutex_, type, value);
+#else
+	baseList_[index]->setLimit(type, value);
+#endif
+}
+
+template<typename Mutex, typename Traits>
+inline void VariableSizeAllocator<Mutex, Traits>::initialize(
+		const Traits &traits) {
+#if UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
+	try {
+		const size_t count = FIXED_ALLOCATOR_COUNT;
+		size_t elementSizeList[count];
+		for (size_t i = count; i > 0; --i) {
+			const size_t index = i - 1;
+			elementSizeList[index] = traits.getFixedSize(index);
+		}
+
+		const bool locked = !(IsSame<Mutex, NoopMutex>::VALUE);
+		VariableSizeAllocatorPool::initializeSubAllocators(
+				stats_.info_, traits.getPool(), baseList_, elementSizeList,
+				count, locked);
+		util::AllocatorManager::addAllocator(stats_.info_, *this);
+	}
+	catch (...) {
+		clear();
+		throw;
+	}
+#else
+	static_cast<void>(traits);
 	std::fill(baseList_, baseList_ + FIXED_ALLOCATOR_COUNT,
 			static_cast<FixedSizeAllocator<Mutex>*>(NULL));
 
@@ -2916,16 +3399,19 @@ inline void VariableSizeAllocator<Mutex, Traits>::initialize() {
 		clear();
 		throw;
 	}
+#endif
 }
 
 template<typename Mutex, typename Traits>
 inline void VariableSizeAllocator<Mutex, Traits>::clear() {
+#if !UTIL_ALLOCATOR_VAR_ALLOCATOR_POOLING
 	for (size_t i = FIXED_ALLOCATOR_COUNT; i > 0; --i) {
 		const size_t index = i - 1;
 
 		delete baseList_[index];
 		baseList_[index] = NULL;
 	}
+#endif
 
 	util::AllocatorManager::removeAllocator(stats_.info_, *this);
 }
@@ -3429,26 +3915,10 @@ inline detail::LocalUniquePtrBuilder LocalUniquePtr<T>::toBuilder(T *ptr) {
 
 template<typename Alloc>
 inline bool AllocatorManager::addAllocator(GroupId id, Alloc &alloc) {
-	util::LockGuard<util::Mutex> guard(mutex_);
-
-	while (id >= groupList_.end_ - groupList_.begin_) {
-		groupList_.add(GroupEntry());
-	}
-
-	GroupEntry &groupEntry = groupList_.begin_[id];
-	if (findAllocatorEntry(&alloc, groupEntry) != NULL) {
-		assert(false);
-		return false;
-	}
-
 	AllocatorEntry entry;
 	entry.allocator_ = &alloc;
 	entry.accessor_ = &Accessor<Alloc>::access;
-	groupEntry.allocatorList_.add(entry);
-
-	assert(findAllocatorEntry(&alloc, groupEntry) != NULL);
-
-	return true;
+	return addAllocatorDetail(id, entry);
 }
 
 template<typename Alloc>
@@ -3460,22 +3930,7 @@ inline bool AllocatorManager::addAllocator(
 template<typename Alloc>
 inline bool AllocatorManager::removeAllocator(
 		GroupId id, Alloc &alloc) throw() {
-	util::LockGuard<util::Mutex> guard(mutex_);
-
-	if (id >= groupList_.end_ - groupList_.begin_) {
-		assert(false);
-		return false;
-	}
-
-	GroupEntry &groupEntry = groupList_.begin_[id];
-	AllocatorEntry *entry = findAllocatorEntry(&alloc, groupEntry);
-	if (entry == NULL) {
-		assert(false);
-		return false;
-	}
-
-	groupEntry.allocatorList_.remove(entry);
-	return true;
+	return removeAllocatorDetail(id, &alloc);
 }
 
 template<typename Alloc>
@@ -3487,42 +3942,25 @@ inline bool AllocatorManager::removeAllocator(
 template<typename InsertIterator>
 inline void AllocatorManager::listSubGroup(
 		GroupId id, InsertIterator it, bool recursive) {
-	util::LockGuard<util::Mutex> guard(mutex_);
-
-	for (GroupEntry *groupIt = groupList_.begin_;
-			groupIt != groupList_.end_; ++groupIt) {
-
-		const GroupId subId =
-				static_cast<GroupId>(groupIt - groupList_.begin_);
-		if (subId == id || !isDescendantOrSelf(id, subId)) {
-			continue;
-		}
-		else if (!recursive && groupList_.begin_[subId].parentId_ != id) {
-			continue;
-		}
-
-		*it++ = subId;
-	}
+	listSubGroupDetail(id, &it, &insertGroupId<InsertIterator>, recursive);
 }
 
 template<typename InsertIterator>
-void AllocatorManager::getAllocatorStats(
+inline void AllocatorManager::getAllocatorStats(
 		const GroupId *idList, size_t idCount, InsertIterator it) {
-	util::LockGuard<util::Mutex> guard(mutex_);
+	getAllocatorStatsDetail(
+			idList, idCount, &it, &insertStats<InsertIterator>);
+}
 
-	for (size_t i = 0; i < idCount; i++) {
-		const GroupEntry &entry = groupList_.begin_[idList[i]];
+template<typename InsertIterator>
+void AllocatorManager::insertGroupId(void *insertIt, const GroupId &id) {
+	*(*static_cast<InsertIterator*>(insertIt))++ = id;
+}
 
-		for (AllocatorEntry *entryIt = entry.allocatorList_.begin_;
-				entryIt != entry.allocatorList_.end_; ++entryIt) {
-			AllocatorStats stats;
-			AccessorParams params;
-			params.stats_ = &stats;
-			(*entryIt->accessor_)(
-					entryIt->allocator_, COMMAND_GET_STAT, params);
-			*it++ = stats;
-		}
-	}
+template<typename InsertIterator>
+void AllocatorManager::insertStats(
+		void *insertIt, const AllocatorStats &stats) {
+	*(*static_cast<InsertIterator*>(insertIt))++ = stats;
 }
 
 template<typename Alloc>

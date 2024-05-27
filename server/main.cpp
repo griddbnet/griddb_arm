@@ -20,13 +20,10 @@
 */
 
 #include "checkpoint_service.h"
-#include "chunk_manager.h"
 #include "cluster_manager.h"
 #include "cluster_service.h"
 #include "config_table.h"
-#include "data_store.h"
 #include "event_engine.h"
-#include "log_manager.h"
 #include "partition_table.h"
 #include "recovery_manager.h"
 #include "sync_manager.h"
@@ -34,14 +31,13 @@
 #include "system_service.h"
 #include "transaction_manager.h"
 #include "transaction_service.h"
-#include "trigger_service.h"
+#include "partition.h"
 #include "sql_service.h"
-#include "sql_execution_manager.h"
-#include "sql_allocator_manager.h"
-#include "sql_utils.h"
-
+#include "sql_execution.h"
+#include "sql_command_manager.h"
+#include "database_manager.h"
 #include "picojson.h"
-#include "resource_set.h"
+
 
 #ifndef _WIN32
 #define MAIN_CAPTURE_SIGNAL
@@ -61,10 +57,10 @@
 
 
 const char8_t *const GS_PRODUCT_NAME = "GridDB";
-const int32_t GS_MAJOR_VERSION = 4;
+const int32_t GS_MAJOR_VERSION = 5;
 const int32_t GS_MINOR_VERSION = 5;
 const int32_t GS_REVISION = 0;
-const int32_t GS_BUILD_NO = 37163;
+const int32_t GS_BUILD_NO = 40191;
 
 const char8_t *const GS_EDITION_NAME = "Community Edition";
 const char8_t *const GS_EDITION_NAME_SHORT = "CE";
@@ -72,9 +68,10 @@ const char8_t *const GS_EDITION_NAME_SHORT = "CE";
 const char8_t *const SYS_CLUSTER_FILE_NAME = "gs_cluster.json";
 const char8_t *const SYS_NODE_FILE_NAME = "gs_node.json";
 const char8_t *const SYS_DEVELOPER_FILE_NAME = "gs_developer.json";
-const char8_t *const GS_CLUSTER_PARAMATER_DIFF_FILE_NAME = "gs_diff.json";
+const char8_t *const GS_CLUSTER_PARAMETER_DIFF_FILE_NAME = "gs_diff.json";
 
 const char8_t *const GS_TRACE_SECRET_HEX_KEY = "7B790AB2C82F01B3"; 
+
 
 static void autoJoinCluster(const Event::Source &eventSource,
 	util::StackAllocator &alloc, SystemService &sysSvc, PartitionTable &pt,
@@ -119,6 +116,7 @@ void signal_handler(int sig, siginfo_t *siginfo, void *param);
 
 UTIL_TRACER_DECLARE(MAIN);
 UTIL_TRACER_DECLARE(SYSTEM_SERVICE);
+AUDIT_TRACER_DECLARE(AUDIT_SYSTEM);
 
 /*!
 	@brief Handles trace request for main function
@@ -144,37 +142,6 @@ public:
 
 	const ConfigTable &config_;
 };
-
-void setUpArchive(const char *bibFile, ConfigTable &config, BibInfo &bibInfo) {
-	std::string jsonString;
-	if (bibFile != NULL) {
-		std::string inputFilePathPath;
-		const char *bibDir = ".";
-
-		util::FileSystem::createPath(
-			bibDir, bibFile, inputFilePathPath);
-		std::ifstream ifs(inputFilePathPath.c_str());
-		if (!ifs) {
-			GS_THROW_USER_ERROR(GS_ERROR_CM_FILE_NOT_FOUND,
-				std::string(bibFile) + " not found");
-		}
-		std::string tmpStr;
-		while (std::getline(ifs, tmpStr)) {
-			jsonString += tmpStr;
-			jsonString += "\n";
-		}
-	} else {
-		std::istreambuf_iterator<char> first(std::cin), last;
-		jsonString.append(first, last);
-	}
-	bibInfo.load(jsonString);
-	config.set(CONFIG_TABLE_DS_STORE_MEMORY_LIMIT, bibInfo.option_.storeMemoryLimit_,
-		"dataStore", &ConfigTable::silentHandler());
-	config.set(CONFIG_TABLE_SYS_EVENT_LOG_PATH, bibInfo.option_.logDirectory_,
-		"system", &ConfigTable::silentHandler());
-	config.set(CONFIG_TABLE_TRACE_RECOVERY_MANAGER, "LEVEL_WARNING",
-		"trace", &ConfigTable::silentHandler());
-}
 
 /*!
 	@brief main function
@@ -334,20 +301,12 @@ int main(int argc, char **argv) {
 			return EXIT_FAILURE;
 		}
 
-
-		BibInfo bibInfo;
-		if (longArchive) {
-			try {
-				setUpArchive(bibFile, config, bibInfo);
-			} catch (std::exception &e) {
-				std::cerr << "bib information is invalid :" << e.what() << std::endl;
-				return EXIT_FAILURE;
-			}
-		}
-
 		MainTraceHandler traceHandler(config);
 		setUpTrace(&config, checkOnly, longArchive);
 		config.setTraceEnabled(true);
+
+		AUDIT_TRACE_INFO(AUDIT_SYSTEM, GS_TRACE_SC_WEB_API_CALLED, 
+				"", "", "", "", "", "", "SYSTEM", "GS_START_NODE", "", "", "");
 
 #ifdef MAIN_CAPTURE_SIGNAL
 		const int syncSignals[] = {
@@ -439,71 +398,72 @@ int main(int argc, char **argv) {
 		ServiceThreadErrorHandler errorHandler;
 
 
+		util::SingleThreadExecutor exeSvc(
+				util::AllocatorInfo(
+						ALLOCATOR_GROUP_MAIN, "globalExecutorService"),
+				varSizeAlloc);
+
 		PartitionTable pt(config);
-
-		RecoveryManager recoveryMgr(config, releaseUnusedFileBlocks);
-		bool isIncrementalBackup = false;
-		if (existBackupInfoFile) {
-			isIncrementalBackup = recoveryMgr.readBackupInfoFile();
-		}
-
-		LogManager::Config logManagerConfig(config);
-		if (longArchive && !longArchiveLogDir.empty()) {
-			logManagerConfig.logDirectory_ = longArchiveLogDir;
-		}
-		LogManager logMgr(logManagerConfig);
-		logMgr.open(
-			checkOnly, forceRecoveryFromExistingFiles, isIncrementalBackup);
-
-		RecoveryManager::checkExistingFiles2(config, logMgr, createMode,
-			existBackupInfoFile, forceRecoveryFromExistingFiles);
-
 		ClusterVersionId clsVersionId = GS_CLUSTER_MESSAGE_CURRENT_VERSION;
 		ClusterManager clsMgr(config, &pt, clsVersionId);
 
 		SyncManager syncMgr(config, &pt);
 
-		TransactionManager txnMgr(config);
+		TransactionManager txnMgr(config, false);
 
-		ChunkManager::ChunkCategoryAttribute *chunkCategoryAttributeList = NULL;
-		chunkCategoryAttributeList = UTIL_NEW
-			ChunkManager::ChunkCategoryAttribute[DS_CHUNK_CATEGORY_SIZE];
-		for (int32_t i = 0; i < DS_CHUNK_CATEGORY_SIZE; i++) {
-			if (DS_CHUNK_CATEGORY_RANGE_BATCH_FREE[i]) {
-				chunkCategoryAttributeList[i].freeMode_ =
-					ChunkManager::BATCH_FREE_MODE;
-			}
+		util::FixedSizeAllocator<util::Mutex> resultSetPool(
+			util::AllocatorInfo(ALLOCATOR_GROUP_TXN_RESULT, "resultSetPool"),
+			1 << DataStoreBase::RESULTSET_POOL_BLOCK_SIZE_BITS);
+		resultSetPool.setTotalElementLimit(
+			ConfigTable::megaBytesToBytes(
+				config.getUInt32(CONFIG_TABLE_DS_RESULT_SET_MEMORY_LIMIT)) /
+			(1 << DataStoreBase::RESULTSET_POOL_BLOCK_SIZE_BITS));
+
+		const uint32_t rsCacheSize =
+			config.getUInt32(CONFIG_TABLE_DS_RESULT_SET_CACHE_MEMORY);
+		if (rsCacheSize > 0) {
+			resultSetPool.setLimit(
+				util::AllocatorStats::STAT_STABLE_LIMIT,
+				ConfigTable::megaBytesToBytes(rsCacheSize));
 		}
-		ChunkManager chunkMgr(config, DS_CHUNK_CATEGORY_SIZE,
-			chunkCategoryAttributeList, checkOnly,
-			createMode);
-		delete[] chunkCategoryAttributeList;
+		else {
+			resultSetPool.setFreeElementLimit(0);
+		}
 
-		DataStore dataStore(config, &chunkMgr);
-
-		ObjectManager *objectMgr = dataStore.getObjectManager();
-
-		EventEngine::Source source(eeVarSizeAlloc, fixedSizeAlloc);
+		PartitionList partitionList(config, &txnMgr, resultSetPool);
+		RecoveryManager recoveryMgr(config, releaseUnusedFileBlocks);
+		bool isIncrementalBackup = false;
+		if (existBackupInfoFile) {
+			isIncrementalBackup = recoveryMgr.readBackupInfoFile();
+		}
+		DataStoreConfig dsConfig(config);
 
 		EventEngine::Config eeConfig;
+		EventEngine::Source source(eeVarSizeAlloc, fixedSizeAlloc);
 
+		int32_t cacheSize = config.get<int32_t>(CONFIG_TABLE_SEC_USER_CACHE_SIZE);
+		int32_t cacheUpdateInterval = config.get<int32_t>(CONFIG_TABLE_SEC_USER_CACHE_UPDATE_INTERVAL);
+		UserCache userCache(cacheSize, varSizeAlloc, cacheUpdateInterval);
+		UserCache* pUserCache = NULL;
+		if (cacheSize > 0) {
+			pUserCache = &userCache;
+		}
+		
 		util::VariableSizeAllocator<> notifyAlloc(
 			(util::AllocatorInfo(ALLOCATOR_GROUP_MAIN, "notifyAlloc")));
 		ClusterService clsSvc(config, eeConfig, source, "CLUSTER_SERVICE",
-			clsMgr, clsVersionId, notifyAlloc);
+			clsMgr, clsVersionId, errorHandler, notifyAlloc);
 
 		SyncService syncSvc(config, eeConfig, source, "SYNC_SERVICE", syncMgr,
-			clsVersionId);
+			clsVersionId, errorHandler);
 
 		u8string diffFile;
 		util::FileSystem::createPath(
-			configDir, GS_CLUSTER_PARAMATER_DIFF_FILE_NAME, diffFile);
+			configDir, GS_CLUSTER_PARAMETER_DIFF_FILE_NAME, diffFile);
 		SystemService sysSvc(config, eeConfig, source, "SYSTEM_SERVICE",
 			diffFile.c_str(), errorHandler);
 
 		sysSvc.getUserTable().load(passwordFile.c_str());
-
-		TriggerService trgSvc(config);
 
 		TransactionService txnSvc(
 			config, eeConfig, source, "TRANSACTION_SERVICE");
@@ -521,87 +481,46 @@ int main(int argc, char **argv) {
 		LTSEventBufferManager ltsEventBufferManager(store);
 		source.bufferManager_ = &ltsEventBufferManager;
 
-		SQLAllocatorManager sqlAllocator(
-				config,
-				SQLAllocatorManager::DEFAULT_ALLOCATOR_BLOCK_SIZE_EXP);
-
-		SQLService sqlSvc(sqlAllocator,
-				config, source, "SQL_SERVICE");
+		SQLService newSqlSvc(config, eeConfig, source, "SQL_SERVICE", &pt);
 
 		StatTable stats(tableAlloc);
 		stats.initialize();
 
 		u8string address;
 		uint16_t port = 0;
-		sqlSvc.getEE()->getSelfServerND().getAddress().getIP(&address, &port);
+		newSqlSvc.getEE()->getSelfServerND().getAddress().getIP(&address, &port);
 
-		SQLExecutionManager executionManager(config, sqlAllocator);
+		SQLExecutionManager executionManager(config, valloc);
 		JobManager jobManager(valloc, store, config);
 
-		ResourceSet resourceSet(
-				&clsSvc, &syncSvc, &txnSvc, &cpSvc, &sysSvc, &trgSvc,
-				&pt, &dataStore, &logMgr, &clsMgr, &syncMgr, &txnMgr, &chunkMgr,
-				&recoveryMgr, objectMgr, &fixedSizeAlloc, &varSizeAlloc, &config,
-				&stats
-			, &sqlSvc, &executionManager, &jobManager, &store
+		DatabaseManager dbMgr(config, varSizeAlloc, txnMgr.getPartitionGroupConfig());
+
+		ManagerSet mgrSet(&clsSvc, &syncSvc, &txnSvc, &cpSvc, &sysSvc,
+			&pt, &partitionList, &clsMgr, &syncMgr, &txnMgr,
+			&recoveryMgr, &fixedSizeAlloc, &varSizeAlloc, &exeSvc,
+			&config, &stats
+			, &newSqlSvc, &executionManager, &jobManager
+			, pUserCache 
+			, NULL
+			, &dsConfig
+			,&dbMgr
 		);
 
-		recoveryMgr.initialize(resourceSet);
 
-		clsSvc.initialize(resourceSet);
-		syncSvc.initialize(resourceSet);
-		txnSvc.initialize(resourceSet);
-		sysSvc.initialize(resourceSet);
-		cpSvc.initialize(resourceSet);
-		dataStore.initialize(resourceSet);
-		sqlSvc.initialize(resourceSet);
-		executionManager.initialize(resourceSet);
-		jobManager.initialize(resourceSet);
+		recoveryMgr.initialize(mgrSet);
 
-		if (logDump) {
-			util::StackAllocator alloc(
-				util::AllocatorInfo(ALLOCATOR_GROUP_MAIN, "logStack"),
-				&fixedSizeAlloc);
-
-			std::cerr << "---LogDumpMode(output to stdout): pgId="
-					  << logDumpPgId << ", cpId=" << logDumpCpId << std::endl;
-			recoveryMgr.dumpLogFile(alloc, logDumpPgId, logDumpCpId);
-
-			return EXIT_SUCCESS;
-		}
-
-		if (dbDump) {
-			util::StackAllocator alloc(
-				util::AllocatorInfo(ALLOCATOR_GROUP_MAIN, "dbStack"),
-				&fixedSizeAlloc);
-			recoveryMgr.dumpCheckpointFile(alloc, dbDumpDir);
-
-			return EXIT_SUCCESS;
-		}
-
-		if (fileVersionDump) {
-			util::StackAllocator alloc(
-				util::AllocatorInfo(ALLOCATOR_GROUP_MAIN, "fileVersionStack"),
-				&fixedSizeAlloc);
-
-			std::cerr << "---FileVersionDump" << std::endl;
-			recoveryMgr.dumpFileVersion(
-				alloc, config.get<const char8_t *>(CONFIG_TABLE_DS_DB_PATH));
-
-			return EXIT_SUCCESS;
-		}
+		clsSvc.initialize(mgrSet);
+		syncSvc.initialize(mgrSet);
+		txnSvc.initialize(mgrSet);
+		sysSvc.initialize(mgrSet);
+		cpSvc.initialize(mgrSet);
+		partitionList.initialize(mgrSet);
+		newSqlSvc.initialize(mgrSet);
+		executionManager.initialize(mgrSet);
+		jobManager.initialize(mgrSet);
 
 
 		try {
-			if (!longArchive) { 
-				sysSvc.start();
-				clsSvc.start(source);
-				syncSvc.start();
-				txnSvc.start();
-				cpSvc.start(source);
-
-				sqlSvc.start();
-			}
 			std::cout << "Running..." << std::endl;
 
 			if (config.get<bool>(CONFIG_TABLE_DEV_RECOVERY)) {
@@ -616,22 +535,19 @@ int main(int argc, char **argv) {
 			else {
 				std::cout << "Skip Open DB" << std::endl;
 			}
-			if (longArchive) {
-				try {
-					util::StackAllocator alloc(
-						util::AllocatorInfo(ALLOCATOR_GROUP_MAIN, "dbStack"),
-						&fixedSizeAlloc);
-					dataStore.archive(alloc, txnMgr, bibInfo);
-				} catch (std::exception &e) {
-					UTIL_TRACE_EXCEPTION(MAIN, e, "");
-					return EXIT_FAILURE;
-				}
-
-				return EXIT_SUCCESS;
-			}
 			cpSvc.executeRecoveryCheckpoint(source);
+
 			if (existBackupInfoFile) {
 				recoveryMgr.removeBackupInfoFile();
+			}
+
+			if (!longArchive) { 
+				sysSvc.start();
+				clsSvc.start(source);
+				syncSvc.start();
+				txnSvc.start();
+				cpSvc.start(source);
+				newSqlSvc.start();
 			}
 
 			if (config.get<bool>(CONFIG_TABLE_DEV_AUTO_JOIN_CLUSTER)) {
@@ -676,9 +592,8 @@ int main(int argc, char **argv) {
 			txnSvc.waitForShutdown();
 			cpSvc.waitForShutdown();
 			sysSvc.waitForShutdown();
-
-			sqlSvc.shutdown();
-			sqlSvc.waitForShutdown();
+			newSqlSvc.shutdown();
+			newSqlSvc.waitForShutdown();
 
 			systemErrorOccurred = clsSvc.isSystemServiceError();
 
@@ -690,7 +605,9 @@ int main(int argc, char **argv) {
 							 " See message logs"
 						  << std::endl;
 			}
-
+			if (!systemErrorOccurred) {
+				systemErrorOccurred = clsMgr.isAutoShutdown();
+			}
 		}
 		catch (std::exception &e) {
 			systemErrorOccurred = true;
@@ -699,8 +616,8 @@ int main(int argc, char **argv) {
 			try {
 				if (!longArchive) {
 					clsSvc.shutdownAllService();
-					sqlSvc.shutdown();
-					sqlSvc.waitForShutdown();
+					newSqlSvc.shutdown();
+					newSqlSvc.waitForShutdown();
 					clsSvc.waitForShutdown();
 					syncSvc.waitForShutdown();
 					txnSvc.waitForShutdown();
@@ -764,7 +681,7 @@ void autoJoinCluster(const Event::Source &eventSource,
 			for (pId = 0; pId < pt.getPartitionNum(); pId++) {
 				pt.setPartitionStatus(pId, PartitionTable::PT_ON);
 				PartitionRole role(
-					pId, rev, PT_CURRENT_OB);
+					pId, rev, PartitionTable::PT_CURRENT_OB);
 				pt.setPartitionRole(pId, role);
 			}
 			break;
@@ -847,10 +764,7 @@ static void cleanupOnNormalShutdown(const Event::Source &eventSource,
 }
 
 static void forceShutdown(ClusterService &clsSvc,
-		const std::string &pidFileName,
-		util::PIdFile &pidFile,
-		bool checkOnly) {
-
+		const std::string &pidFileName, util::PIdFile &pidFile, bool checkOnly) {
 	if (!checkOnly) {
 		cleanupPidFile(pidFileName, pidFile);
 	}
@@ -887,7 +801,6 @@ void MainConfigSetUpHandler::operator()(ConfigTable &config) {
 	CONFIG_TABLE_RESOLVE_GROUP(config, CONFIG_TABLE_TRACE, "trace");
 	MAIN_TRACE_DECLARE(config, DEFAULT, ERROR);
 	MAIN_TRACE_DECLARE(config, MAIN, WARNING);
-	MAIN_TRACE_DECLARE(config, HASH_MAP, ERROR);
 	MAIN_TRACE_DECLARE(config, BASE_CONTAINER, ERROR);
 	MAIN_TRACE_DECLARE(config, DATA_STORE, ERROR);
 	MAIN_TRACE_DECLARE(config, COLLECTION, ERROR);
@@ -926,21 +839,34 @@ void MainConfigSetUpHandler::operator()(ConfigTable &config) {
 	MAIN_TRACE_DECLARE(config, DISTRIBUTED_FRAMEWORK, ERROR);
 	MAIN_TRACE_DECLARE(config, DISTRIBUTED_FRAMEWORK_DETAIL, ERROR);
 	MAIN_TRACE_DECLARE(config, SQL_HINT, ERROR);
+	MAIN_TRACE_DECLARE(config, SQL_INTERNAL, ERROR);
 	MAIN_TRACE_DECLARE(config, MESSAGE_LOG_TEST, ERROR);
 	MAIN_TRACE_DECLARE(config, CLUSTER_INFO_TRACE, ERROR);
 	MAIN_TRACE_DECLARE(config, SYSTEM, ERROR);
 	MAIN_TRACE_DECLARE(config, BTREE_MAP, ERROR);
-	MAIN_TRACE_DECLARE(config, AUTHENTICATION_TIMEOUT, ERROR);
-
+	MAIN_TRACE_DECLARE(config, AUTHENTICATION_TIMEOUT, WARNING);
 	MAIN_TRACE_DECLARE(config, DATASTORE_BACKGROUND, ERROR);
 	MAIN_TRACE_DECLARE(config, SYNC_DETAIL, WARNING);
 	MAIN_TRACE_DECLARE(config, CLUSTER_DETAIL, WARNING);
 	MAIN_TRACE_DECLARE(config, CLUSTER_DUMP, WARNING);
-
 	MAIN_TRACE_DECLARE(config, SQL_DETAIL, WARNING);
 	MAIN_TRACE_DECLARE(config, ZLIB_UTILS, ERROR);
 	MAIN_TRACE_DECLARE(config, SIZE_MONITOR, WARNING);
 	MAIN_TRACE_DECLARE(config, LONG_ARCHIVE, WARNING);
+	MAIN_TRACE_DECLARE(config, AUTH_OPERATION, ERROR);
+	MAIN_TRACE_DECLARE(config, PARTITION, INFO);
+	MAIN_TRACE_DECLARE(config, PARTITION_DETAIL, ERROR);
+	MAIN_TRACE_DECLARE(config, DATA_EXPIRATION_DETAIL, INFO);
+	MAIN_TRACE_DECLARE(config, CONNECTION_DETAIL, WARNING);
+	MAIN_TRACE_DECLARE(config, AUDIT_SYSTEM, CRITICAL);
+	MAIN_TRACE_DECLARE(config, AUDIT_STAT, CRITICAL);
+	MAIN_TRACE_DECLARE(config, AUDIT_SQL_READ, CRITICAL);
+	MAIN_TRACE_DECLARE(config, AUDIT_SQL_WRITE, CRITICAL);
+	MAIN_TRACE_DECLARE(config, AUDIT_NOSQL_READ, CRITICAL);
+	MAIN_TRACE_DECLARE(config, AUDIT_NOSQL_WRITE, CRITICAL);
+	MAIN_TRACE_DECLARE(config, AUDIT_CONNECT, INFO);
+	MAIN_TRACE_DECLARE(config, AUDIT_DDL, CRITICAL);
+	MAIN_TRACE_DECLARE(config, AUDIT_DCL, CRITICAL);
 
 	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_TRACE_OUTPUT_TYPE, INT32)
 		.setExtendedType(ConfigTable::EXTENDED_TYPE_ENUM)
@@ -955,6 +881,23 @@ void MainConfigSetUpHandler::operator()(ConfigTable &config) {
 	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_TRACE_FILE_COUNT, INT32)
 		.setMin(1)
 		.setDefault(30);
+
+	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_TRACE_AUDIT_LOGS, BOOL)
+		.setExtendedType(ConfigTable::EXTENDED_TYPE_LAX_BOOL)
+		.setDefault(false);
+	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_TRACE_AUDIT_LOGS_PATH, STRING)
+		.setDefault("audit");
+	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_TRACE_AUDIT_FILE_LIMIT, INT32)
+		.setUnit(ConfigTable::VALUE_UNIT_SIZE_MB)
+		.setMin(1)
+		.setDefault(10);
+	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_TRACE_AUDIT_MESSAGE_LIMIT, INT32)
+		.setMin(0)
+		.setDefault(1024);
+	
+	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_TRACE_AUDIT_FILE_COUNT, INT32)
+		.setMin(0)
+		.setDefault(0);
 
 	CONFIG_TABLE_RESOLVE_GROUP(config, CONFIG_TABLE_DEV, "developer");
 	CONFIG_TABLE_ADD_PARAM(config, CONFIG_TABLE_DEV_AUTO_JOIN_CLUSTER, BOOL)
@@ -1074,6 +1017,7 @@ void setUpAllocator() {
 		parentId, ALLOCATOR_GROUP_TXN_MESSAGE, "transactionMessage");
 	manager.addGroup(parentId, ALLOCATOR_GROUP_TXN_RESULT, "transactionResult");
 	manager.addGroup(parentId, ALLOCATOR_GROUP_TXN_WORK, "transactionWork");
+	manager.addGroup(parentId, ALLOCATOR_GROUP_TXN_STATE, "transactionState");
 
 	manager.addGroup(parentId, ALLOCATOR_GROUP_SQL_MESSAGE, "sqlMessage");
 	manager.addGroup(parentId, ALLOCATOR_GROUP_SQL_WORK, "sqlWork");
@@ -1085,8 +1029,7 @@ void StackMemoryLimitOverErrorHandler::operator()(util::Exception &e) {
 	GS_RETHROW_USER_OR_SYSTEM(e, "");
 }
 
-
-void SQLUtils::getDatabaseVersion(int32_t &major, int32_t &minor) {
+void NoSQLCommonUtils::getDatabaseVersion(int32_t &major, int32_t &minor) {
 	major = GS_MAJOR_VERSION;
 	minor = GS_MINOR_VERSION;
 }

@@ -53,7 +53,12 @@
 namespace util {
 
 namespace detail {
+struct ObjectPoolFreeLink {
+	ObjectPoolFreeLink *next_;
+};
+
 struct ObjectPoolUtils;
+template<typename Mutex, typename D> class ObjectPoolDirectAllocator;
 template<typename T, typename Mutex> class ObjectPoolAllocator;
 }
 
@@ -114,12 +119,10 @@ public:
 #endif
 
 private:
-	struct FreeLink {
-		FreeLink *next_;
-	};
+	friend struct ObjectPoolUtils;
 
-	static const size_t ELEMENT_OFFSET =
-			detail::AlignedSizeOf<FreeLink>::VALUE;
+	typedef detail::ObjectPoolFreeLink FreeLink;
+	typedef detail::ObjectPoolUtils Utils;
 
 	ObjectPool(const ObjectPool&);
 	ObjectPool& operator=(const ObjectPool&);
@@ -133,15 +136,6 @@ private:
 			size_t baseCount, const util::LockGuard<Mutex>&);
 
 	Mutex& getLock();
-
-	inline static void* elementOf(FreeLink *entry) {
-		return reinterpret_cast<uint8_t*>(entry) + ELEMENT_OFFSET;
-	}
-
-	inline static FreeLink* linkOf(void *entry) {
-		return reinterpret_cast<FreeLink*>(
-				static_cast<uint8_t*>(entry) - ELEMENT_OFFSET);
-	}
 
 	size_t freeElementLimit_;
 
@@ -172,30 +166,116 @@ struct ObjectPool<T, Mutex>::StdAllocatorResolver {
 
 namespace detail {
 struct ObjectPoolUtils {
+	static const size_t ELEMENT_OFFSET =
+			AlignedSizeOf<ObjectPoolFreeLink>::VALUE;
+
+	template<typename T> struct TypedElementDestructor;
+	struct ElementDestructor;
+
+	template<typename T> struct ElementDestructorOf {
+#if UTIL_HAS_TEMPLATE_PLACEMENT_NEW
+		typedef TypedElementDestructor<T> Type;
+#else
+		typedef ElementDestructor Type;
+#endif
+	};
+
 	template<typename T, typename Mutex>
 	static ObjectPool<T, Mutex>& checkType(ObjectPool<T, Mutex> &pool) {
 		return pool;
 	}
 
 	template<typename T, typename Mutex>
-	static void* allocateDirect(ObjectPool<T, Mutex> &pool) {
-		return pool.allocateDirect();
+	static ObjectPoolDirectAllocator<
+			Mutex, typename ElementDestructorOf<T>::Type> toDirectAllocator(
+			ObjectPool<T, Mutex> &pool) {
+		typedef typename ElementDestructorOf<T>::Type Destructor;
+		return ObjectPoolDirectAllocator<Mutex, Destructor>(
+				pool.freeLink_, pool.freeElementCount_, pool.base_,
+				Destructor::template create<T>());
 	}
 
-	template<typename T, typename Mutex>
-	static void deallocateDirect(
-			ObjectPool<T, Mutex> &pool, void *rawElement) throw() {
-		try {
-			pool.deallocateDirect(rawElement);
-		}
-		catch (...) {
-		}
-	}
-
-	template<typename T, typename Mutex>
+	template<typename T>
 	static size_t getBaseElementSize() {
-		return ObjectPool<T, Mutex>::ELEMENT_OFFSET + sizeof(T);
+		return ELEMENT_OFFSET + sizeof(T);
 	}
+
+	static size_t getElementSize(size_t baseSize) {
+		return baseSize - ELEMENT_OFFSET;
+	}
+
+	static void* elementOf(ObjectPoolFreeLink *entry) {
+		return reinterpret_cast<uint8_t*>(entry) + ELEMENT_OFFSET;
+	}
+
+	static ObjectPoolFreeLink* linkOf(void *entry) {
+		return reinterpret_cast<ObjectPoolFreeLink*>(
+				static_cast<uint8_t*>(entry) - ELEMENT_OFFSET);
+	}
+
+};
+
+template<typename T>
+struct ObjectPoolUtils::TypedElementDestructor {
+public:
+	template<typename> static TypedElementDestructor create() {
+		return TypedElementDestructor();
+	}
+
+	void operator()(void *rawElement) const {
+		static_cast<T*>(rawElement)->~T();
+	}
+};
+
+struct ObjectPoolUtils::ElementDestructor {
+public:
+	template<typename T> static ElementDestructor create() {
+		return ElementDestructor(&destruct<T>);
+	}
+
+	void operator()(void *rawElement) const {
+		func_(rawElement);
+	}
+
+private:
+	typedef void (*Func)(void*);
+
+	explicit ElementDestructor(Func func) : func_(func) {
+	}
+
+	template<typename T> static void destruct(void *rawElement) {
+		static_cast<T*>(rawElement)->~T();
+	}
+
+	Func func_;
+};
+}	
+
+namespace detail {
+template<typename Mutex, typename D>
+class ObjectPoolDirectAllocator {
+public:
+	typedef ObjectPoolFreeLink FreeLink;
+	typedef FixedSizeAllocator<Mutex> BaseAllocator;
+
+	ObjectPoolDirectAllocator(
+			FreeLink *&freeLink, size_t &freeElementCount, BaseAllocator &base,
+			const D &elementDestructor);
+
+	void* allocateDirect(size_t elementSize) const;
+	void deallocateDirect(void *rawElement) const throw();
+
+private:
+	typedef detail::ObjectPoolUtils Utils;
+
+	Mutex& getLock() const {
+		return base_.getLock();
+	}
+
+	FreeLink *&freeLink_;
+	size_t &freeElementCount_;
+	BaseAllocator &base_;
+	D elementDestructor_;
 };
 }	
 
@@ -209,12 +289,12 @@ public:
 		BaseType &pool = base();
 		if (size != sizeof(T) ||
 				pool.base().getElementSize() !=
-						ObjectPoolUtils::getBaseElementSize<T, Mutex>()) {
+						ObjectPoolUtils::getBaseElementSize<T>()) {
 			UTIL_THROW_UTIL_ERROR(CODE_ILLEGAL_ARGUMENT, "");
 		}
 
 		uint8_t *baseAddr = static_cast<uint8_t*>(pool.base().allocate());
-		return baseAddr + ObjectPoolUtils::getBaseElementSize<T, Mutex>() -
+		return baseAddr + ObjectPoolUtils::getBaseElementSize<T>() -
 				sizeof(T);
 	}
 
@@ -225,7 +305,7 @@ public:
 
 		BaseType &pool = base();
 		uint8_t *baseAddr = static_cast<uint8_t*>(ptr) + sizeof(T) -
-				ObjectPoolUtils::getBaseElementSize<T, Mutex>();
+				ObjectPoolUtils::getBaseElementSize<T>();
 
 		pool.base().deallocate(baseAddr);
 	}
@@ -250,23 +330,53 @@ private:
 }	
 
 #define UTIL_OBJECT_POOL_NEW(pool) \
-		new (util::detail::ObjectPoolUtils::checkType(pool))
+		new (util::detail::ObjectPoolUtils::toDirectAllocator(pool))
 
 #define UTIL_OBJECT_POOL_DELETE(pool, element) \
 		util::detail::ObjectPoolUtils::checkType(pool).deallocate(element)
 
-template<typename T, typename Mutex>
-void* operator new(size_t size, util::ObjectPool<T, Mutex> &pool) {
-	assert(size == sizeof(T));
-	(void) size;
-
-	return util::detail::ObjectPoolUtils::allocateDirect(pool);
+#if UTIL_HAS_TEMPLATE_PLACEMENT_NEW
+template<typename Mutex, typename D>
+void* operator new(
+		size_t size, const util::detail::ObjectPoolDirectAllocator<
+				Mutex, D> &alloc) {
+	return alloc.allocateDirect(size);
+}
+template<typename Mutex, typename D>
+void operator delete(
+		void *p, const util::detail::ObjectPoolDirectAllocator<
+				Mutex, D> &alloc) throw() {
+	alloc.deallocateDirect(p);
+}
+#else
+inline void operator delete(
+		void *p, const util::detail::ObjectPoolDirectAllocator<
+				util::NoopMutex,
+				util::detail::ObjectPoolUtils::ElementDestructor> &alloc) throw() {
+	alloc.deallocateDirect(p);
 }
 
-template<typename T, typename Mutex>
-void operator delete(void *p, util::ObjectPool<T, Mutex> &pool) throw() {
-	return util::detail::ObjectPoolUtils::deallocateDirect(pool, p);
+inline void* operator new(
+		size_t size, const util::detail::ObjectPoolDirectAllocator<
+				util::NoopMutex,
+				util::detail::ObjectPoolUtils::ElementDestructor> &alloc) {
+	return alloc.allocateDirect(size);
 }
+
+inline void* operator new(
+		size_t size, const util::detail::ObjectPoolDirectAllocator<
+				util::Mutex,
+				util::detail::ObjectPoolUtils::ElementDestructor> &alloc) {
+	return alloc.allocateDirect(size);
+}
+
+inline void operator delete(
+		void *p, const util::detail::ObjectPoolDirectAllocator<
+				util::Mutex,
+				util::detail::ObjectPoolUtils::ElementDestructor> &alloc) throw() {
+	alloc.deallocateDirect(p);
+}
+#endif 
 
 namespace util {
 
@@ -1677,8 +1787,8 @@ public:
 
 private:
 	template<typename Ev>
-	struct Enrty {
-		Enrty() : referenceCount_(0) {};
+	struct Entry {
+		Entry() : referenceCount_(0) {};
 
 		Ev value_;
 		size_t referenceCount_;
@@ -1687,7 +1797,7 @@ private:
 	WeakMap(const WeakMap&);
 	WeakMap& operator=(const WeakMap&);
 
-	typedef Enrty<V> EntryType;
+	typedef Entry<V> EntryType;
 	typedef std::map<K, EntryType*> BaseType;
 
 	BaseType base_;
@@ -1712,6 +1822,255 @@ private:
 	WeakMap<K, V> *weakMap_;
 	const K key_;
 	V *value_;
+};
+
+
+namespace detail {
+
+struct ConcurrentQueueUtils {
+	typedef void (*ErrorHandler)(std::exception&);
+	static void errorQueueClosed(ErrorHandler customHandler);
+};
+
+template< typename T, typename Alloc = StdAllocator<void, void> >
+class BlockingQueue {
+public:
+	typedef ConcurrentQueueUtils::ErrorHandler ErrorHandler;
+
+	explicit BlockingQueue(const Alloc &alloc);
+	~BlockingQueue();
+
+	void push(AllocUniquePtr<T> &ptr);
+	bool poll(AllocUniquePtr<T> &ptr);
+
+	void wait();
+
+	bool isClosed();
+	void close();
+
+	void setErrorHandler(ErrorHandler handler);
+
+private:
+	struct Entry {
+		Entry(T *value, const AllocDefaultDelete<T> &deteter);
+
+		T *value_;
+		AllocDefaultDelete<T> deteter_;
+	};
+
+	typedef typename Alloc::template rebind<Entry>::other EntryAllocator;
+
+	BlockingQueue(const BlockingQueue&);
+	BlockingQueue& operator=(const BlockingQueue&);
+
+	Condition cond_;
+	Deque<Entry, EntryAllocator> base_;
+	ErrorHandler errorHandler_;
+	bool closed_;
+};
+
+class FuturePool {
+public:
+	FuturePool(
+			const AllocatorInfo &info, const StdAllocator<void, void> &alloc);
+
+	StdAllocator<void, void>& getAllocator() throw();
+	ObjectPool<Condition, Mutex>& getConditionPool() throw();
+
+private:
+	FuturePool(const FuturePool&);
+	FuturePool& operator=(const FuturePool&);
+
+	StdAllocator<void, void> alloc_;
+	ObjectPool<Condition, Mutex> condPool_;
+};
+
+template<typename T>
+class FutureBase {
+public:
+	explicit FutureBase(FuturePool &pool);
+	~FutureBase();
+
+	FutureBase(const FutureBase &another);
+	FutureBase& operator=(const FutureBase&);
+
+	T* poll();
+	void waitFor(uint32_t timeoutMillis);
+	void setValue(const T &value);
+	void setException(std::exception &e);
+
+	bool isCancelled();
+	void cancel() throw();
+
+private:
+	struct Data;
+
+	void reset() throw();
+	Data& resolveData();
+
+	static void cancelInternal(
+			Data &data, const LockGuard<Condition> &gurad) throw();
+	static bool isResultAcceptable(
+			Data &data, const LockGuard<Condition>&) throw();
+
+	Data *data_;
+	bool forConsumer_;
+};
+
+template<typename T>
+struct FutureBase<T>::Data {
+	explicit Data(FuturePool &pool);
+	~Data();
+
+	Atomic<uint64_t> refCount_;
+	Atomic<uint64_t> consumerCount_;
+
+	FuturePool &pool_;
+	Condition *cond_;
+
+	LocalUniquePtr<T> value_;
+	LocalUniquePtr< std::pair<Exception, bool> > exception_;
+	bool cancelled_;
+	bool retrieved_;
+};
+
+struct FutureBaseUtils {
+	typedef std::pair<Exception, bool> ExceptionInfo;
+	static void errorNotAssigned();
+	static void errorRetrieved();
+	static void errorCancelled();
+	static void errorServiceShutdown(std::exception &e);
+
+	static void raiseExceptionResult(const ExceptionInfo &ex);
+	static void assignExceptionResult(
+			std::exception &e, LocalUniquePtr<ExceptionInfo> &dest) throw();
+};
+
+class TaskBase {
+public:
+	virtual ~TaskBase();
+	virtual void operator()() = 0;
+
+protected:
+	TaskBase();
+
+private:
+	TaskBase(const TaskBase&);
+	TaskBase& operator=(const TaskBase&);
+};
+
+template<typename C>
+class BasicTask : public TaskBase {
+public:
+	typedef typename C::ResultType ResultType;
+	typedef FutureBase<ResultType> FutureType;
+
+	BasicTask(FuturePool &pool, const C &command);
+	virtual ~BasicTask();
+
+	virtual void operator()();
+	FutureBase<ResultType> getFuture();
+
+private:
+	FutureBase<ResultType> future_;
+	C command_;
+};
+
+} 
+
+template<typename T>
+class Future {
+public:
+	explicit Future(const detail::FutureBase<T> &base);
+
+	T* poll();
+	void waitFor(uint32_t timeoutMillis);
+
+private:
+	detail::FutureBase<T> base_;
+};
+
+class ExecutorService {
+public:
+	template<typename C>
+	struct FutureOf {
+		typedef Future<typename detail::BasicTask<C>::ResultType> Type;
+	};
+
+	virtual ~ExecutorService();
+
+	template<typename C>
+	typename FutureOf<C>::Type submit(const C &command);
+
+	virtual void start() = 0;
+	virtual void shutdown() = 0;
+	virtual void waitForShutdown() = 0;
+
+protected:
+	ExecutorService();
+
+	virtual void submitTask(AllocUniquePtr<detail::TaskBase> &task) = 0;
+	virtual detail::FuturePool& getFuturePool() = 0;
+};
+
+class SingleThreadExecutor : public ExecutorService {
+public:
+	SingleThreadExecutor(
+			const AllocatorInfo &info, const StdAllocator<void, void> &alloc);
+	virtual ~SingleThreadExecutor();
+
+	virtual void start();
+	virtual void shutdown();
+	virtual void waitForShutdown();
+
+protected:
+	virtual void submitTask(AllocUniquePtr<detail::TaskBase> &task);
+	virtual detail::FuturePool& getFuturePool();
+
+private:
+	typedef detail::BlockingQueue<detail::TaskBase> TaskQueue;
+
+	static SingleThreadExecutor *defaultInstance_;
+
+	class Runner : public ThreadRunner {
+	public:
+		explicit Runner(TaskQueue &queueRef);
+		virtual ~Runner();
+		virtual void run();
+
+	private:
+		TaskQueue &queueRef_;
+	};
+
+	detail::FuturePool futurePool_;
+	TaskQueue queue_;
+	Runner runner_;
+	Thread thread_;
+};
+
+template< typename C, typename Alloc = StdAllocator<void, void> >
+class BatchCommand {
+public:
+	typedef typename detail::BasicTask<C>::ResultType SubResultType;
+	typedef typename Alloc::template rebind<SubResultType>::other ResultAllocator;
+	typedef typename Alloc::template rebind<C>::other CommnandAllocator;
+	typedef Vector<SubResultType, ResultAllocator> ResultType;
+	typedef Vector<C, CommnandAllocator> CommnandList;
+	typedef typename CommnandList::const_iterator CommandIterator;
+
+	explicit BatchCommand(const Alloc &alloc);
+
+	void add(const C &command);
+	template<typename It> void addAll(It begin, It end);
+	void clear();
+
+	CommandIterator begin() const;
+	CommandIterator end() const;
+
+	ResultType operator()();
+
+private:
+	CommnandList commandList_;
 };
 
 
@@ -1818,7 +2177,7 @@ ObjectPool<T, Mutex>::ObjectPool(const AllocatorInfo &info) :
 		freeElementLimit_(std::numeric_limits<size_t>::max()),
 		freeLink_(NULL),
 		freeElementCount_(0),
-		base_(info, ELEMENT_OFFSET + sizeof(T)),
+		base_(info, Utils::ELEMENT_OFFSET + sizeof(T)),
 		stats_(info) {
 
 	util::AllocatorManager::addAllocator(stats_.info_, *this);
@@ -1846,7 +2205,7 @@ T* ObjectPool<T, Mutex>::allocate() {
 		FreeLink *entry = static_cast<FreeLink*>(base_.allocate());
 
 		entry->next_ = NULL;
-		return new (elementOf(entry)) T();
+		return new (Utils::elementOf(entry)) T();
 	}
 
 	return element;
@@ -1858,7 +2217,7 @@ void ObjectPool<T, Mutex>::deallocate(T *element) {
 		return;
 	}
 
-	FreeLink *entry = linkOf(element);
+	FreeLink *entry = Utils::linkOf(element);
 
 	do {
 		const size_t baseCount = base_.getFreeElementCount();
@@ -1897,7 +2256,7 @@ T* ObjectPool<T, Mutex>::poll() {
 	assert(freeElementCount_ > 0);
 	--freeElementCount_;
 
-	return static_cast<T*>(elementOf(cur));
+	return static_cast<T*>(Utils::elementOf(cur));
 }
 
 template<typename T, typename Mutex>
@@ -1984,50 +2343,6 @@ void ObjectPool<T, Mutex>::setLimit(
 }
 
 template<typename T, typename Mutex>
-void* ObjectPool<T, Mutex>::allocateDirect() {
-	FreeLink *cur;
-	do {
-		LockGuard<Mutex> guard(getLock());
-
-		cur = freeLink_;
-		if (cur == NULL) {
-			break;
-		}
-
-		freeLink_ = cur->next_;
-
-		assert(freeElementCount_ > 0);
-		--freeElementCount_;
-	}
-	while (false);
-
-	if (cur == NULL) {
-		FreeLink *entry = static_cast<FreeLink*>(base_.allocate());
-
-		entry->next_ = NULL;
-		return elementOf(entry);
-	}
-
-	cur->next_ = NULL;
-
-	void *rawElement = elementOf(cur);
-	static_cast<T*>(rawElement)->~T();
-
-	return rawElement;
-}
-
-template<typename T, typename Mutex>
-void ObjectPool<T, Mutex>::deallocateDirect(void *rawElement) {
-	if (rawElement == NULL) {
-		return;
-	}
-
-	FreeLink *entry = linkOf(rawElement);
-	assert(entry->next_ == NULL);
-	base_.deallocate(entry);
-}
-
-template<typename T, typename Mutex>
 void ObjectPool<T, Mutex>::clear(size_t preservedCount) {
 	const size_t baseCount = base_.getFreeElementCount();
 	size_t rest = 0;
@@ -2056,7 +2371,7 @@ void ObjectPool<T, Mutex>::clear(size_t preservedCount) {
 			freeElementCount_--;
 		}
 
-		static_cast<T*>(elementOf(cur))->~T();
+		static_cast<T*>(Utils::elementOf(cur))->~T();
 		base_.deallocate(cur);
 	}
 	while (--rest > 0);
@@ -2072,6 +2387,72 @@ template<typename T, typename Mutex>
 Mutex& ObjectPool<T, Mutex>::getLock() {
 	return base_.getLock();
 }
+
+
+namespace detail {
+template<typename Mutex, typename D>
+ObjectPoolDirectAllocator<Mutex, D>::ObjectPoolDirectAllocator(
+		FreeLink *&freeLink, size_t &freeElementCount, BaseAllocator &base,
+		const D &elementDestructor) :
+		freeLink_(freeLink),
+		freeElementCount_(freeElementCount),
+		base_(base),
+		elementDestructor_(elementDestructor) {
+}
+
+template<typename Mutex, typename D>
+void* ObjectPoolDirectAllocator<Mutex, D>::allocateDirect(
+		size_t elementSize) const {
+	assert(elementSize == Utils::getElementSize(base_.getElementSize()));
+	static_cast<void>(elementSize);
+
+	FreeLink *cur;
+	do {
+		LockGuard<Mutex> guard(getLock());
+
+		cur = freeLink_;
+		if (cur == NULL) {
+			break;
+		}
+
+		freeLink_ = cur->next_;
+
+		assert(freeElementCount_ > 0);
+		--freeElementCount_;
+	}
+	while (false);
+
+	if (cur == NULL) {
+		FreeLink *entry = static_cast<FreeLink*>(base_.allocate());
+
+		entry->next_ = NULL;
+		return Utils::elementOf(entry);
+	}
+
+	cur->next_ = NULL;
+
+	void *rawElement = Utils::elementOf(cur);
+	elementDestructor_(rawElement);
+
+	return rawElement;
+}
+
+template<typename Mutex, typename D>
+void ObjectPoolDirectAllocator<Mutex, D>::deallocateDirect(
+		void *rawElement) const throw() {
+	if (rawElement == NULL) {
+		return;
+	}
+
+	FreeLink *entry = Utils::linkOf(rawElement);
+	assert(entry->next_ == NULL);
+	try {
+		base_.deallocate(entry);
+	}
+	catch (...) {
+	}
+}
+}	
 
 
 template<typename V, typename T>
@@ -2497,7 +2878,7 @@ void XArray<T, Alloc>::reserveInternal(size_t requestedCapacity) {
 
 	const uint32_t MIN_CAPACITY_BIT = 4;	
 	const size_t usedSize = this->size();
-	const size_t newCapacity = (1U << std::max<uint32_t>(
+	size_t newCapacity = (1U << std::max<uint32_t>(
 		MIN_CAPACITY_BIT,
 		static_cast<uint32_t>(sizeof(uint32_t) * CHAR_BIT) -
 		nlz(static_cast<uint32_t>(requestedCapacity - 1)) ));
@@ -2506,6 +2887,21 @@ void XArray<T, Alloc>::reserveInternal(size_t requestedCapacity) {
 				"Too large array capacity requested (size=" <<
 				requestedCapacity << ")");
 	}
+
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+	typedef detail::DirectAllocationUtils Utils;
+	if (newCapacity >= (1U << (Utils::LARGE_ELEMENT_BITS - 1)) / sizeof(T)) {
+		const size_t margin =
+				(Utils::ELEMENT_MARGIN_SIZE + sizeof(T) - 1) / sizeof(T);
+		if (margin <= newCapacity - requestedCapacity) {
+			newCapacity -= margin;
+		}
+		else if (newCapacity < (1U << (sizeof(uint32_t) * CHAR_BIT - 1)) &&
+				newCapacity > margin) {
+			newCapacity += newCapacity - margin;
+		}
+	}
+#endif
 
 	T *newData;
 	try {
@@ -3213,7 +3609,7 @@ WeakMap<K, V>::WeakMap() {
 
 template<typename K, typename V>
 WeakMap<K, V>::~WeakMap() {
-	for (typename std::map<K, Enrty<V>*>::iterator it = base_.begin();
+	for (typename std::map<K, Entry<V>*>::iterator it = base_.begin();
 			it != base_.end(); ++it) {
 		delete it->second;
 	}
@@ -3291,6 +3687,401 @@ void WeakMapReference<K, V>::unmanage() {
 	value_ = NULL;
 }
 
+
+namespace detail {
+
+
+template<typename T, typename Alloc>
+BlockingQueue<T, Alloc>::BlockingQueue(const Alloc &alloc) :
+		base_(alloc),
+		errorHandler_(NULL),
+		closed_(false) {
+}
+
+template<typename T, typename Alloc>
+BlockingQueue<T, Alloc>::~BlockingQueue() {
+	close();
+}
+
+template<typename T, typename Alloc>
+void BlockingQueue<T, Alloc>::push(AllocUniquePtr<T> &ptr) {
+	LockGuard<Condition> guard(cond_);
+	if (closed_) {
+		ConcurrentQueueUtils::errorQueueClosed(errorHandler_);
+		return;
+	}
+
+	cond_.signal();
+	base_.push_back(Entry(ptr.get(), ptr.get_deleter()));
+	ptr.release();
+}
+
+template<typename T, typename Alloc>
+bool BlockingQueue<T, Alloc>::poll(AllocUniquePtr<T> &ptr) {
+	LockGuard<Condition> guard(cond_);
+	if (base_.empty()) {
+		return false;
+	}
+
+	const Entry &entry = base_.front();
+	ptr = AllocUniquePtr<T>::of(entry.value_, entry.deteter_);
+	base_.pop_front();
+	return true;
+}
+
+template<typename T, typename Alloc>
+void BlockingQueue<T, Alloc>::wait() {
+	LockGuard<Condition> guard(cond_);
+	while (base_.empty() && !closed_) {
+		cond_.wait();
+	}
+}
+
+template<typename T, typename Alloc>
+bool BlockingQueue<T, Alloc>::isClosed() {
+	LockGuard<Condition> guard(cond_);
+	return closed_;
+}
+
+template<typename T, typename Alloc>
+void BlockingQueue<T, Alloc>::close() {
+	LockGuard<Condition> guard(cond_);
+	cond_.signal();
+
+	closed_ = true;
+	while (!base_.empty()) {
+		const Entry &entry = base_.front();
+
+		AllocUniquePtr<T> ptr(entry.value_, entry.deteter_);
+		ptr.reset();
+
+		base_.pop_front();
+	}
+}
+
+template<typename T, typename Alloc>
+void BlockingQueue<T, Alloc>::setErrorHandler(ErrorHandler handler) {
+	errorHandler_ = handler;
+}
+
+
+template<typename T, typename Alloc>
+BlockingQueue<T, Alloc>::Entry::Entry(
+		T *value, const AllocDefaultDelete<T> &deteter) :
+		value_(value),
+		deteter_(deteter) {
+}
+
+
+template<typename T>
+FutureBase<T>::FutureBase(FuturePool &pool) :
+		data_(ALLOC_NEW(pool.getAllocator()) Data(pool)),
+		forConsumer_(false) {
+}
+
+template<typename T>
+FutureBase<T>::~FutureBase() {
+	reset();
+}
+
+template<typename T>
+FutureBase<T>::FutureBase(const FutureBase &another) :
+		data_(NULL),
+		forConsumer_(false) {
+	*this = another;
+}
+
+template<typename T>
+FutureBase<T>& FutureBase<T>::operator=(const FutureBase &another) {
+	if (this == &another) {
+		return *this;
+	}
+	reset();
+
+	if (another.data_ != NULL) {
+		data_ = another.data_;
+		forConsumer_ = true;
+		++data_->refCount_;
+		++data_->consumerCount_;
+	}
+	return *this;
+}
+
+template<typename T>
+T* FutureBase<T>::poll() {
+	Data &data = resolveData();
+
+	LockGuard<Condition> guard(*data.cond_);
+	if (data.retrieved_) {
+		FutureBaseUtils::errorRetrieved();
+	}
+	else if (data.cancelled_) {
+		FutureBaseUtils::errorCancelled();
+	}
+	else if (data.exception_.get() != NULL) {
+		data.retrieved_ = true;
+		FutureBaseUtils::raiseExceptionResult(*data.exception_);
+	}
+	else if (data.value_.get() != NULL) {
+		data.retrieved_ = true;
+		return data.value_.get();
+	}
+	return NULL;
+}
+
+template<typename T>
+void FutureBase<T>::waitFor(uint32_t timeoutMillis) {
+	Data &data = resolveData();
+
+	Stopwatch watch;
+	watch.start();
+
+	LockGuard<Condition> guard(*data.cond_);
+	while (isResultAcceptable(data, guard)) {
+		const uint32_t elapsedMillis = watch.elapsedMillis();
+		if (elapsedMillis >= timeoutMillis) {
+			break;
+		}
+		data.cond_->wait(timeoutMillis - elapsedMillis);
+	}
+}
+
+template<typename T>
+void FutureBase<T>::setValue(const T &value) {
+	Data &data = resolveData();
+
+	LockGuard<Condition> guard(*data.cond_);
+	if (!isResultAcceptable(data, guard)) {
+		return;
+	}
+
+	data.cond_->signal();
+	try {
+		data.value_ = UTIL_MAKE_LOCAL_UNIQUE(data.value_, T, value);
+	}
+	catch (...) {
+		std::exception e;
+		FutureBaseUtils::assignExceptionResult(e, data.exception_);
+	}
+}
+
+template<typename T>
+void FutureBase<T>::setException(std::exception &e) {
+	Data &data = resolveData();
+
+	LockGuard<Condition> guard(*data.cond_);
+	if (!isResultAcceptable(data, guard)) {
+		return;
+	}
+
+	data.cond_->signal();
+	FutureBaseUtils::assignExceptionResult(e, data.exception_);
+}
+
+template<typename T>
+bool FutureBase<T>::isCancelled() {
+	Data &data = resolveData();
+
+	LockGuard<Condition> guard(*data.cond_);
+	return data.cancelled_;
+}
+
+template<typename T>
+void FutureBase<T>::cancel() throw() {
+	if (data_ == NULL) {
+		return;
+	}
+
+	LockGuard<Condition> guard(*data_->cond_);
+	cancelInternal(*data_, guard);
+}
+
+template<typename T>
+void FutureBase<T>::reset() throw() {
+	if (data_ == NULL) {
+		return;
+	}
+
+	Data *const data = data_;
+	const bool forConsumer = forConsumer_;
+
+	data_ = NULL;
+	forConsumer_ = false;
+
+	assert(data->refCount_ > 0);
+	const bool noRef = (--data->refCount_ == 0);
+
+	if (forConsumer) {
+		assert(data->consumerCount_ > 0);
+		if (--data->consumerCount_ == 0) {
+			LockGuard<Condition> guard(*data->cond_);
+			cancelInternal(*data, guard);
+		}
+	}
+
+	if (noRef) {
+		ALLOC_DELETE(data->pool_.getAllocator(), data);
+	}
+}
+
+template<typename T>
+typename FutureBase<T>::Data& FutureBase<T>::resolveData() {
+	if (data_ == NULL) {
+		FutureBaseUtils::errorNotAssigned();
+	}
+
+	return *data_;
+}
+
+template<typename T>
+void FutureBase<T>::cancelInternal(
+		Data &data, const LockGuard<Condition> &gurad) throw() {
+	if (!isResultAcceptable(data, gurad)) {
+		return;
+	}
+	data.cond_->signal();
+	data.cancelled_ = true;
+}
+
+template<typename T>
+bool FutureBase<T>::isResultAcceptable(
+		Data &data, const LockGuard<Condition>&) throw() {
+	return (!data.cancelled_ &&
+			data.exception_.get() == NULL &&
+			data.value_.get() == NULL);
+}
+
+
+template<typename T>
+FutureBase<T>::Data::Data(FuturePool &pool) :
+		refCount_(1),
+		consumerCount_(0),
+		pool_(pool),
+		cond_(pool.getConditionPool().allocate()),
+		cancelled_(false),
+		retrieved_(false) {
+}
+
+template<typename T>
+FutureBase<T>::Data::~Data() {
+	assert(refCount_ == 0);
+	pool_.getConditionPool().deallocate(cond_);
+}
+
+
+template<typename C>
+BasicTask<C>::BasicTask(FuturePool &pool, const C &command) :
+		future_(pool),
+		command_(command) {
+}
+
+template<typename C>
+BasicTask<C>::~BasicTask() {
+	future_.cancel();
+}
+
+template<typename C>
+void BasicTask<C>::operator()() {
+	try {
+		if (future_.isCancelled()) {
+			return;
+		}
+		future_.setValue(command_());
+	}
+	catch (...) {
+		std::exception e;
+		future_.setException(e);
+	}
+}
+
+template<typename C>
+typename BasicTask<C>::FutureType BasicTask<C>::getFuture() {
+	return future_;
+}
+
+} 
+
+
+template<typename T>
+Future<T>::Future(const detail::FutureBase<T> &base) :
+		base_(base) {
+}
+
+template<typename T>
+T* Future<T>::poll() {
+	return base_.poll();
+}
+
+template<typename T>
+void Future<T>::waitFor(uint32_t timeoutMillis) {
+	return base_.waitFor(timeoutMillis);
+}
+
+
+template<typename C>
+typename ExecutorService::template FutureOf<C>::Type
+ExecutorService::submit(const C &command) {
+	typedef detail::BasicTask<C> TaskType;
+
+	detail::FuturePool &pool = getFuturePool();
+	StdAllocator<void, void> &alloc = pool.getAllocator();
+
+	AllocUniquePtr<TaskType> task(
+			ALLOC_UNIQUE(alloc, TaskType, pool, command));
+	typename FutureOf<C>::Type future(task->getFuture());
+
+	AllocUniquePtr<detail::TaskBase> taskBase(task.release(), alloc);
+	submitTask(taskBase);
+
+	return future;
+}
+
+
+template<typename C, typename Alloc>
+BatchCommand<C, Alloc>::BatchCommand(const Alloc &alloc) :
+		commandList_(alloc) {
+}
+
+template<typename C, typename Alloc>
+void BatchCommand<C, Alloc>::add(const C &command) {
+	commandList_.push_back(command);
+}
+
+template<typename C, typename Alloc>
+template<typename It>
+void BatchCommand<C, Alloc>::addAll(It begin, It end) {
+	commandList_.insert(commandList_.end(), begin, end);
+}
+
+template<typename C, typename Alloc>
+void BatchCommand<C, Alloc>::clear() {
+	commandList_.clear();
+}
+
+template<typename C, typename Alloc>
+typename BatchCommand<C, Alloc>::CommandIterator
+BatchCommand<C, Alloc>::begin() const {
+	return commandList_.begin();
+}
+
+template<typename C, typename Alloc>
+typename BatchCommand<C, Alloc>::CommandIterator
+BatchCommand<C, Alloc>::end() const {
+	return commandList_.end();
+}
+
+template<typename C, typename Alloc>
+typename BatchCommand<C, Alloc>::ResultType
+BatchCommand<C, Alloc>::operator()() {
+	ResultType result(commandList_.get_allocator());
+
+	for (CommandIterator it = commandList_.begin();
+			it != commandList_.end(); ++it) {
+		result.push_back((*it)());
+	}
+
+	return result;
+}
 
 
 

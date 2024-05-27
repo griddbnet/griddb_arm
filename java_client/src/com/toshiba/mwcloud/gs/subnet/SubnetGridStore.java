@@ -74,7 +74,7 @@ import com.toshiba.mwcloud.gs.common.LoggingUtils;
 import com.toshiba.mwcloud.gs.common.LoggingUtils.BaseGridStoreLogger;
 import com.toshiba.mwcloud.gs.common.RowMapper;
 import com.toshiba.mwcloud.gs.common.RowMapper.Cursor;
-import com.toshiba.mwcloud.gs.common.RowMapper.MutableColumnInfo;
+import com.toshiba.mwcloud.gs.common.RowMapper.SchemaFeatureLevel;
 import com.toshiba.mwcloud.gs.common.Statement;
 import com.toshiba.mwcloud.gs.common.Statement.GeneralStatement;
 import com.toshiba.mwcloud.gs.experimental.ContainerAttribute;
@@ -669,7 +669,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 							(byte) metaNamingType.ordinal());
 				}
 				optionalRequest.putAcceptableFeatureVersion(
-						FeatureVersion.V4_3);
+						FeatureVersion.V5_3);
 			}
 
 			@Override
@@ -700,7 +700,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 		final ContainerInfo containerInfo = new ContainerInfo();
 
 		ContainerIdInfo containerIdInfo = null;
-		List<MutableColumnInfo> columnInfoList = null;
+		List<ColumnInfo.Builder> columnInfoList = null;
 		List<IndexInfo> indexInfoList = null;
 		Integer respAttribute = null;
 		Map<Integer, byte[]> rawEntries = null;
@@ -730,7 +730,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 				containerIdInfo = importIdProperty(resp, keyConverter, curEnd);
 				break;
 			case SCHEMA:
-				columnInfoList = new ArrayList<MutableColumnInfo>();
+				columnInfoList = new ArrayList<ColumnInfo.Builder>();
 				importSchemaProperty(resp, containerInfo, columnInfoList);
 				importContainerProperties(resp, containerInfo, columnInfoList);
 				break;
@@ -779,7 +779,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 
 		if (columnInfoList != null) {
 			containerInfo.setColumnInfoList(
-					new ArrayList<ColumnInfo>(columnInfoList));
+					RowMapper.toColumnInfoList(columnInfoList));
 		}
 
 		final ContainerProperties containerProps = new ContainerProperties();
@@ -960,9 +960,9 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 					bindType.castContainer(container);
 		}
 
-		final ContainerType containerType =
-				RowMapper.BindingTool.findContainerType(bindType);
 		final ContainerInfo info = findContainerInfo(props);
+		final ContainerType containerType = resolveContainerType(
+				RowMapper.BindingTool.findContainerType(bindType), info);
 
 		final ContainerKeyConverter keyConverter =
 				getContainerKeyConverter(internalMode, true);
@@ -1109,6 +1109,25 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 		};
 	}
 
+	private static OptionalRequestSource containerSchemaToOption(
+				SchemaFeatureLevel level, boolean accepting)
+				throws GSException {
+		final FeatureVersion schemaFeatureVersion =
+				getFeatureVersionForSchema(level);
+		if (!accepting && schemaFeatureVersion == null) {
+			return null;
+		}
+
+		final OptionalRequest request = new OptionalRequest();
+		if (schemaFeatureVersion != null) {
+			request.putFeatureVersion(schemaFeatureVersion);
+		}
+		if (accepting) {
+			request.putAcceptableFeatureVersion(FeatureVersion.V5_3);
+		}
+		return request;
+	}
+
 	private static OptionalRequestSource containerPropertiesToOption(
 				ContainerProperties props, RowMapper mapper)
 				throws GSException {
@@ -1119,15 +1138,28 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 					"definition in the current version");
 		}
 
-		if (props == null ||
+		final FeatureVersion schemaFeatureVersion =
+				getFeatureVersionForSchema(mapper.getFeatureLevel());
+		if (schemaFeatureVersion == null && (props == null ||
 				(props.getReservedValue() == null &&
-				props.getSchemaOptions() == null)) {
+				props.getSchemaOptions() == null))) {
 			return null;
 		}
 
 		final OptionalRequest request = new OptionalRequest();
-		request.putFeatureVersion(FeatureVersion.V4_1);
+		request.putFeatureVersion(
+				FeatureVersion.V4_1.merge(schemaFeatureVersion));
 		return request;
+	}
+
+	private static FeatureVersion getFeatureVersionForSchema(
+			SchemaFeatureLevel level) {
+		switch (level) {
+		case LEVEL2:
+			return FeatureVersion.V5_3;
+		default:
+			return null;
+		}
 	}
 
 	private void exportContainerProperties(
@@ -1144,10 +1176,12 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 		out.putInt((attribute == null ?
 				ContainerAttribute.SINGLE.flag() : attribute));
 
-		final Long reservedValue = props.getReservedValue();
+		final Long reservedValue =
+				(props == null ? null : props.getReservedValue());
 		out.putLong((reservedValue == null ? 0 : reservedValue));
 
-		final Map<Integer, byte[]> schemaOptions = props.getSchemaOptions();
+		final Map<Integer, byte[]> schemaOptions =
+				(props == null ? null : props.getSchemaOptions());
 		if (schemaOptions != null) {
 			for (Map.Entry<Integer, byte[]> entry : schemaOptions.entrySet()) {
 				final byte[] value = entry.getValue();
@@ -1257,7 +1291,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 
 	private static void importContainerProperties(
 			BasicBuffer in, ContainerInfo containerInfo,
-			List<? extends ColumnInfo> columnInfoList) throws GSException {
+			List<ColumnInfo.Builder> columnInfoList) throws GSException {
 
 		if (isTSDivisionAndAffinityEnabled() &&
 				!GridStoreChannel.v20AffinityCompatible) {
@@ -1332,7 +1366,8 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 						"columnId=" + columnId + ", " +
 						"columnCount=" + columnInfoList.size() + ")");
 			}
-			final String columnName = columnInfoList.get(columnId).getName();
+			final String columnName =
+					columnInfoList.get(columnId).toInfo().getName();
 
 			final boolean relative = in.getBoolean();
 			if (relative) {
@@ -1568,7 +1603,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 
 	private static void importSchemaProperty(
 			BasicBuffer in, ContainerInfo containerInfo,
-			List<MutableColumnInfo> columnInfoList) throws GSException {
+			List<ColumnInfo.Builder> columnInfoList) throws GSException {
 		columnInfoList.clear();
 		final RowMapper.Config config = getRowMapperConfig();
 
@@ -1587,7 +1622,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 	}
 
 	private static void importIndexProperty(
-			BasicBuffer in, List<MutableColumnInfo> columnInfoList)
+			BasicBuffer in, List<ColumnInfo.Builder> columnInfoList)
 			throws GSException {
 		final List<Set<IndexType>> indexTypesList =
 				new ArrayList<Set<IndexType>>();
@@ -1655,7 +1690,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 
 	private static void importTriggerProperty(
 			BasicBuffer in, ContainerInfo containerInfo,
-			List<? extends ColumnInfo> columnInfoList) throws GSException {
+			List<ColumnInfo.Builder> columnInfoList) throws GSException {
 		final List<TriggerInfo> triggerInfoList = new ArrayList<TriggerInfo>();
 
 		final int entryCount = in.base().getInt();
@@ -1694,7 +1729,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 							"columnCount=" + schemaColumnCount + ")");
 				}
 				final String columnName =
-						columnInfoList.get(columnId).getName();
+						columnInfoList.get(columnId).toInfo().getName();
 				columnSet.add(columnName);
 			}
 			in.getString();
@@ -1758,7 +1793,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 	}
 
 	private static void assignIndexColumnNames(
-			List<MutableColumnInfo> columnInfoList,
+			List<ColumnInfo.Builder> columnInfoList,
 			List<IndexInfo> indexInfoList, Integer attribute,
 			boolean internalMode) throws GSException {
 		if (internalMode && (attribute == null ||
@@ -1774,7 +1809,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 			final List<String> columnNameList =
 					new ArrayList<String>(columnList.size());
 			for (Integer column : columnList) {
-				final MutableColumnInfo columnInfo;
+				final ColumnInfo.Builder columnInfo;
 				try {
 					columnInfo = columnInfoList.get(column);
 				}
@@ -1783,9 +1818,10 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 							GSErrorCode.MESSAGE_CORRUPTED,
 							"Protocol error by illegal index column", e);
 				}
-				columnNameList.add(columnInfo.getName());
+				columnNameList.add(columnInfo.toInfo().getName());
 
-				final Set<IndexType> typeSet = columnInfo.getIndexTypes();
+				final Set<IndexType> typeSet =
+						columnInfo.toInfo().getIndexTypes();
 				if (typeSet != null && !typeSet.contains(type)) {
 					if (columnList.size() == 1) {
 						throw new GSConnectionException(
@@ -2881,6 +2917,8 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 		final Map<ContainerKey, SubEntry> subEntryMap =
 				new HashMap<ContainerKey, SubEntry>();
 
+		SchemaFeatureLevel featureLevel;
+
 		UUID sessionUUID;
 
 		static BasicFactory<List<Row>, Void> newFactory(
@@ -2917,6 +2955,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 					mapper.checkSchemaMatched(RowMapper.getInstance(
 							row, getRowMapperConfig()));
 				}
+				featureLevel = mapper.getFeatureLevel().merge(featureLevel);
 			}
 
 			if (entry == null) {
@@ -2954,7 +2993,9 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 				req.putUUID(sessionUUID);
 			}
 
-			tryPutSystemOptionalRequest(req, context, internalMode, false, null);
+			tryPutSystemOptionalRequest(
+					req, context, internalMode, false, null,
+					containerSchemaToOption(featureLevel, false));
 
 			final ContainerKeyConverter keyConverter =
 					context.getKeyConverter(internalMode, true);
@@ -3025,7 +3066,9 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 				req.putUUID(sessionUUID);
 			}
 
-			tryPutDatabaseOptionalRequest(req, context, null);
+			tryPutDatabaseOptionalRequest(
+					req, context,
+					containerSchemaToOption(featureLevel, false));
 
 			req.putInt(mapperList.size());
 			for (RowMapper mapper : mapperList) {
@@ -3440,6 +3483,20 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 	private static class MultiGetRequest<V extends RowKeyPredicate<?>>
 	extends MultiOperationStatement<ContainerKey, V> {
 
+		private static class PredicateEntry {
+
+			final RowKeyPredicate<?> predicate;
+
+			final RowMapper mapper;
+
+			PredicateEntry(
+					RowKeyPredicate<?> predicate, RowMapper mapper) {
+				this.predicate = predicate;
+				this.mapper = mapper;
+			}
+
+		}
+
 		private static class SubEntry {
 
 			ContainerKey containerKey;
@@ -3454,12 +3511,14 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 
 		final MultiOperationContext<ContainerKey, V, List<Row>> multiContext;
 
-		final List<RowKeyPredicate<?>> predicateList =
-				new ArrayList<RowKeyPredicate<?>>();
+		final List<PredicateEntry> predicateList =
+				new ArrayList<PredicateEntry>();
 
 		final List<SubEntry> entryList = new ArrayList<SubEntry>();
 
 		final ContainerKeyConverter keyConverter;
+
+		SchemaFeatureLevel featureLevel;
 
 		MultiGetRequest(
 				MultiOperationContext<ContainerKey, V, List<Row>> multiContext,
@@ -3491,7 +3550,10 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 			entry.predicateIndex = predicateList.indexOf(value);
 			if (entry.predicateIndex < 0) {
 				entry.predicateIndex = predicateList.size();
-				predicateList.add(value);
+				final RowMapper mapper =
+						RowMapper.getInstance(value, ANY_MAPPER_CONFIG);
+				featureLevel = mapper.getFeatureLevel().merge(featureLevel);
+				predicateList.add(new PredicateEntry(value, mapper));
 			}
 			entry.attribute = attribute;
 			entry.source = source;
@@ -3511,15 +3573,18 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 				req.putUUID(context.getSessionUUID());
 			}
 
-			tryPutSystemOptionalRequest(req, context, internalMode, false, null);
+			tryPutSystemOptionalRequest(
+					req, context, internalMode, false, null,
+					containerSchemaToOption(featureLevel, true));
 
 			final RowMapper.MappingMode mappingMode =
 					SubnetContainer.getRowMappingMode();
 
 			req.putInt(predicateList.size());
-			for (RowKeyPredicate<?> predicate : predicateList) {
-				final RowMapper mapper =
-						RowMapper.getInstance(predicate, ANY_MAPPER_CONFIG);
+			for (PredicateEntry entry : predicateList) {
+				final RowKeyPredicate<?> predicate = entry.predicate;
+				final RowMapper mapper = entry.mapper;
+
 				final boolean composite = (mapper.getKeyCategory() ==
 						RowMapper.KeyCategory.COMPOSITE);
 
@@ -3829,70 +3894,85 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 			return map;
 		}
 
-		
+		List<UserInfo> list = new LinkedList<UserInfo>();
 		for (int i = 0; i < userInfoCount; i++) {
-
 			String userName = resp.getString();		
 			Byte property = resp.base().get();		
 			Boolean passwordExist = resp.getBoolean();	
+			String tmp = resp.getString();
 			String hashPassword = "";
 
 			if (passwordExist) {
-				hashPassword = resp.getString();
+				hashPassword = tmp;
 			}
-
-			map.put(userName, new UserInfo(userName, hashPassword, (Boolean)(property != 0)));
+			list.add(new UserInfo(userName, hashPassword, (Boolean)(property != 0), false, ""));
 		}
-
+		for (int i = 0; i < userInfoCount; i++) {
+			Boolean isGroupMapping = resp.getBoolean();	
+			String roleName = resp.getString();		
+			
+			if (list.get(i).getName().length() > 0) {
+				map.put(list.get(i).getName(), new UserInfo(list.get(i).getName(), list.get(i).getHashPassword(), list.get(i).isSuperUser(), isGroupMapping, roleName));
+			} else {
+				map.put(roleName, new UserInfo(list.get(i).getName(), list.get(i).getHashPassword(), list.get(i).isSuperUser(), isGroupMapping, roleName));
+			}
+		}
 		return map;
 	}
 
-	public void putUser(String name, UserInfo userInfo, boolean modifiable)
+	public void putUser(String name, UserInfo userInfo, boolean modifiable, boolean isRole)
 			throws GSException {
-
-		GSErrorCode.checkNullParameter(userInfo, "userInfo", null);
-
-		
-		name = resolveName(name, userInfo.getName(), "user name");
-
 		final BasicBuffer req = context.getRequestBuffer();
 		final BasicBuffer resp = context.getResponseBuffer();
 
 		channel.setupRequestBuffer(req);
 
-		NodeConnection.tryPutEmptyOptionalRequest(req);
+		OptionalRequest opt = new OptionalRequest();
+		if (isRole) { 
+			opt.putFeatureVersion(FeatureVersion.V4_5);
+		}
+		opt.format(req);
 
 		final int partitionId = SYSTEM_USER_PARTITION_ID;
 
-		final String password = userInfo.getPassword();
-		final String hashPassword = userInfo.getHashPassword();
+		if (isRole) { 
+			setUserInfoRequest(req, name, (byte) 0, null);
+		} else {
+		
+			GSErrorCode.checkNullParameter(userInfo, "userInfo", null);
 
-		if (password != null && hashPassword == null) {
-			RowMapper.checkString(password, "password");
+			
+			name = resolveName(name, userInfo.getName(), "user name");
 
-			final int bytesLength =
-					password.getBytes(BasicBuffer.DEFAULT_CHARSET).length;
-			if (bytesLength > MAX_PASSWORD_BYTES_LENGTH) {
-				throw new GSException(GSErrorCode.ILLEGAL_PARAMETER,
-						"The length of password string bytes exceeded (max=" +
-						MAX_PASSWORD_BYTES_LENGTH + ")");
+			final String password = userInfo.getPassword();
+			final String hashPassword = userInfo.getHashPassword();
+
+			if (password != null && hashPassword == null) {
+				RowMapper.checkString(password, "password");
+
+				final int bytesLength =
+						password.getBytes(BasicBuffer.DEFAULT_CHARSET).length;
+				if (bytesLength > MAX_PASSWORD_BYTES_LENGTH) {
+					throw new GSException(GSErrorCode.ILLEGAL_PARAMETER,
+							"The length of password string bytes exceeded (max=" +
+							MAX_PASSWORD_BYTES_LENGTH + ")");
+				}
+
+				setUserInfoRequest(
+						req, name, (byte) 0, NodeConnection.getDigest(password));
 			}
-
-			setUserInfoRequest(
-					req, name, (byte) 0, NodeConnection.getDigest(password));
+			else if (password == null && hashPassword != null) {
+				setUserInfoRequest(req, name, (byte) 0, hashPassword);
+			}
+			else if (password == null) {
+				throw new GSException(GSErrorCode.EMPTY_PARAMETER,
+						"Password and hash password not specified");
+			}
+			else {
+				throw new GSException(GSErrorCode.ILLEGAL_PARAMETER,
+						"Both password and hash password specified");
+			}
 		}
-		else if (password == null && hashPassword != null) {
-			setUserInfoRequest(req, name, (byte) 0, hashPassword);
-		}
-		else if (password == null) {
-			throw new GSException(GSErrorCode.EMPTY_PARAMETER,
-					"Password and hash password not specified");
-		}
-		else {
-			throw new GSException(GSErrorCode.ILLEGAL_PARAMETER,
-					"Both password and hash password specified");
-		}
-
 		req.putBoolean(modifiable);
 
 		executeStatement(Statement.PUT_USER, partitionId, req, resp, null);
@@ -3925,7 +4005,9 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 
 		channel.setupRequestBuffer(req);
 
-		NodeConnection.tryPutEmptyOptionalRequest(req);
+		OptionalRequest opt = new OptionalRequest();
+		opt.putAcceptableFeatureVersion(FeatureVersion.V4_5);
+		opt.format(req);
 
 		final int partitionId = SYSTEM_USER_PARTITION_ID;
 
@@ -3947,7 +4029,9 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 
 		channel.setupRequestBuffer(req);
 
-		NodeConnection.tryPutEmptyOptionalRequest(req);
+		OptionalRequest opt = new OptionalRequest();
+		opt.putAcceptableFeatureVersion(FeatureVersion.V4_5);
+		opt.format(req);
 
 		final int partitionId = SYSTEM_USER_PARTITION_ID;
 
@@ -4162,7 +4246,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 		channel.setupRequestBuffer(req);
 
 		OptionalRequest opt = new OptionalRequest();
-		opt.putAcceptableFeatureVersion(FeatureVersion.V4_3);
+		opt.putAcceptableFeatureVersion(FeatureVersion.V4_5);
 		opt.format(req);
 
 		final int partitionId = SYSTEM_USER_PARTITION_ID;
@@ -4187,7 +4271,7 @@ Experimentals.AsStore, Experimentals.StoreProvider {
 		channel.setupRequestBuffer(req);
 
 		OptionalRequest opt = new OptionalRequest();
-		opt.putAcceptableFeatureVersion(FeatureVersion.V4_3);
+		opt.putAcceptableFeatureVersion(FeatureVersion.V4_5);
 		opt.format(req);
 
 		final int partitionId = SYSTEM_USER_PARTITION_ID;

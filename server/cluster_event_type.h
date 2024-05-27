@@ -23,6 +23,7 @@
 #define CLUSTER_EVENT_TYPE_H_
 
 #include "util/type.h"
+#include "util/container.h"
 
 
 static const int32_t V_1_5_CLUSTER_START = 1000;
@@ -73,7 +74,10 @@ enum WebAPIErrorType {
 
 	WEBAPI_NOT_RECOVERY_CHECKPOINT = 400,
 	WEBAPI_CONFIG_SET_ERROR,
-	WEBAPI_CONFIG_GET_ERROR
+	WEBAPI_CONFIG_GET_ERROR,
+
+	WEBAPI_DATABASE = 500,
+	WEBAPI_DB_INVALID_PARAMETER
 };
 
 /*!
@@ -227,6 +231,7 @@ enum GSEventType {
 	REMOVE_MULTIPLE_ROWS_BY_ID_SET,
 	UPDATE_MULTIPLE_ROWS_BY_ID_SET,
 	UPDATE_TABLE_CACHE,
+	SEND_EVENT,
 
 	CLIENT_STATEMENT_TYPE_MAX =
 		499,  
@@ -293,6 +298,8 @@ enum GSEventType {
 
 	CS_NEWSQL_PARTITION_REFRESH,
 	CS_NEWSQL_PARTITION_REFRESH_ACK,
+	
+	CS_SEND_MASTER_INFO,
 
 
 	TXN_SHORTTERM_SYNC_REQUEST =
@@ -312,6 +319,7 @@ enum GSEventType {
 	TXN_LONGTERM_SYNC_LOG_ACK,	/*!< LONGTERM_SYNC_LOG ack */
 	TXN_SYNC_TIMEOUT,			  /*!< synchronization timeout */
 	TXN_LONGTERM_SYNC_PREPARE_ACK,
+	TXN_LONGTERM_SYNC_RECOVERY_ACK,
 	SYC_SHORTTERM_SYNC_LOG =
 		2500,			   /*!< shor-term synchronization via SyncService */
 	SYC_LONGTERM_SYNC_LOG, /*!< long-term log synchronization via SyncService */
@@ -319,12 +327,10 @@ enum GSEventType {
 								SyncService */
 	TXN_SYNC_CHECK_END,
 
-
-
 	PARTITION_GROUP_START =
 		3000,			 /*!< start of checkpoint among a group of Partitions */
 	PARTITION_START,	 /*!< start of Partition checkpoint */
-	COPY_CHUNK,			 /*!< copy chunk */
+ 	EXECUTE_CP,			 /*!< execute (full or partial) checkpoint */
 	PARTITION_END,		 /*!< end of Partition checkpoint */
 	PARTITION_GROUP_END, /*!< end of checkpoint among a group of Partitions */
 	WRITE_LOG_PERIODICALLY, /*!< periodic write to log */
@@ -349,12 +355,17 @@ enum GSEventType {
 	NOSQL_CANCEL,
 	SQL_DDL_RESULT,
 
-
 	RECV_NOTIFY_MASTER = 5000 /*!< multicasts master address for NoSQL client */
 	,
 	EVENT_TYPE_MAX
 };
 
-const char8_t* getEventTypeName(EventType eventType);
+
+class EventTypeUtility {
+public:
+	static const char8_t* getEventTypeName(EventType eventType);
+	static EventType getCategoryEventType(EventType eventType);
+	static std::set<EventType> CATEGORY_EVENT_TYPES;
+};
 
 #endif

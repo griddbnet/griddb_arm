@@ -97,9 +97,10 @@ int SelectionTimeFind<isJustInclude, isAscending>::operator()(
 			"Invalid column for aggregation, first arg must be *");
 	}
 
-	ObjectManager &objectManager = *(timeSeries.getObjectManager());
+	ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
+	AllocateStrategy &strategy = timeSeries.getRowAllocateStrategy();
 	Expr *tsExpr =
-		args[1]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
+		args[1]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
 	Timestamp baseTs = tsExpr->getTimeStamp();
 	Timestamp ts;
 	bool found;
@@ -241,9 +242,10 @@ uint64_t SelectionTimeFind<isJustInclude, isAscending>::apiPassThrough(
 	}
 
 	Value v;
-	ObjectManager &objectManager = *(timeSeries.getObjectManager());
+	ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
+	AllocateStrategy &strategy = timeSeries.getRowAllocateStrategy();
 	Expr *tsExpr =
-		args[1]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
+		args[1]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
 	if (tsExpr->isNullValue()) {
 		resultNum = 0;
 		return 0;
@@ -284,12 +286,12 @@ void SelectionTimeInterpolated::getInterpolatedValue(TransactionContext &txn,
 	double rate = static_cast<double>(t - t1) / static_cast<double>(t2 - t1);
 	tmp1.set(rate);
 
-	CalculatorTable::subTable_[v2.getType()][v1.getType()](txn, v2.data(), 0, v1.data(), 0,
-		vdiff);  
-	CalculatorTable::mulTable_[tmp1.getType()][vdiff.getType()](
-		txn, tmp1.data(), 0, vdiff.data(), 0, tmp2);
-	CalculatorTable::addTable_[tmp2.getType()][v1.getType()](
-		txn, tmp2.data(), 0, v1.data(), 0, v);
+	CalculatorTable::Sub()(v2.getType(), v1.getType())(
+			txn, v2.data(), 0, v1.data(), 0, vdiff);  
+	CalculatorTable::Mul()(tmp1.getType(), vdiff.getType())(
+			txn, tmp1.data(), 0, vdiff.data(), 0, tmp2);
+	CalculatorTable::Add()(tmp2.getType(), v1.getType())(
+			txn, tmp2.data(), 0, v1.data(), 0, v);
 	int64_t i = v.getLong();
 	double d = v.getDouble();
 	switch (v1.getType()) {
@@ -331,7 +333,8 @@ int SelectionTimeInterpolated::operator()(TransactionContext &txn,
 	bool isSorted, OutputOrder, SortExprList *, uint64_t, uint64_t offset,
 	FunctionMap &, ExprList &args, OutputMessageRowStore *messageRowStore,
 	ResultType &resultType) {
-	ObjectManager &objectManager = *(timeSeries.getObjectManager());
+	ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
+	AllocateStrategy &strategy = timeSeries.getRowAllocateStrategy();
 	if (args.size() != 2) {
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_COUNT,
 			"Invalid argument count for selection");
@@ -346,7 +349,7 @@ int SelectionTimeInterpolated::operator()(TransactionContext &txn,
 
 	Value v;
 	Expr *tsExpr =
-		args[1]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
+		args[1]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
 
 	if (tsExpr->isNullValue()) {
 		return 0;
@@ -372,7 +375,7 @@ int SelectionTimeInterpolated::operator()(TransactionContext &txn,
 	}
 
 	resultType = RESULT_ROWSET;
-	if (!(type >= COLUMN_TYPE_BYTE && type <= COLUMN_TYPE_DOUBLE)) {
+	if (!ValueProcessor::isNumerical(type)) {
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE,
 			"Cannot interpolate non-numeric column");
 	}
@@ -427,9 +430,8 @@ int SelectionTimeInterpolated::operator()(TransactionContext &txn,
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_TIM_SAMPLE_FAILED,
 			"Specified time is later than all timestamp in resultset.");
 	}
-
-	ContainerValue v1(txn.getPartitionId(), objectManager);
-	ContainerValue v2(txn.getPartitionId(), objectManager);
+	ContainerValue v1(objectManager, timeSeries.getRowAllocateStrategy());
+	ContainerValue v2(objectManager, timeSeries.getRowAllocateStrategy());
 	ColumnInfo &interpolateColumnInfo =
 		timeSeries.getColumnInfo(columnId);  
 	rowArray.load(txn, resultRowIdList[pos - 1], &timeSeries,
@@ -489,13 +491,13 @@ uint64_t SelectionTimeInterpolated::apiPassThrough(TransactionContext &txn,
 		type = columnInfo->getColumnType();
 	}
 	resultType = RESULT_ROWSET;
-	if (!(type >= COLUMN_TYPE_BYTE && type <= COLUMN_TYPE_DOUBLE)) {
+	if (!ValueProcessor::isNumerical(type)) {
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE,
 			"Cannot interpolate non-numeric column");
 	}
 
 	Expr *tsExpr = args[1]->eval(
-		txn, *(timeSeries.getObjectManager()), NULL, NULL, EVAL_MODE_NORMAL);
+		txn, *(timeSeries.getObjectManager()), timeSeries.getRowAllocateStrategy(), NULL, NULL, EVAL_MODE_NORMAL);
 	if (tsExpr->isNullValue()) {
 		return 0;
 	}
@@ -543,8 +545,9 @@ int SelectionTimeSampling::operator()(TransactionContext &txn,
 					  (*orderByExpr)[0].expr->getColumnId() == 0 &&
 					  (*orderByExpr)[0].order == ASC);
 
-	ObjectManager &objectManager = *(timeSeries.getObjectManager());
-	bool isNullValue = parseArgument(txn, objectManager, args, columnId, columnType, fType,
+	ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
+	AllocateStrategy &strategy = timeSeries.getRowAllocateStrategy();
+	bool isNullValue = parseArgument(txn, objectManager, strategy, args, columnId, columnType, fType,
 		targetTs, endTs, duration);
 	if (isNullValue) {
 		return 0;
@@ -617,14 +620,14 @@ int SelectionTimeSampling::operator()(TransactionContext &txn,
 			tmpRow.key = targetTs;
 			if (columnId != UNDEF_COLUMNID) {
 				Value *v = QP_NEW Value();
-				ContainerValue currentContainerValue(txn.getPartitionId(), objectManager);
+				ContainerValue currentContainerValue(objectManager, timeSeries.getRowAllocateStrategy());
 				rowArray.load(txn, resultRowIdList[i], &timeSeries,
 					OBJECT_READ_ONLY);  
 				BaseContainer::RowArray::Row row(
 					rowArray.getRow(), &rowArray);  
 				row.getField(txn, timeSeries.getColumnInfo(columnId),
 					currentContainerValue);  
-				v->copy(txn, objectManager,
+				v->copy(txn, objectManager, strategy,
 					currentContainerValue
 						.getValue());  
 				tmpRow.value = v;
@@ -642,8 +645,8 @@ int SelectionTimeSampling::operator()(TransactionContext &txn,
 			tmpRow.key = targetTs;
 			if (columnId != UNDEF_COLUMNID) {
 				Value *v = QP_NEW Value();
-				ContainerValue v1(txn.getPartitionId(), objectManager);
-				ContainerValue v2(txn.getPartitionId(), objectManager);
+				ContainerValue v1(objectManager, timeSeries.getRowAllocateStrategy());
+				ContainerValue v2(objectManager, timeSeries.getRowAllocateStrategy());
 				rowArray.load(txn, resultRowIdList[i - 1], &timeSeries,
 					OBJECT_READ_ONLY);  
 				BaseContainer::RowArray::Row row1(
@@ -714,7 +717,7 @@ int SelectionTimeSampling::operator()(TransactionContext &txn,
 }
 
 bool SelectionTimeSampling::parseArgument(TransactionContext &txn,
-	ObjectManager &objectManager, ExprList &args, uint32_t &columnId,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, ExprList &args, uint32_t &columnId,
 	ColumnType &columnType, util::DateTime::FieldType &fType,
 	Timestamp &targetTs, Timestamp &endTs, int32_t &duration) {
 	if (args.size() != 5) {
@@ -744,9 +747,9 @@ bool SelectionTimeSampling::parseArgument(TransactionContext &txn,
 
 	const char *unitStr;
 	Expr *e1, *e2, *e3;
-	e1 = args[1]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
-	e2 = args[2]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
-	e3 = args[3]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
+	e1 = args[1]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
+	e2 = args[2]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
+	e3 = args[3]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
 	if (e1->isNullValue() || e2->isNullValue() || e3->isNullValue()) {
 		return true;
 	}
@@ -763,7 +766,7 @@ bool SelectionTimeSampling::parseArgument(TransactionContext &txn,
 	}
 
 	if (!args[4]->isColumn()) {
-		Expr *e4 = args[4]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
+		Expr *e4 = args[4]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
 		if (e4->isNullValue()) {
 			return true;
 		}
@@ -813,13 +816,13 @@ uint64_t SelectionTimeSampling::apiPassThrough(TransactionContext &txn,
 	Sampling sampling;
 	int64_t duration_msec;
 
-	ObjectManager &objectManager = *(timeSeries.getObjectManager());
-	bool isNullValue = parseArgument(txn, objectManager, args, columnId, columnType, fType,
+	ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
+	AllocateStrategy &strategy = timeSeries.getRowAllocateStrategy();
+	bool isNullValue = parseArgument(txn, objectManager, strategy, args, columnId, columnType, fType,
 		startTs, endTs, duration);
 	if (isNullValue) {
 		return 0;
 	}
-
 
 	if (columnId != UNDEF_COLUMNID) {
 		sampling.interpolatedColumnIdList_.push_back(columnId);
@@ -854,21 +857,13 @@ uint64_t SelectionTimeSampling::apiPassThrough(TransactionContext &txn,
 	sampling.timeUnit_ = unit;
 	sampling.mode_ = INTERP_MODE_LINEAR_OR_PREVIOUS;
 
-	Timestamp expiredTime = timeSeries.getCurrentExpiredTime(txn);
-
-	if (expiredTime > endTs) {
-		return 0;
-	}
-	if (expiredTime > startTs) {
-		startTs = expiredTime;
-	}
 	TermCondition *currentStartCond = sc.getStartKeyCondition();
 	if (currentStartCond == NULL) {
 		TermCondition startCond(
 			COLUMN_TYPE_TIMESTAMP, COLUMN_TYPE_TIMESTAMP,
 			DSExpression::GE,
 			ColumnInfo::ROW_KEY_COLUMN_ID, reinterpret_cast<uint8_t *>(&startTs), sizeof(startTs));
-		sc.addCondition(startCond, true);
+		sc.addCondition(txn, startCond, true);
 	}
 	else {
 		bool isReplace = false;
@@ -897,7 +892,7 @@ uint64_t SelectionTimeSampling::apiPassThrough(TransactionContext &txn,
 			COLUMN_TYPE_TIMESTAMP, COLUMN_TYPE_TIMESTAMP,
 			DSExpression::LE,
 			ColumnInfo::ROW_KEY_COLUMN_ID, reinterpret_cast<uint8_t *>(&endTs), sizeof(endTs));
-		sc.addCondition(endCond, true);
+		sc.addCondition(txn, endCond, true);
 	}
 	else {
 		Timestamp endTs2 =
@@ -924,17 +919,17 @@ uint64_t SelectionTimeSampling::apiPassThrough(TransactionContext &txn,
 		util::StackAllocator &alloc = txn.getDefaultAllocator();
 		util::XArray<uint8_t> fixedData(alloc);
 		util::XArray<uint8_t> variableData(alloc);
-		const DataStoreValueLimitConfig &dsValueLimitConfig =
-			timeSeries.getDataStore()->getValueLimitConfig();
+		const DataStoreConfig &dsConfig =
+			timeSeries.getDataStore()->getConfig();
 
-		OutputMessageRowStore omrs(dsValueLimitConfig,
+		OutputMessageRowStore omrs(dsConfig,
 			timeSeries.getColumnInfoList(), columnNum, fixedData, variableData,
 			false);
 		timeSeries.sample(txn, sc, sampling, resultNum, &omrs);
 		fixedData.insert(
 			fixedData.end(), variableData.begin(), variableData.end());
 
-		InputMessageRowStore imrs(dsValueLimitConfig,
+		InputMessageRowStore imrs(dsConfig,
 			timeSeries.getColumnInfoList(), columnNum, fixedData.data(),
 			static_cast<uint32_t>(fixedData.size()), resultNum,
 			timeSeries.getRowFixedDataSize());
@@ -983,8 +978,9 @@ int SelectionTimeWindowAgg::operator()(TransactionContext &txn,
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_SELECTION_ABUSE,
 			"TimeWindowAgg is not support with order by clause");
 	}
-	ObjectManager &objectManager = *(timeSeries.getObjectManager());
-	bool isNullValue = parseArgument(txn, objectManager, args, columnId, columnType, fType,
+	ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
+	AllocateStrategy &strategy = timeSeries.getRowAllocateStrategy();
+	bool isNullValue = parseArgument(txn, objectManager, strategy, args, columnId, columnType, fType,
 		startTime, endTime, duration, aggType);
 	if (isNullValue) {
 		return 0;
@@ -999,7 +995,7 @@ int SelectionTimeWindowAgg::operator()(TransactionContext &txn,
 }
 
 bool SelectionTimeWindowAgg::parseArgument(TransactionContext &txn,
-	ObjectManager &objectManager, ExprList &args, uint32_t &columnId,
+	ObjectManagerV4 &objectManager, AllocateStrategy &strategy, ExprList &args, uint32_t &columnId,
 	ColumnType &columnType, util::DateTime::FieldType &fType,
 	Timestamp &targetTs, Timestamp &endTs, int32_t &duration,
 	AggregationType &aggType) {
@@ -1043,9 +1039,9 @@ bool SelectionTimeWindowAgg::parseArgument(TransactionContext &txn,
 			"Invalid aggregation type for TIME_WINDOW_AGG() : " << aggStr);
 	}
 
-	e1 = args[2]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
-	e2 = args[3]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
-	e3 = args[4]->eval(txn, objectManager, NULL, NULL, EVAL_MODE_NORMAL);
+	e1 = args[2]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
+	e2 = args[3]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
+	e3 = args[4]->eval(txn, objectManager, strategy, NULL, NULL, EVAL_MODE_NORMAL);
 	if (e1->isNullValue() || e2->isNullValue() || e3->isNullValue()) {
 			GS_THROW_USER_ERROR(GS_ERROR_TQ_CONSTRAINT_INVALID_ARGUMENT_TYPE,
 				"Cannot input null value");
@@ -1106,8 +1102,9 @@ uint64_t SelectionTimeWindowAgg::apiPassThrough(TransactionContext &txn,
 	ResultSize resultNum;
 	AggregationType aggType;
 
-	ObjectManager &objectManager = *(timeSeries.getObjectManager());
-	bool isNullValue = parseArgument(txn, objectManager, args, columnId, columnType, fType,
+	ObjectManagerV4 &objectManager = *(timeSeries.getObjectManager());
+	AllocateStrategy &strategy = timeSeries.getRowAllocateStrategy();
+	bool isNullValue = parseArgument(txn, objectManager, strategy, args, columnId, columnType, fType,
 		startTime, endTime, duration, aggType);
 	if (isNullValue) {
 		return 0;
@@ -1163,7 +1160,7 @@ int SelectionMaxMinRows<aggregateType>::execute(TransactionContext &txn,
 	ColumnInfo &columnInfo = container->getColumnInfo(columnId);
 	ColumnType columnType = columnInfo.getColumnType();
 	if (!ValueProcessor::isNumerical(columnType) &&
-		columnType != COLUMN_TYPE_TIMESTAMP) {
+			!ValueProcessor::isTimestampFamily(columnType)) {
 		GS_THROW_USER_ERROR(GS_ERROR_TQ_COLUMN_CANNOT_AGGREGATE,
 			"Invalid column for aggregation");
 	}
@@ -1198,30 +1195,29 @@ int SelectionMaxMinRows<aggregateType>::execute(TransactionContext &txn,
 		limit += offset;
 	}
 
-	assert(ComparatorTable::comparatorTable_[columnType][columnType] != NULL);
-
 	bool isFirst = true;
 	Value maxMinVal;
 	util::XArray<PointRowId> maxMinPosList(
 		txn.getDefaultAllocator());  
-	ObjectManager &objectManager = *(container->getObjectManager());
+	ObjectManagerV4 &objectManager = *(container->getObjectManager());
+	AllocateStrategy& strategy = container->getRowAllocateStrategy();
 	BaseContainer::RowArray rowArray(txn, container);
 	for (size_t i = 0; i < resultRowIdList.size(); i++) {
 		rowArray.load(txn, resultRowIdList[i], container, OBJECT_READ_ONLY);  
 		BaseContainer::RowArray::Row row(rowArray.getRow(), &rowArray);  
-		ContainerValue currentContainerValue(txn.getPartitionId(), objectManager);
+		ContainerValue currentContainerValue(objectManager, container->getRowAllocateStrategy());
 		row.getField(txn, columnInfo, currentContainerValue);
 		if (currentContainerValue.getValue().isNullValue()) {
 		}
 		else if (isFirst) {
 			isFirst = false;
 			maxMinVal.copy(
-				txn, objectManager, currentContainerValue.getValue());
+				txn, objectManager, strategy, currentContainerValue.getValue());
 			maxMinPosList.push_back(resultRowIdList[i]);
 		}
 		else {
-			int32_t ret =
-				ComparatorTable::comparatorTable_[columnType][columnType](txn, maxMinVal.data(),
+			int32_t ret = ComparatorTable::getComparator(columnType, columnType)(
+					txn, maxMinVal.data(),
 					maxMinVal.size(), currentContainerValue.getValue().data(),
 					currentContainerValue.getValue().size());
 			if (ret == 0) {
@@ -1230,7 +1226,7 @@ int SelectionMaxMinRows<aggregateType>::execute(TransactionContext &txn,
 			else if ((ret < 0 && aggregateType == AGG_MAX) ||
 					 (ret > 0 && aggregateType == AGG_MIN)) {
 				maxMinVal.copy(
-					txn, objectManager, currentContainerValue.getValue());
+					txn, objectManager, strategy, currentContainerValue.getValue());
 				maxMinPosList.clear();
 				maxMinPosList.push_back(resultRowIdList[i]);
 			}

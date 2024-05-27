@@ -76,7 +76,7 @@ public class SubnetGridStoreFactory extends GridStoreFactory {
 	private static boolean isConfigurableProviderChained(
 			Set<Class<?>> chainProviderClasses) {
 		for (Class<?> c : chainProviderClasses) {
-			if (ConfigProvidable.class.isAssignableFrom(c)) {
+			if (Extensibles.ConfigProvidable.class.isAssignableFrom(c)) {
 				return true;
 			}
 		}
@@ -91,14 +91,9 @@ public class SubnetGridStoreFactory extends GridStoreFactory {
 					GSErrorCode.RESOURCE_CLOSED, "Already closed");
 		}
 
+		GSErrorCode.checkNullParameter(properties, "properties", null);
 		final WrappedProperties wrapped = new WrappedProperties(properties);
-		final Source source;
-		try {
-			source = new Source(wrapped);
-		}
-		catch (NullPointerException e) {
-			throw GSErrorCode.checkNullParameter(properties, "properties", e);
-		}
+		final Source source = new Source(wrapped, channelConfig);
 		ConfigUtils.checkProperties(wrapped, "store");
 
 		GridStoreChannel channel = channelMap.get(source.getKey());
@@ -202,6 +197,11 @@ public class SubnetGridStoreFactory extends GridStoreFactory {
 		}
 	}
 
+	private void setTransportProvider(
+			Extensibles.TransportProvider provider) {
+		channelConfig.setTransportProvider(provider);
+	}
+
 	public static class ExtensibleFactory extends Extensibles.AsStoreFactory {
 
 		
@@ -212,7 +212,8 @@ public class SubnetGridStoreFactory extends GridStoreFactory {
 		
 		
 		
-		private static final String ACCEPTABLE_VERSION = "7";
+		
+		private static final String ACCEPTABLE_VERSION = "8";
 
 		private final SubnetGridStoreFactory base;
 
@@ -241,9 +242,15 @@ public class SubnetGridStoreFactory extends GridStoreFactory {
 			return base;
 		}
 
+		@Override
+		public void setTransportProvider(
+				Extensibles.TransportProvider provider) {
+			base.setTransportProvider(provider);
+		}
+
 	}
 
-	public interface ConfigProvidable {
+	public interface ConfigProvidable extends Extensibles.ConfigProvidable {
 	}
 
 	public static class ConfigurableFactory extends GridStoreFactory {

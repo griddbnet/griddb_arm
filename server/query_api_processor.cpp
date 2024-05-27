@@ -18,16 +18,16 @@
 	@file
 	@brief Implementation of QueryProcessor
 */
-#include "data_store.h"
+#include "data_store_v4.h"
 #include "data_store_common.h"
 #include "query_processor.h"
 #include "result_set.h"
-#include "transaction_manager.h"
 #include "btree_map.h"
 #include "gs_error.h"
 #include "value_processor.h"
 #include "query.h"
 #include "gis_quadraticsurface.h"
+#include "message_row_store.h"
 #include <sstream>
 
 /*!
@@ -51,27 +51,14 @@ void QueryProcessor::get(TransactionContext &txn, BaseContainer &container,
 			bool withPartialMatch = false;
 			IndexTypes indexBit =
 				container.getIndexTypes(txn, keyColumnIdList, withPartialMatch);
-			if (container.hasIndex(indexBit, MAP_TYPE_HASH)) {
-				assert(keyColumnIdList.size() == 1);
-				assert(keyFields.size() == 1);
-				KeyData &keyData = keyFields[0];
-				ColumnId columnId = ColumnInfo::ROW_KEY_COLUMN_ID;
-				ColumnInfo &columnInfo = container.getColumnInfo(columnId);
-				TermCondition cond(columnInfo.getColumnType(), columnInfo.getColumnType(),
-					DSExpression::EQ,
-					columnId,
-					keyData.data_, keyData.size_);
-				HashMap::SearchContext sc(txn.getDefaultAllocator(), cond, 1);
-				container.searchColumnIdIndex(txn, sc, idList);
-			}
-			else if (container.hasIndex(indexBit, MAP_TYPE_BTREE)) {
+			if (container.hasIndex(indexBit, MAP_TYPE_BTREE)) {
 				BtreeMap::SearchContext sc(alloc, keyColumnIdList);
 				sc.setLimit(1);
 				for (ColumnId i = 0; i < static_cast<uint32_t>(keyFields.size()); i++) {
 					ColumnInfo &columnInfo = container.getColumnInfo(i);
 					TermCondition cond(columnInfo.getColumnType(), columnInfo.getColumnType(), 
 						DSExpression::EQ, i, keyFields[i].data_, keyFields[i].size_);
-					sc.addCondition(cond, true);
+					sc.addCondition(txn, cond, true);
 				}
 				container.searchColumnIdIndex(txn, sc, idList, ORDER_UNDEFINED);
 			}
@@ -82,7 +69,7 @@ void QueryProcessor::get(TransactionContext &txn, BaseContainer &container,
 					ColumnInfo &columnInfo = container.getColumnInfo(i);
 					TermCondition cond(columnInfo.getColumnType(), columnInfo.getColumnType(), 
 						DSExpression::EQ, i, keyFields[i].data_, keyFields[i].size_);
-					sc.addCondition(cond, false);
+					sc.addCondition(txn, cond, false);
 				}
 				container.searchRowIdIndex(txn, sc, idList, ORDER_UNDEFINED);
 			}
@@ -166,13 +153,13 @@ void QueryProcessor::search(TransactionContext &txn, BaseContainer &container,
 			GS_THROW_USER_ERROR(GS_ERROR_QP_ROW_KEY_INVALID, "range for composite row key is not support");
 		}
 
-		util::XArray<KeyData> startKeyFileds(alloc);
-		util::XArray<KeyData> endKeyFileds(alloc);
+		util::XArray<KeyData> startKeyFields(alloc);
+		util::XArray<KeyData> endKeyFields(alloc);
 		if (startKey != NULL) {
-			container.getRowKeyFields(txn, startKey->size(), startKey->data(), startKeyFileds);
+			container.getRowKeyFields(txn, startKey->size(), startKey->data(), startKeyFields);
 		}
 		if (endKey != NULL) {
-			container.getRowKeyFields(txn, endKey->size(), endKey->data(), endKeyFileds);
+			container.getRowKeyFields(txn, endKey->size(), endKey->data(), endKeyFields);
 		}
 		util::Vector<ColumnId> rowIdColumnIdList(alloc);
 		rowIdColumnIdList.push_back(container.getRowIdColumnId());
@@ -201,17 +188,17 @@ void QueryProcessor::search(TransactionContext &txn, BaseContainer &container,
 		} else {
 		}
 		BtreeMap::SearchContext sc(txn.getDefaultAllocator(), *indexColumnIdList);
-		for (ColumnId i = 0; i < static_cast<uint32_t>(startKeyFileds.size()); i++) {
+		for (ColumnId i = 0; i < static_cast<uint32_t>(startKeyFields.size()); i++) {
 			ColumnInfo &columnInfo = container.getColumnInfo(i);
 			TermCondition cond(columnInfo.getColumnType(), columnInfo.getColumnType(), 
-				DSExpression::GE, i, startKeyFileds[i].data_, startKeyFileds[i].size_);
-			sc.addCondition(cond, isKeyCondition);
+				DSExpression::GE, i, startKeyFields[i].data_, startKeyFields[i].size_);
+			sc.addCondition(txn, cond, isKeyCondition);
 		}
-		for (ColumnId i = 0; i < static_cast<uint32_t>(endKeyFileds.size()); i++) {
+		for (ColumnId i = 0; i < static_cast<uint32_t>(endKeyFields.size()); i++) {
 			ColumnInfo &columnInfo = container.getColumnInfo(i);
 			TermCondition cond(columnInfo.getColumnType(), columnInfo.getColumnType(), 
-				DSExpression::LE, i, endKeyFileds[i].data_, endKeyFileds[i].size_);
-			sc.addCondition(cond, isKeyCondition);
+				DSExpression::LE, i, endKeyFields[i].data_, endKeyFields[i].size_);
+			sc.addCondition(txn, cond, isKeyCondition);
 		}
 		OutputOrder order = (keyColumnIdList.size() > 1) ? ORDER_UNDEFINED : ORDER_ASCENDING;
 		if (isUseValueIndex) {
@@ -251,37 +238,19 @@ void QueryProcessor::search(TransactionContext &txn, TimeSeries &timeSeries,
 			}
 		}
 
-		Timestamp expiredTime =
-			timeSeries.getCurrentExpiredTime(txn);  
-
-		if (expiredTime > end) {
-			resultSet.setResultNum(0);
-			return;
-		}
-
 		Timestamp rewriteStartTime = start;
 		DSExpression::Operation startOpType = DSExpression::GE;
-		if (rewriteStartTime == UNDEF_TIMESTAMP) {
-			if (expiredTime != MINIMUM_EXPIRED_TIMESTAMP) {
-				rewriteStartTime = expiredTime;
-				startOpType = DSExpression::GT;
-			}
-		}
-		else if (expiredTime > start) {
-			rewriteStartTime = expiredTime;
-			startOpType = DSExpression::GT;
-		}
 		if (rewriteStartTime != UNDEF_TIMESTAMP) {
 			TermCondition cond(timeSeries.getRowIdColumnType(), timeSeries.getRowIdColumnType(),
 				startOpType, timeSeries.getRowIdColumnId(),
 				reinterpret_cast<uint8_t *>(&rewriteStartTime), sizeof(rewriteStartTime));
-			sc.addCondition(cond, true);
+			sc.addCondition(txn, cond, true);
 		}
 		if (end != UNDEF_TIMESTAMP) {
 			TermCondition cond(timeSeries.getRowIdColumnType(), timeSeries.getRowIdColumnType(),
 				DSExpression::LE, timeSeries.getRowIdColumnId(),
 				reinterpret_cast<uint8_t *>(&end), sizeof(end));
-			sc.addCondition(cond, true);
+			sc.addCondition(txn, cond, true);
 		}
 
 		sc.setLimit(limit);
@@ -318,14 +287,7 @@ void QueryProcessor::sample(TransactionContext &txn, TimeSeries &timeSeries,
 			GS_THROW_USER_ERROR(GS_ERROR_QP_INTERVAL_INVALID, "");
 		}
 
-		Timestamp expiredTime = timeSeries.getCurrentExpiredTime(txn);
 		ResultSize resultNum = 0;
-		if (expiredTime > end) {
-			resultSet.setResultType(RESULT_ROWSET, 0);
-			return;
-		}
-
-
 		TermCondition startCond(timeSeries.getRowIdColumnType(), timeSeries.getRowIdColumnType(),
 			DSExpression::GE, timeSeries.getRowIdColumnId(), &start,
 			sizeof(start));
@@ -333,8 +295,9 @@ void QueryProcessor::sample(TransactionContext &txn, TimeSeries &timeSeries,
 			DSExpression::LE, timeSeries.getRowIdColumnId(), &end,
 			sizeof(end));
 		BtreeMap::SearchContext sc(txn.getDefaultAllocator(), startCond, endCond, limit);
+
 		OutputMessageRowStore outputMessageRowStore(
-			timeSeries.getDataStore()->getValueLimitConfig(),
+			timeSeries.getDataStore()->getConfig(),
 			timeSeries.getColumnInfoList(), timeSeries.getColumnNum(),
 			serializedRowList, serializedVarDataList, false);
 		if (sampling.mode_ == INTERP_MODE_EMPTY) {
@@ -375,38 +338,16 @@ void QueryProcessor::aggregate(TransactionContext &txn, TimeSeries &timeSeries,
 				"Timestamp of end out of range (end=" << end << ")");
 		}
 
-		Timestamp expiredTime =
-			timeSeries.getCurrentExpiredTime(txn);  
-
-		if (expiredTime > end) {
-			if (aggregationType == AGG_COUNT) {
-				Value value;
-				int64_t count = 0;
-				value.set(count);
-				value.serialize(serializedRowList);
-				resultNum = 1;
-			}
-			else {
-				resultNum = 0;
-			}
-			resultSet.setResultType(RESULT_AGGREGATE, resultNum);
-			return;
-		}
-
 		DSExpression::Operation opType = DSExpression::GE;
 		Timestamp *rewriteStartTime = &start;
-		if (expiredTime > start) {
-			rewriteStartTime = &expiredTime;
-			opType = DSExpression::GT;
-		}
 		TermCondition startCond(timeSeries.getRowIdColumnType(), timeSeries.getRowIdColumnType(),
 			opType, timeSeries.getRowIdColumnId(),
 			rewriteStartTime, sizeof(*rewriteStartTime));
-		sc.addCondition(startCond, true);
+		sc.addCondition(txn, startCond, true);
 		TermCondition endCond(timeSeries.getRowIdColumnType(), timeSeries.getRowIdColumnType(),
 			DSExpression::LE, timeSeries.getRowIdColumnId(),
 			&end, sizeof(end));
-		sc.addCondition(endCond, true);
+		sc.addCondition(txn, endCond, true);
 
 		Value value;
 		timeSeries.aggregate(
@@ -471,10 +412,6 @@ void QueryProcessor::interpolate(TransactionContext &txn,
 			GS_THROW_USER_ERROR(GS_ERROR_QP_COLUMN_ID_INVALID, "");
 		}
 
-		Timestamp expiredTime = timeSeries.getCurrentExpiredTime(txn);
-		if (expiredTime > ts) {  
-			return;
-		}
 		if (columnId >= timeSeries.getColumnNum()) {
 			GS_THROW_USER_ERROR(GS_ERROR_DS_COLUMN_ID_INVALID, "");
 		}
@@ -490,7 +427,7 @@ void QueryProcessor::interpolate(TransactionContext &txn,
 		sampling.interval_ = 0;
 
 		OutputMessageRowStore outputMessageRowStore(
-			timeSeries.getDataStore()->getValueLimitConfig(),
+			timeSeries.getDataStore()->getConfig(),
 			timeSeries.getColumnInfoList(), timeSeries.getColumnNum(),
 			serializedRowList, serializedVarDataList, false);
 		timeSeries.sample(txn, sc, sampling, resultNum, &outputMessageRowStore);
@@ -522,13 +459,8 @@ void QueryProcessor::get(TransactionContext &txn, TimeSeries &timeSeries,
 
 		util::XArray<OId> &rowIdList = *resultSet.getOIdList();
 
-		Timestamp expiredTime =
-			timeSeries.getCurrentExpiredTime(txn);  
 		if (preLast != UNDEF_TIMESTAMP) {
 			Timestamp start = preLast;
-			if (expiredTime > start) {
-				start = expiredTime;
-			}
 			TermCondition cond(timeSeries.getRowIdColumnType(), timeSeries.getRowIdColumnType(),
 				DSExpression::GT, timeSeries.getRowIdColumnId(), &start,
 				sizeof(start));
@@ -536,9 +468,10 @@ void QueryProcessor::get(TransactionContext &txn, TimeSeries &timeSeries,
 			timeSeries.searchRowIdIndex(txn, sc, rowIdList, ORDER_ASCENDING);
 		}
 		else {
+			Timestamp startTime = MINIMUM_EXPIRED_TIMESTAMP;
 			TermCondition cond(timeSeries.getRowIdColumnType(), timeSeries.getRowIdColumnType(),
-				DSExpression::GT, timeSeries.getRowIdColumnId(), &expiredTime,
-				sizeof(expiredTime));
+				DSExpression::GT, timeSeries.getRowIdColumnId(), &startTime,
+				sizeof(startTime));
 			BtreeMap::SearchContext sc(txn.getDefaultAllocator(), cond, limit);
 			timeSeries.searchRowIdIndex(txn, sc, rowIdList, ORDER_ASCENDING);
 		}
@@ -646,7 +579,7 @@ void QueryProcessor::fetch(TransactionContext &txn, BaseContainer &container,
 					}
 				}
 				OutputMessageRowStore outputMessageRowStore(
-					container.getDataStore()->getValueLimitConfig(),
+					container.getDataStore()->getConfig(),
 					container.getColumnInfoList(), container.getColumnNum(),
 					*(resultSet->getRowDataFixedPartBuffer()),
 					*(resultSet->getRowDataVarPartBuffer()), isRowIdIncluded);
@@ -691,7 +624,7 @@ void QueryProcessor::fetch(TransactionContext &txn, BaseContainer &container,
 				}
 				bool isValidate = false;
 				InputMessageRowStore inputMessageRowStore(
-					container.getDataStore()->getValueLimitConfig(),
+					container.getDataStore()->getConfig(),
 					container.getColumnInfoList(), container.getColumnNum(),
 					serializedFixedDataList->data(),
 					static_cast<uint32_t>(serializedFixedDataList->size()),

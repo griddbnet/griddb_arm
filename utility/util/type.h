@@ -59,12 +59,24 @@
 #define UTIL_FAILURE_SIMULATION_ENABLED 0
 #endif
 
+#ifndef UTIL_MEMORY_POOL_AGGRESSIVE
+#define UTIL_MEMORY_POOL_AGGRESSIVE 0
+#endif
+
+#ifndef UTIL_MEMORY_POOL_PLACEMENT_NEW
+#define UTIL_MEMORY_POOL_PLACEMENT_NEW 0
+#endif
+
+#ifndef UTIL_MEMORY_ALLOCATE_INITIALIZE
+#define UTIL_MEMORY_ALLOCATE_INITIALIZE 0
+#endif
 
 
 #define UTIL_STACK_TRACE_ENABLED
 
 #if UTIL_FAILURE_SIMULATION_ENABLED || \
-	defined(UTIL_MEMORY_ALLOCATE_INITIALIZE) || \
+	UTIL_MEMORY_POOL_PLACEMENT_NEW || \
+	UTIL_MEMORY_ALLOCATE_INITIALIZE || \
 	defined(UTIL_DUMP_OPERATOR_DELETE)
 #define UTIL_PLACEMENT_NEW_ENABLED
 #endif
@@ -92,6 +104,12 @@
 #define UTIL_CXX14_SUPPORTED 1
 #else
 #define UTIL_CXX14_SUPPORTED 0
+#endif
+
+#if __cplusplus >= 201703L
+#define UTIL_CXX17_SUPPORTED 1
+#else
+#define UTIL_CXX17_SUPPORTED 0
 #endif
 
 #if defined(_MSC_VER) && defined(_M_X64) && !defined(_WIN64)
@@ -131,6 +149,29 @@
 #endif
 #else
 #define UTIL_HAS_ATTRIBUTE_NODISCARD 0
+#endif
+
+#ifndef UTIL_HAS_TEMPLATE_PLACEMENT_NEW
+#define UTIL_HAS_TEMPLATE_PLACEMENT_NEW 0
+#endif
+
+#ifndef UTIL_CPU_BUILD_AVX2
+#if defined(__GNUC__) && \
+		(__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
+#define UTIL_CPU_BUILD_AVX2 1
+#else
+#define UTIL_CPU_BUILD_AVX2 0
+#endif
+#endif
+
+#if UTIL_CPU_BUILD_AVX2
+#define UTIL_CPU_SUPPORTS_AVX2() (__builtin_cpu_supports("avx2") != 0)
+#else
+#define UTIL_CPU_SUPPORTS_AVX2() (false)
+#endif
+
+#ifndef UTIL_EXT_LIBRARY_ENABLED
+#define UTIL_EXT_LIBRARY_ENABLED 0
 #endif
 
 #ifdef _WIN32
@@ -347,6 +388,10 @@
 #include <stddef.h>
 #endif
 
+#if UTIL_CXX11_SUPPORTED_EXACT
+#include <type_traits>
+#endif
+
 #ifndef UTIL_HAVE_INTPTR_T
 #	if ( UTIL_HAVE_POINTER_T == 4 )
 typedef int32_t intptr_t;
@@ -401,16 +446,33 @@ typedef std::basic_string< char8_t, std::char_traits<char8_t> > NormalString;
 } 
 
 
-#if UTIL_CXX11_SUPPORTED
+#if UTIL_CXX11_SUPPORTED_EXACT
 #define UTIL_NOEXCEPT noexcept
 #else
 #define UTIL_NOEXCEPT throw()
 #endif
 
-#if UTIL_CXX11_SUPPORTED
+#if UTIL_CXX11_SUPPORTED_EXACT
 #define UTIL_NULLPTR nullptr
 #else
 #define UTIL_NULLPTR NULL
+#endif
+
+
+#if UTIL_HAS_ATTRIBUTE_MAYBE_UNUSED
+#define UTIL_UNUSED_VARIABLE(v) \
+		do { using utilUnused_##v [[maybe_unused]] = decltype(v); } \
+		while (false)
+#else
+#define UTIL_UNUSED_VARIABLE(v) static_cast<void>(v)
+#endif
+
+#if UTIL_HAS_ATTRIBUTE_MAYBE_UNUSED
+#define UTIL_UNUSED_TYPE_ALIAS(type) \
+	do { using utilUnused_##type [[maybe_unused]] = type; } while (false)
+#else
+#define UTIL_UNUSED_TYPE_ALIAS(type) \
+	do { static_cast<void>(static_cast<type*>(NULL)); } while (false)
 #endif
 
 #ifdef _MSC_VER
@@ -467,6 +529,23 @@ typedef size_t blkcnt_t;
 typedef size_t fsblkcnt_t;
 #endif 
 
+} 
+
+namespace util {
+namespace detail {
+
+
+class MemoryManagerInitializer {
+public:
+	MemoryManagerInitializer() throw();
+	~MemoryManagerInitializer();
+};
+
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+static MemoryManagerInitializer g_memoryManagerInitializer;
+#endif
+
+} 
 } 
 
 const int32_t ERROR_UNDEF = 0;
@@ -780,7 +859,8 @@ public:
 		CODE_MEMORY_LIMIT_EXCEEDED,	
 		CODE_SIZE_LIMIT_EXCEEDED,	
 		CODE_DECODE_FAILED,	
-		CODE_VALUE_OVERFLOW 
+		CODE_VALUE_OVERFLOW, 
+		CODE_LIBRARY_UNMATCH 
 	};
 };
 
@@ -956,6 +1036,32 @@ public:
 			util::PlatformExceptionBuilder::type, errorCode);
 
 
+struct UtilExceptionTag;
+
+namespace util {
+struct LibraryTool {
+	typedef int32_t (*ProviderFunc)(
+			const void *const **funcList, size_t *funcCount);
+
+	static bool findError(int32_t code, UtilExceptionTag *ex) throw();
+
+	template<typename E> static E fromLibraryException(
+			int32_t code, ProviderFunc provider,
+			UtilExceptionTag *&src) throw() {
+		E dest;
+		fromLibraryException(code, provider, src, dest);
+		return dest;
+	}
+
+	static void fromLibraryException(
+			int32_t code, ProviderFunc provider, UtilExceptionTag *&src,
+			Exception &dest) throw();
+	static int32_t toLibraryException(
+			const Exception &src, UtilExceptionTag **dest) throw();
+};
+} 
+
+
 namespace util {
 	
 /*!
@@ -1042,6 +1148,22 @@ template<typename E>
 struct IsPointer<E*> {
 	typedef TrueType Type;
 	enum Value { VALUE = Type::VALUE };
+};
+
+template<typename F>
+struct BinaryFunctionResultOf {
+#if UTIL_CXX17_SUPPORTED
+	typedef typename std::invoke_result<F(int, int)>::type Type;
+#elif UTIL_CXX11_SUPPORTED_EXACT
+	typedef typename std::result_of<F(
+			typename F::first_argument_type,
+			typename F::second_argument_type)>::type Type;
+#else
+	typedef typename Conditional<
+			(sizeof(typename F::first_argument_type) > 0 &&
+			sizeof(typename F::second_argument_type) > 0),
+			F, void>::Type::result_type Type;
+#endif
 };
 
 }
@@ -1161,15 +1283,55 @@ private:
 
 namespace util {
 namespace detail {
+struct FreeLink {
+	FreeLink *next_;
+};
 struct DirectAllocationUtils {
-	static void* allocate(size_t size);
-	static void deallocate(void *ptr);
+	enum {
+		LARGE_ELEMENT_BITS = 20,
+		ELEMENT_MARGIN_SIZE = sizeof(uint64_t) * 4
+	};
+
+	static void* allocate(size_t size, bool monitoring) UTIL_NOEXCEPT;
+	static void deallocate(void *ptr, bool monitoring) UTIL_NOEXCEPT;
+
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+	static FreeLink* allocateBulk(
+			size_t size, bool monitoring, bool aligned,
+			size_t &count) UTIL_NOEXCEPT;
+	static void deallocateBulk(
+			FreeLink *link, size_t size, bool monitoring,
+			bool aligned) UTIL_NOEXCEPT;
+#endif
+
+	static void* allocateDirect(
+			size_t size, bool monitoring, bool aligned) UTIL_NOEXCEPT;
+	static void deallocateDirect(
+			void *ptr, size_t size, bool monitoring,
+			bool aligned) UTIL_NOEXCEPT;
+
+	static size_t adjustAllocationSize(
+			size_t size, bool withHead, size_t *index) UTIL_NOEXCEPT;
+
+	static size_t getUnitCount() UTIL_NOEXCEPT;
+	static bool getUnitProfile(
+			size_t index, int64_t &totalSize, int64_t &cacheSize,
+			int64_t &monitoringSize, int64_t &totalCount, int64_t &cacheCount,
+			int64_t &deallocCount) UTIL_NOEXCEPT;
+
+	static void dumpStats(std::ostream &os);
+	static void dumpSizeHistogram(std::ostream &os);
 };
 } 
 } 
 
-#define UTIL_MALLOC(size) util::detail::DirectAllocationUtils::allocate(size)
-#define UTIL_FREE(ptr) util::detail::DirectAllocationUtils::deallocate(ptr)
+#define UTIL_MALLOC(size) util::detail::DirectAllocationUtils::allocate(size, false)
+#define UTIL_FREE(ptr) util::detail::DirectAllocationUtils::deallocate(ptr, false)
+
+#define UTIL_MALLOC_MONITORING(size) \
+	util::detail::DirectAllocationUtils::allocate(size, true)
+#define UTIL_FREE_MONITORING(ptr) \
+	util::detail::DirectAllocationUtils::deallocate(ptr, true)
 
 
 
@@ -1193,6 +1355,7 @@ public:
 	static void set(int32_t targetType, uint64_t startCount, uint64_t endCount);
 
 	static void checkOperation(int32_t targetType, size_t size);
+	static bool checkOperationDirect(int32_t targetType, size_t size) UTIL_NOEXCEPT;
 
 	static uint64_t getLastOperationCount() { return lastOperationCount_; }
 
@@ -1215,11 +1378,16 @@ void operator delete[](void *p);
 #else
 
 #ifdef UTIL_PLACEMENT_NEW_ENABLED
-void* operator new(size_t size);
-void* operator new[](size_t size);
-void operator delete(void *p);
-void operator delete[](void *p);
+#if UTIL_CXX11_SUPPORTED
+#define UTIL_PLACEMENT_NEW_SPECIFIER
+#else
+#define UTIL_PLACEMENT_NEW_SPECIFIER throw(std::bad_alloc)
 #endif
+void* operator new(size_t size) UTIL_PLACEMENT_NEW_SPECIFIER;
+void* operator new[](size_t size) UTIL_PLACEMENT_NEW_SPECIFIER;
+void operator delete(void *p) UTIL_NOEXCEPT;
+void operator delete[](void *p) UTIL_NOEXCEPT;
+#endif 
 
 #endif	
 

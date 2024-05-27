@@ -20,6 +20,472 @@
 #include "util/numeric.h"
 
 
+bool SQLValues::TypeUtils::isAny(TupleColumnType type) {
+	return BaseUtils::isAny(type);
+}
+
+bool SQLValues::TypeUtils::isNull(TupleColumnType type) {
+	return BaseUtils::isNull(type);
+}
+
+bool SQLValues::TypeUtils::isSomeFixed(TupleColumnType type) {
+	return BaseUtils::isSomeFixed(type);
+}
+
+bool SQLValues::TypeUtils::isNormalFixed(TupleColumnType type) {
+	return BaseUtils::isNormalFixed(type);
+}
+
+bool SQLValues::TypeUtils::isLargeFixed(TupleColumnType type) {
+	return BaseUtils::isLargeFixed(type);
+}
+
+bool SQLValues::TypeUtils::isSingleVar(TupleColumnType type) {
+	return BaseUtils::isSingleVar(toNonNullable(type));
+}
+
+bool SQLValues::TypeUtils::isSingleVarOrLarge(TupleColumnType type) {
+	return BaseUtils::isSingleVarOrLarge(toNonNullable(type));
+}
+
+bool SQLValues::TypeUtils::isArray(TupleColumnType type) {
+	return BaseUtils::isArray(type);
+}
+
+bool SQLValues::TypeUtils::isLob(TupleColumnType type) {
+	return BaseUtils::isLob(toNonNullable(type));
+}
+
+bool SQLValues::TypeUtils::isIntegral(TupleColumnType type) {
+	return BaseUtils::isIntegral(type);
+}
+
+bool SQLValues::TypeUtils::isFloating(TupleColumnType type) {
+	return BaseUtils::isFloating(type);
+}
+
+bool SQLValues::TypeUtils::isTimestampFamily(TupleColumnType type) {
+	return BaseUtils::isTimestampFamily(type);
+}
+
+bool SQLValues::TypeUtils::isDeclarable(TupleColumnType type) {
+	return BaseUtils::isDeclarable(type);
+}
+
+bool SQLValues::TypeUtils::isSupported(TupleColumnType type) {
+	return BaseUtils::isSupported(type);
+}
+
+bool SQLValues::TypeUtils::isNullable(TupleColumnType type) {
+	return BaseUtils::isNullable(type);
+}
+
+TupleColumnType SQLValues::TypeUtils::setNullable(
+		TupleColumnType type, bool nullable) {
+	const TupleColumnType baseType = toNonNullable(type);
+	if (!nullable || isAny(baseType) || isNull(baseType)) {
+		return baseType;
+	}
+
+	return static_cast<TupleColumnType>(
+			baseType | TupleTypes::TYPE_MASK_NULLABLE);
+}
+
+TupleColumnType SQLValues::TypeUtils::toNonNullable(TupleColumnType type) {
+	return static_cast<TupleColumnType>(
+			type & ~TupleTypes::TYPE_MASK_NULLABLE);
+}
+
+TupleColumnType SQLValues::TypeUtils::toNullable(TupleColumnType type) {
+	return setNullable(type, true);
+}
+
+size_t SQLValues::TypeUtils::getFixedSize(TupleColumnType type) {
+	return BaseUtils::getFixedSize(type);
+}
+
+TupleColumnType SQLValues::TypeUtils::toComparisonType(TupleColumnType type) {
+	if (isAny(type)) {
+		return TupleTypes::TYPE_ANY;
+	}
+
+	TupleColumnType baseType;
+	switch (getStaticTypeCategory(toNonNullable(type))) {
+	case TYPE_CATEGORY_LONG:
+		baseType = TupleTypes::TYPE_LONG;
+		break;
+	case TYPE_CATEGORY_DOUBLE:
+		baseType = TupleTypes::TYPE_DOUBLE;
+		break;
+	default:
+		baseType = type;
+		break;
+	}
+	return setNullable(baseType, isNullable(type));
+}
+
+TupleColumnType SQLValues::TypeUtils::findComparisonType(
+		TupleColumnType type1, TupleColumnType type2, bool anyAsNull) {
+	const TupleColumnType promoType = findPromotionType(type1, type2, anyAsNull);
+	if (isNull(promoType)) {
+		return TupleTypes::TYPE_NULL;
+	}
+
+	return toComparisonType(promoType);
+}
+
+TupleColumnType SQLValues::TypeUtils::findPromotionType(
+		TupleColumnType type1, TupleColumnType type2, bool anyAsNull) {
+	const TupleColumnType base1 = toNonNullable(type1);
+	const TupleColumnType base2 = toNonNullable(type2);
+	const bool eitherNullable = (isNullable(type1) || isNullable(type2));
+
+	if (base1 == base2) {
+		return setNullable(base1, eitherNullable);
+	}
+
+	if (anyAsNull) {
+		if (isAny(base1)) {
+			return setNullable(base2, true);
+		}
+		if (isAny(base2)) {
+			return setNullable(base1, true);
+		}
+	}
+
+	const TypeCategory category1 = getStaticTypeCategory(base1);
+	const TypeCategory category2 = getStaticTypeCategory(base2);
+
+	if (category1 == category2 &&
+			category1 == TYPE_CATEGORY_TIMESTAMP) {
+		if (getTimePrecisionLevel(base1) >=
+				getTimePrecisionLevel(base2)) {
+			return setNullable(base1, eitherNullable);
+		}
+		else {
+			return setNullable(base2, eitherNullable);
+		}
+	}
+
+	const int32_t maskedCategory1 =
+			category1 & ~TYPE_CATEGORY_NUMERIC_MASK;
+	const int32_t maskedCategory2 =
+			category2 & ~TYPE_CATEGORY_NUMERIC_MASK;
+	if (maskedCategory1 == maskedCategory2) {
+		const int32_t bothCategory = (category1 | category2);
+
+		if (bothCategory == TYPE_CATEGORY_LONG) {
+			return setNullable(TupleTypes::TYPE_LONG, eitherNullable);
+		}
+		else {
+			assert((category1 & TYPE_CATEGORY_NUMERIC_FLAG) != 0);
+			assert((category2 & TYPE_CATEGORY_NUMERIC_FLAG) != 0);
+			return setNullable(TupleTypes::TYPE_DOUBLE, eitherNullable);
+		}
+	}
+
+	return TupleTypes::TYPE_NULL;
+}
+
+TupleColumnType SQLValues::TypeUtils::resolveConversionType(
+		TupleColumnType src, TupleColumnType desired, bool implicit,
+		bool anyAsNull) {
+	const TupleColumnType convType =
+			findConversionType(src, desired, implicit, anyAsNull);
+	if (isNull(convType)) {
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_UNSUPPORTED_TYPE_CONVERSION,
+				(implicit ? "Unacceptable implicit" : "Unsupported") <<
+				" type conversion (from=" << toString(src) <<
+				", to=" <<toString(desired) << ")");
+	}
+
+	return convType;
+}
+
+TupleColumnType SQLValues::TypeUtils::findEvaluatingConversionType(
+		TupleColumnType src, TupleColumnType desired, bool implicit,
+		bool anyAsNull, bool evaluating) {
+	TupleColumnType result =
+			findConversionType(src, desired, implicit, anyAsNull);
+
+	if (isNull(result) && !evaluating) {
+		result = findConversionType(
+				toNonNullable(src), desired, implicit, anyAsNull);
+
+		if (isNull(result) && anyAsNull && isAny(src) && !isAny(desired)) {
+			result = toNonNullable(desired);
+		}
+	}
+
+	return result;
+}
+
+TupleColumnType SQLValues::TypeUtils::findConversionType(
+		TupleColumnType src, TupleColumnType desired, bool implicit,
+		bool anyAsNull) {
+	const TupleColumnType srcBase = toNonNullable(src);
+	const TupleColumnType desiredBase = toNonNullable(desired);
+	const bool srcNullable = isNullable(src);
+	const bool desiredNullable = isNullable(desired);
+
+	if (srcBase == desiredBase) {
+		if (srcNullable && !desiredNullable) {
+			return TupleTypes::TYPE_NULL;
+		}
+		if (desiredBase == TupleTypes::TYPE_NUMERIC) {
+			return TupleTypes::TYPE_ANY;
+		}
+		return setNullable(desiredBase, srcNullable);
+	}
+
+	if (desired == TupleTypes::TYPE_ANY) {
+		return src;
+	}
+
+	if (anyAsNull && isAny(src)) {
+		if (!desiredNullable) {
+			return TupleTypes::TYPE_NULL;
+		}
+		if (desiredBase == TupleTypes::TYPE_NUMERIC) {
+			return TupleTypes::TYPE_ANY;
+		}
+		return setNullable(desiredBase, true);
+	}
+
+	const TypeCategory srcCategory = getStaticTypeCategory(srcBase);
+	const TypeCategory desiredCategory = getStaticTypeCategory(desiredBase);
+
+	if (!implicit) {
+		if (srcCategory == TYPE_CATEGORY_STRING ||
+				desiredCategory == TYPE_CATEGORY_STRING ||
+				(srcCategory == TYPE_CATEGORY_BOOL &&
+						desiredCategory == TYPE_CATEGORY_LONG) ||
+				(srcCategory == TYPE_CATEGORY_LONG &&
+						desiredCategory == TYPE_CATEGORY_BOOL) ||
+				(srcCategory == TYPE_CATEGORY_TIMESTAMP &&
+						desiredCategory == TYPE_CATEGORY_TIMESTAMP)) {
+			return setNullable(desiredBase, srcNullable);
+		}
+	}
+
+	if (srcCategory == TYPE_CATEGORY_TIMESTAMP &&
+			desiredCategory == TYPE_CATEGORY_TIMESTAMP) {
+		return setNullable(desiredBase, srcNullable);
+	}
+	else if ((srcCategory & TYPE_CATEGORY_NUMERIC_FLAG) != 0 &&
+			(desiredCategory & TYPE_CATEGORY_NUMERIC_FLAG) != 0) {
+		if (desiredCategory == TYPE_CATEGORY_NUMERIC_FLAG) {
+			if (srcCategory == TYPE_CATEGORY_LONG) {
+				return setNullable(TupleTypes::TYPE_LONG, srcNullable);
+			}
+			else if (srcCategory == TYPE_CATEGORY_DOUBLE) {
+				return setNullable(TupleTypes::TYPE_DOUBLE, srcNullable);
+			}
+			else {
+				assert(false);
+				return TupleTypes::TYPE_NULL;
+			}
+		}
+		return setNullable(desiredBase, srcNullable);
+	}
+
+	return TupleTypes::TYPE_NULL;
+}
+
+TupleColumnType SQLValues::TypeUtils::filterColumnType(TupleColumnType type) {
+	if (!isSupported(type) || isArray(type)) {
+		return TupleTypes::TYPE_ANY;
+	}
+
+	return type;
+}
+
+SQLValues::TypeUtils::TypeCategory
+SQLValues::TypeUtils::getStaticTypeCategory(TupleColumnType type) {
+	if (type == TupleTypes::TYPE_NULL) {
+		return TYPE_CATEGORY_NULL;
+	}
+	else if (isIntegral(type)) {
+		return TYPE_CATEGORY_LONG;
+	}
+	else if (isFloating(type)) {
+		return TYPE_CATEGORY_DOUBLE;
+	}
+	else if (type == TupleTypes::TYPE_STRING) {
+		return TYPE_CATEGORY_STRING;
+	}
+	else if (type == TupleTypes::TYPE_BLOB) {
+		return TYPE_CATEGORY_BLOB;
+	}
+	else if (type == TupleTypes::TYPE_BOOL) {
+		return TYPE_CATEGORY_BOOL;
+	}
+	else if (TypeUtils::isTimestampFamily(type)) {
+		return TYPE_CATEGORY_TIMESTAMP;
+	}
+	else if (type == TupleTypes::TYPE_NUMERIC) {
+		return TYPE_CATEGORY_NUMERIC_FLAG;
+	}
+
+	assert(false);
+	return TYPE_CATEGORY_NULL;
+}
+
+bool SQLValues::TypeUtils::isNumerical(TupleColumnType type) {
+	return isIntegral(type) || isFloating(type);
+}
+
+util::DateTime::FieldType SQLValues::TypeUtils::getTimePrecision(
+		TupleColumnType type) {
+	switch (type) {
+	case TupleTypes::TYPE_MICRO_TIMESTAMP:
+		return util::DateTime::FIELD_MICROSECOND;
+	case TupleTypes::TYPE_NANO_TIMESTAMP:
+		return util::DateTime::FIELD_NANOSECOND;
+	default:
+		assert(type == TupleTypes::TYPE_TIMESTAMP);
+		return util::DateTime::FIELD_MILLISECOND;
+	}
+}
+
+int32_t SQLValues::TypeUtils::getTimePrecisionLevel(TupleColumnType type) {
+	switch (type) {
+	case TupleTypes::TYPE_MICRO_TIMESTAMP:
+		return 6;
+	case TupleTypes::TYPE_NANO_TIMESTAMP:
+		return 9;
+	default:
+		assert(type == TupleTypes::TYPE_TIMESTAMP);
+		return 3;
+	}
+}
+
+void SQLValues::TypeUtils::setUpTupleInfo(
+		TupleList::Info &info, const TupleColumnType *list, size_t count) {
+	info.columnTypeList_ = list;
+	info.columnCount_ = count;
+}
+
+const char8_t* SQLValues::TypeUtils::toString(
+		TupleColumnType type, bool nullOnUnknown, bool internal) {
+	if (!internal) {
+		switch (type) {
+		case TupleTypes::TYPE_MICRO_TIMESTAMP:
+			return "TIMESTAMP(6)";
+		case TupleTypes::TYPE_NANO_TIMESTAMP:
+			return "TIMESTAMP(9)";
+		default:
+			break;
+		}
+	}
+
+	const char8_t *str = TupleList::TupleColumnTypeCoder()(type);
+	if (str == NULL && !nullOnUnknown) {
+		return "";
+	}
+	return str;
+}
+
+
+SQLValues::TypeSwitcher::TypeSwitcher(
+		TupleColumnType type1, TupleColumnType type2, bool nullableAlways) :
+		type1_(type1),
+		type2_(type2),
+		nullableAlways_(nullableAlways),
+		profile_(NULL) {
+}
+
+SQLValues::TypeSwitcher SQLValues::TypeSwitcher::withProfile(
+		ValueProfile *profile) const {
+	TypeSwitcher dest = *this;
+	dest.profile_ = profile;
+	return dest;
+}
+
+SQLValues::TypeSwitcher SQLValues::TypeSwitcher::toNonNullable() const {
+	return TypeSwitcher(
+			TypeUtils::toNonNullable(type1_),
+			TypeUtils::toNonNullable(type2_),
+			false);
+}
+
+SQLValues::TypeSwitcher SQLValues::TypeSwitcher::toNullableAlways() const {
+	return TypeSwitcher(
+			TypeUtils::toNullable(type1_),
+			TypeUtils::toNullable(type2_),
+			true);
+}
+
+bool SQLValues::TypeSwitcher::isAny() const {
+	return TypeUtils::isAny(getMaskedType1());
+}
+
+TupleColumnType SQLValues::TypeSwitcher::getMaskedType1() const {
+	TupleColumnType type;
+	if (TypeUtils::isAny(type1_) && !TypeUtils::isNull(type2_)) {
+		type = type2_;
+	}
+	else {
+		type = type1_;
+	}
+	return TypeUtils::toNonNullable(type);
+}
+
+TupleColumnType SQLValues::TypeSwitcher::getMaskedType2() const {
+	TupleColumnType type;
+	if (TypeUtils::isAny(type2_)) {
+		type = type1_;
+	}
+	else {
+		type = type2_;
+	}
+	return TypeUtils::toNonNullable(type);
+}
+
+bool SQLValues::TypeSwitcher::isNullable() const {
+	if (isNullableAlways()) {
+		return true;
+	}
+
+	bool anyFound = false;
+	bool nonAnyFound = false;
+	for (size_t i = 0; i < 2; i++) {
+		const TupleColumnType type = (i <= 0 ? type1_ : type2_);
+		if (TypeUtils::isNull(type)) {
+			break;
+		}
+		else if (TypeUtils::isNullable(type)) {
+			return true;
+		}
+		else if (TypeUtils::isAny(type)) {
+			anyFound = true;
+		}
+		else {
+			nonAnyFound = true;
+		}
+	}
+	return (anyFound && nonAnyFound);
+}
+
+bool SQLValues::TypeSwitcher::isNullableAlways() const {
+	return nullableAlways_;
+}
+
+bool SQLValues::TypeSwitcher::checkNullable(bool nullableSwitching) const {
+	const bool nullable = isNullable();
+
+	if (profile_ != NULL && nullableSwitching) {
+		ProfileElement &elem = profile_->noNull_;
+		elem.candidate_++;
+		if (!nullable) {
+			elem.target_++;
+		}
+	}
+
+	return nullable;
+}
+
+
 const size_t SQLValues::ValueContext::Constants::DEFAULT_MAX_STRING_LENGTH =
 		128 * 1024;
 
@@ -27,6 +493,7 @@ SQLValues::ValueContext::ValueContext(const Source &source) :
 		alloc_(source.alloc_),
 		varCxt_(source.varCxt_),
 		extCxt_(source.extCxt_),
+		maxStringLength_(0),
 		timeZoneAssigned_(false) {
 	if (varCxt_ == NULL) {
 		localVarCxt_ = UTIL_MAKE_LOCAL_UNIQUE(localVarCxt_, VarContext);
@@ -44,8 +511,15 @@ SQLValues::ValueContext::Source SQLValues::ValueContext::ofAllocator(
 }
 
 SQLValues::ValueContext::Source SQLValues::ValueContext::ofVarContext(
-		VarContext &varCxt, util::StackAllocator *alloc) {
+		VarContext &varCxt, util::StackAllocator *alloc,
+		bool noVarAllocAllowed) {
 	if (varCxt.getVarAllocator() == NULL) {
+		if (noVarAllocAllowed) {
+			util::StackAllocator *foundAlloc = findAllocator(varCxt, alloc);
+			if (foundAlloc != NULL) {
+				return ofAllocator(*foundAlloc);
+			}
+		}
 		assert(false);
 		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
 	}
@@ -69,9 +543,11 @@ SQLValues::VarAllocator& SQLValues::ValueContext::getVarAllocator() {
 	return *varAlloc;
 }
 
-SQLValues::VarContext& SQLValues::ValueContext::getVarContext() {
-	assert(varCxt_ != NULL);
-	return *varCxt_;
+util::StdAllocator<void, void> SQLValues::ValueContext::getStdAllocator() {
+	if (varCxt_->getVarAllocator() != NULL) {
+		return util::StdAllocator<void, void>(getVarAllocator());
+	}
+	return util::StdAllocator<void, void>(getAllocator());
 }
 
 size_t SQLValues::ValueContext::getVarContextDepth() {
@@ -86,24 +562,6 @@ size_t SQLValues::ValueContext::getVarContextDepth() {
 	return depth;
 }
 
-size_t SQLValues::ValueContext::getMaxStringLength() {
-	do {
-		if (extCxt_ == NULL) {
-			break;
-		}
-
-		const size_t len = extCxt_->findMaxStringLength();
-		if (len == 0) {
-			break;
-		}
-
-		return len;
-	}
-	while (false);
-
-	return Constants::DEFAULT_MAX_STRING_LENGTH;
-}
-
 int64_t SQLValues::ValueContext::getCurrentTimeMillis() {
 	if (extCxt_ == NULL) {
 		assert(false);
@@ -112,7 +570,8 @@ int64_t SQLValues::ValueContext::getCurrentTimeMillis() {
 
 	const int64_t time = extCxt_->getCurrentTimeMillis();
 	try {
-		return SQLValues::ValueUtils::checkTimestamp(time);
+		return SQLValues::ValueUtils::checkTimestamp(
+				DateTimeElements(time)).toTimestamp(Types::TimestampTag());
 	}
 	catch (UserException &e) {
 		GS_RETHROW_USER_ERROR_CODED(
@@ -143,12 +602,145 @@ void SQLValues::ValueContext::setTimeZone(const util::TimeZone *zone) {
 	}
 }
 
+util::StackAllocator* SQLValues::ValueContext::findAllocator(
+		VarContext &varCxt, util::StackAllocator *alloc) {
+	if (alloc != NULL) {
+		return alloc;
+	}
+	return varCxt.getStackAllocator();
+}
+
+size_t SQLValues::ValueContext::resolveMaxStringLength() {
+	size_t len;
+	do {
+		if (extCxt_ != NULL) {
+			len = extCxt_->findMaxStringLength();
+			if (len != 0) {
+				break;
+			}
+		}
+
+		len = Constants::DEFAULT_MAX_STRING_LENGTH;
+	}
+	while (false);
+
+	maxStringLength_ = len;
+	return len;
+}
+
 SQLValues::ValueContext::Source::Source(
 		util::StackAllocator *alloc, VarContext *varCxt,
 		ExtValueContext *extCxt) :
 		alloc_(alloc),
 		varCxt_(varCxt),
 		extCxt_(extCxt) {
+}
+
+
+SQLValues::ProfileElement::ProfileElement() :
+		candidate_(0),
+		target_(0) {
+}
+
+void SQLValues::ProfileElement::merge(const ProfileElement &src) {
+	candidate_ += src.candidate_;
+	target_ += src.target_;
+}
+
+
+SQLValues::ValueHolder::ValueHolder(SQLValues::ValueContext &valueCxt) :
+		varCxt_(valueCxt.getVarContext()) {
+}
+
+SQLValues::ValueHolder::~ValueHolder() {
+	reset();
+}
+
+void SQLValues::ValueHolder::assign(TupleValue &value) {
+	reset();
+	value_ = value;
+	value = TupleValue();
+}
+
+TupleValue SQLValues::ValueHolder::release() {
+	TupleValue ret = value_;
+	value_ = TupleValue();
+	return ret;
+}
+
+void SQLValues::ValueHolder::reset() {
+	if (isDeallocatableContext(varCxt_)) {
+		ValueContext cxt(ValueContext::ofVarContext(varCxt_));
+		ValueUtils::destroyValue(cxt, value_);
+	}
+	value_ = TupleValue();
+}
+
+bool SQLValues::ValueHolder::isDeallocatableContext(VarContext &varCxt) {
+	return (varCxt.getVarAllocator() != NULL);
+}
+
+bool SQLValues::ValueHolder::isDeallocatableValueType(TupleColumnType type) {
+	assert(!TypeUtils::isAny(type) && !TypeUtils::isNullable(type));
+	return !TypeUtils::isNull(type) && !TypeUtils::isNormalFixed(type);
+}
+
+
+SQLValues::ValueSetHolder::ValueSetHolder(SQLValues::ValueContext &valueCxt) :
+		varCxt_(valueCxt.getVarContext()),
+		values_(valueCxt.getStdAllocator()) {
+}
+
+SQLValues::ValueSetHolder::~ValueSetHolder() {
+	reset();
+}
+
+void SQLValues::ValueSetHolder::add(TupleValue &value) {
+	if (!ValueHolder::isDeallocatableContext(varCxt_) ||
+			!ValueHolder::isDeallocatableValueType(value.getType())) {
+		return;
+	}
+	ValueContext cxt(ValueContext::ofVarContext(varCxt_));
+	ValueHolder holder(cxt);
+	values_.push_back(TupleValue());
+	values_.back() = holder.release();
+}
+
+void SQLValues::ValueSetHolder::reset() {
+	if (!ValueHolder::isDeallocatableContext(varCxt_)) {
+		return;
+	}
+	ValueContext cxt(ValueContext::ofVarContext(varCxt_));
+	ValueHolder holder(cxt);
+	while (!values_.empty()) {
+		holder.assign(values_.back());
+		values_.pop_back();
+	}
+}
+
+SQLValues::VarContext& SQLValues::ValueSetHolder::getVarContext() {
+	return varCxt_;
+}
+
+
+SQLValues::SummaryColumn::SummaryColumn(const Source &src) :
+		tupleColumn_(src.tupleColumn_),
+		offset_(src.offset_),
+		nullsOffset_(src.nullsOffset_),
+		nullsMask_(src.nullsMask_),
+		pos_(src.pos_),
+		ordering_(src.ordering_) {
+}
+
+
+SQLValues::SummaryColumn::Source::Source() :
+		type_(TupleTypes::TYPE_NULL),
+		offset_(-1),
+		nullsOffset_(-1),
+		nullsMask_(0),
+		pos_(-1),
+		ordering_(-1),
+		tupleColumnPos_(-1) {
 }
 
 
@@ -160,28 +752,13 @@ SQLValues::CompColumn::CompColumn() :
 		eitherUnbounded_(false),
 		lowerUnbounded_(false),
 		eitherExclusive_(false),
-		lowerExclusive_(false) {
+		lowerExclusive_(false),
+		ordering_(true) {
 }
 
-const SQLValues::TupleColumn& SQLValues::CompColumn::getTupleColumn1() const {
-	return tupleColumn1_;
-}
-
-const SQLValues::TupleColumn& SQLValues::CompColumn::getTupleColumn2() const {
-	return tupleColumn2_;
-}
-
-void SQLValues::CompColumn::setTupleColumn1(const TupleColumn &column) {
-	tupleColumn1_ = column;
-}
-
-void SQLValues::CompColumn::setTupleColumn2(const TupleColumn &column) {
-	tupleColumn2_ = column;
-}
-
-void SQLValues::CompColumn::setTupleColumn(
-		const TupleColumn &column, bool first) {
-	(first ? tupleColumn1_ : tupleColumn2_) = column;
+void SQLValues::CompColumn::setSummaryColumn(
+		const SummaryColumn &column, bool first) {
+	(first ? summaryColumn1_ : summaryColumn2_) = column;
 }
 
 bool SQLValues::CompColumn::isColumnPosAssigned(bool first) const {
@@ -206,20 +783,8 @@ void SQLValues::CompColumn::setType(TupleColumnType type) {
 	type_ = type;
 }
 
-bool SQLValues::CompColumn::isAscending() const {
-	return ascending_;
-}
-
 void SQLValues::CompColumn::setAscending(bool ascending) {
 	ascending_ = ascending;
-}
-
-bool SQLValues::CompColumn::isEitherUnbounded() const {
-	return eitherUnbounded_;
-}
-
-bool SQLValues::CompColumn::isLowerUnbounded() const {
-	return lowerUnbounded_;
 }
 
 void SQLValues::CompColumn::setEitherUnbounded(bool unbounded) {
@@ -230,14 +795,6 @@ void SQLValues::CompColumn::setLowerUnbounded(bool unbounded) {
 	lowerUnbounded_ = unbounded;
 }
 
-bool SQLValues::CompColumn::isEitherExclusive() const {
-	return eitherExclusive_;
-}
-
-bool SQLValues::CompColumn::isLowerExclusive() const {
-	return lowerExclusive_;
-}
-
 void SQLValues::CompColumn::setEitherExclusive(bool exclusive) {
 	eitherExclusive_ = exclusive;
 }
@@ -246,10 +803,50 @@ void SQLValues::CompColumn::setLowerExclusive(bool exclusive) {
 	lowerExclusive_ = exclusive;
 }
 
+bool SQLValues::CompColumn::isOrdering() const {
+	return ordering_;
+}
+
+void SQLValues::CompColumn::setOrdering(bool ordering) {
+	ordering_ = ordering;
+}
+
+SQLValues::CompColumn SQLValues::CompColumn::toSingleSide(bool first) const {
+	CompColumn dest;
+
+	dest.summaryColumn1_ = (first ? summaryColumn1_ : summaryColumn2_);
+	dest.summaryColumn2_ = dest.summaryColumn1_;
+
+	dest.columnPos1_ = (first ? columnPos1_ : columnPos2_);
+	dest.columnPos2_ = dest.columnPos1_;
+
+	dest.type_ = dest.getTupleColumn1().getType();
+	dest.ordering_ = ordering_;
+
+	return dest;
+}
+
+SQLValues::CompColumn SQLValues::CompColumn::toReversedSide() const {
+	CompColumn dest = *this;
+
+	dest.setSummaryColumn(getSummaryColumn(util::TrueType()), false);
+	dest.setSummaryColumn(getSummaryColumn(util::FalseType()), true);
+	dest.setColumnPos(getColumnPos(true), false);
+	dest.setColumnPos(getColumnPos(false), true);
+
+	if (isEitherUnbounded()) {
+		dest.setLowerUnbounded(!isLowerUnbounded());
+	}
+	if (isEitherExclusive()) {
+		dest.setLowerExclusive(!isLowerExclusive());
+	}
+
+	return dest;
+}
+
 
 SQLValues::ArrayTuple::ArrayTuple(util::StackAllocator &alloc) :
-		valueList_(alloc),
-		varCxt_(NULL) {
+		valueList_(alloc) {
 }
 
 SQLValues::ArrayTuple::~ArrayTuple() {
@@ -260,13 +857,8 @@ SQLValues::ArrayTuple::~ArrayTuple() {
 	}
 }
 
-bool SQLValues::ArrayTuple::isEmpty() {
-	return valueList_.empty();
-}
-
 void SQLValues::ArrayTuple::clear() {
 	resize(0);
-	varCxt_ = NULL;
 }
 
 void SQLValues::ArrayTuple::assign(ValueContext &cxt, const ArrayTuple &tuple) {
@@ -279,7 +871,7 @@ void SQLValues::ArrayTuple::assign(ValueContext &cxt, const ArrayTuple &tuple) {
 }
 
 void SQLValues::ArrayTuple::assign(
-		ValueContext &cxt, const util::Vector<TupleColumnType> &typeList) {
+		ValueContext &cxt, const ColumnTypeList &typeList) {
 	const size_t size = typeList.size();
 	resize(size);
 
@@ -300,7 +892,7 @@ void SQLValues::ArrayTuple::assign(
 }
 
 void SQLValues::ArrayTuple::assign(
-		ValueContext &cxt, ReadableTuple &tuple,
+		ValueContext &cxt, const ReadableTuple &tuple,
 		const CompColumnList &columnList) {
 	const size_t size = columnList.size();
 	resize(size);
@@ -311,40 +903,38 @@ void SQLValues::ArrayTuple::assign(
 }
 
 void SQLValues::ArrayTuple::assign(
-		ValueContext &cxt, ReadableTuple &tuple,
-		const util::Vector<TupleColumn> &columnList) {
+		ValueContext &cxt, const ReadableTuple &tuple,
+		const CompColumnList &columnList,
+		const TupleColumnList &inColumnList) {
 	const size_t size = columnList.size();
 	resize(size);
 
 	for (size_t i = 0; i < size; i++) {
-		set(i, cxt, tuple.get(columnList[i]));
+		const CompColumn &compColumn = columnList[i];
+		const TupleColumnType compType =
+				TypeUtils::toNonNullable(compColumn.getType());
+
+		TupleValue value = tuple.get(inColumnList[i]);
+		if (value.getType() != compType &&
+				!TypeUtils::isNull(value.getType())) {
+			value = ValuePromoter(compType)(&cxt, value);
+		}
+		set(i, cxt, value);
 	}
 }
 
-void SQLValues::ArrayTuple::swap(ArrayTuple &another) {
-	valueList_.swap(another.valueList_);
-	std::swap(varCxt_, another.varCxt_);
-}
-
-const TupleValue& SQLValues::ArrayTuple::get(size_t index) const {
-	assert(index < valueList_.size());
-	return valueList_[index];
+TupleValue SQLValues::ArrayTuple::get(size_t index) const {
+	const TypeSwitcher switcher(toColumnType(
+			static_cast<TupleColumnType>(getEntry(index).type_)));
+	EntryGetter op(*this);
+	return switcher(op, index);
 }
 
 void SQLValues::ArrayTuple::set(
 		size_t index, ValueContext &cxt, const TupleValue &value) {
-	assert(index < valueList_.size());
-	TupleValue &dest = valueList_[index];
-
-	assert(&cxt.getVarContext() == varCxt_ || varCxt_ == NULL);
-	varCxt_ = &cxt.getVarContext();
-	ValueUtils::destroyValue(cxt, dest);
-
-	dest = ValueUtils::duplicateValue(cxt, value);
-
-	if (!ValueUtils::isNull(dest)) {
-		ValueUtils::moveValueToRoot(cxt, dest, cxt.getVarContextDepth(), 0);
-	}
+	const TypeSwitcher switcher(toColumnType(value.getType()));
+	EntrySetter op(*this);
+	switcher(op, index, cxt, value);
 }
 
 void SQLValues::ArrayTuple::resize(size_t size) {
@@ -356,106 +946,1532 @@ void SQLValues::ArrayTuple::resize(size_t size) {
 		return;
 	}
 
-	assert(varCxt_ != NULL);
-	ValueContext cxt(ValueContext::ofVarContext(*varCxt_));
-
 	while (valueList_.size() > size) {
-		set(valueList_.size() - 1, cxt, TupleValue());
+		clear(valueList_.back());
 		valueList_.pop_back();
 	}
 }
 
+void SQLValues::ArrayTuple::clear(ValueEntry &entry) {
+	if (entry.data_.ptr_ != NULL) {
+		const TupleColumnType type = static_cast<TupleColumnType>(entry.type_);
+		if (TypeUtils::isLob(type)) {
+			ValueContext cxt(ValueContext::ofVarContext(*entry.data_.varCxt_));
+			TupleValue dest(entry.value_.var_, type);
+			ValueUtils::destroyValue(cxt, dest);
 
-SQLValues::ValueComparator::ValueComparator(
-		TupleColumnType type, bool sensitive) :
+			entry.data_.ptr_ = NULL;
+		}
+	}
+	entry.type_ = TupleTypes::TYPE_NULL;
+}
+
+uint8_t* SQLValues::ArrayTuple::prepareVarData(
+		ValueEntry &entry, uint32_t size) {
+	assert(size > 0);
+	assert(entry.type_ == TupleTypes::TYPE_NULL ||
+			TypeUtils::isSingleVarOrLarge(
+					static_cast<TupleColumnType>(entry.type_)));
+
+	VarData *&varData = entry.data_.var_;
+	if (varData == NULL) {
+		util::StackAllocator &alloc = *valueList_.get_allocator().base();
+		varData = ALLOC_NEW(alloc) VarData(alloc);
+	}
+
+	if (size > varData->size()) {
+		varData->resize(size);
+	}
+
+	return &(*varData)[0];
+}
+
+TupleColumnType SQLValues::ArrayTuple::toColumnType(TupleColumnType type) {
+	if (TypeUtils::isNull(type)) {
+		return TupleTypes::TYPE_ANY;
+	}
+	return type;
+}
+
+
+SQLValues::ArrayTuple::Assigner::Assigner(
+		util::StackAllocator &alloc, const CompColumnList &columnList,
+		const TupleColumnList *inColumnList) :
+		columnList_(columnList),
+		inColumnList_(inColumnList) {
+	static_cast<void>(alloc);
+}
+
+
+SQLValues::ArrayTuple::EmptyAssigner::EmptyAssigner(
+		ValueContext &cxt, const ColumnTypeList &typeList) :
+		typeList_(typeList) {
+	for (ColumnTypeList::const_iterator it = typeList.begin();
+			it != typeList.end(); ++it) {
+		if (!TypeUtils::isNullable(*it) && !TypeUtils::isAny(*it) &&
+				!TypeUtils::isNormalFixed(*it)) {
+			return;
+		}
+	}
+
+	emptyTuple_ = UTIL_MAKE_LOCAL_UNIQUE(
+			emptyTuple_, ArrayTuple, cxt.getAllocator());
+	emptyTuple_->assign(cxt, typeList_);
+}
+
+
+TupleValue SQLValues::SummaryTuple::getValue(
+		const SummaryColumn &column) const {
+	TypeSwitcher typeSwitcher(TypeUtils::setNullable(
+			column.getTupleColumn().getType(), (column.getNullsOffset() >= 0)));
+	return typeSwitcher.get<const FieldGetter>()(FieldGetter(*this, column));
+}
+
+void SQLValues::SummaryTuple::initializeBodyDetail(
+		SummaryTupleSet &tupleSet, TupleListReader *reader) {
+	if (reader != NULL && tupleSet.isReadableTupleAvailable()) {
+		const int32_t offset = SummaryTupleSet::getDefaultReadableTupleOffset();
+		if (offset >= 0) {
+			*static_cast<ReadableTuple*>(getField(offset)) = reader->get();
+		}
+	}
+}
+
+void SQLValues::SummaryTuple::swapValue(
+		SummaryTupleSet &tupleSet, SummaryTuple &tuple1, uint32_t pos1,
+		SummaryTuple &tuple2, uint32_t pos2, uint32_t count) {
+	const ColumnList &totalColumnList = tupleSet.getTotalColumnList();
+
+	assert(pos1 + count <= totalColumnList.size());
+	assert(pos2 + count <= totalColumnList.size());
+
+	ColumnList::const_iterator colIt1  = totalColumnList.begin() + pos1;
+	ColumnList::const_iterator colIt2  = totalColumnList.begin() + pos2;
+
+	uint64_t localData[2];
+	void *localAddr = &localData;
+	for (uint32_t i = 0; i < count; i++) {
+		const SummaryColumn &column1 = totalColumnList[pos1 + i];
+		const SummaryColumn &column2 = totalColumnList[pos2 + i];
+
+		if (TypeUtils::isAny(column1.getTupleColumn().getType())) {
+			continue;
+		}
+
+		void *field1 = tuple1.getField(column1.getOffset());
+		void *field2 = tuple2.getField(column2.getOffset());
+
+		const size_t size1 = tupleSet.getFixedFieldSize(pos1 + i);
+		const size_t size2 = tupleSet.getFixedFieldSize(pos2 + i);
+		if (size1 != size2 || size1 > sizeof(localData) ||
+				column1.getTupleColumn().getType() !=
+				column2.getTupleColumn().getType()) {
+			assert(false);
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+		}
+
+		const bool null1 = tuple1.isNull(column1);
+		const bool null2 = tuple2.isNull(column2);
+
+		if (null1) {
+			if (null2) {
+				continue;
+			}
+			tuple1.setNullDetail(column1, false);
+			tuple2.setNullDetail(column2, true);
+			memcpy(field1, field2, size1);
+		}
+		else if (null2) {
+			tuple1.setNullDetail(column1, true);
+			tuple2.setNullDetail(column2, false);
+			memcpy(field2, field1, size1);
+		}
+		else {
+			memcpy(localAddr, field1, size1);
+			memcpy(field1, field2, size1);
+			memcpy(field2, localAddr, size1);
+		}
+	}
+}
+
+
+SQLValues::SummaryTupleSet::SummaryTupleSet(
+		ValueContext &cxt, SummaryTupleSet *parent) :
+		alloc_(cxt.getAllocator()),
+		varCxt_(cxt.getVarContext()),
+		poolAlloc_(varCxt_.getVarAllocator()),
+		parent_(parent),
+		columnSourceList_(alloc_),
+		keySourceList_(alloc_),
+		subInputInfoList_(alloc_),
+		totalColumnList_(alloc_),
+		readerColumnList_(alloc_),
+		modifiableColumnList_(alloc_),
+		fieldReaderList_(alloc_),
+		subFieldReaderList_(alloc_),
+		getterFuncList_(alloc_),
+		setterFuncList_(alloc_),
+		promotedSetterFuncList_(alloc_),
+		readableTupleRequired_(false),
+		keyNullIgnorable_(false),
+		orderedDigestRestricted_(false),
+		readerColumnsDeep_(false),
+		headNullAccessible_(false),
+		columnsCompleted_(false),
+		bodySize_(0),
+		initialBodyImage_(NULL),
+		initialBodyOffset_(0),
+		restBodyData_(NULL),
+		restBodySize_(0),
+		lobLink_(NULL),
+		varDataLimit_(0) {
+	initializePool(cxt);
+}
+
+SQLValues::SummaryTupleSet::~SummaryTupleSet() {
+	deallocateAll();
+}
+
+void SQLValues::SummaryTupleSet::addColumn(
+		TupleColumnType type, const uint32_t *readerColumnPos) {
+	assert(!columnsCompleted_);
+	SummaryColumn::Source src;
+
+	src.type_ = type;
+	if (readerColumnPos != NULL) {
+		src.tupleColumnPos_ = static_cast<int32_t>(*readerColumnPos);
+	}
+
+	columnSourceList_.push_back(src);
+}
+
+void SQLValues::SummaryTupleSet::addKey(
+		uint32_t readerColumnPos, bool ordering, bool rotating) {
+	assert(!columnsCompleted_);
+	SummaryColumn::Source src;
+
+	src.tupleColumnPos_ = static_cast<int32_t>(readerColumnPos);
+	if (ordering) {
+		if (rotating && keySourceList_.empty()) {
+			src.ordering_ = 1;
+		}
+		else {
+			src.ordering_ = 0;
+		}
+	}
+	else {
+		src.ordering_ = -1;
+	}
+
+	keySourceList_.push_back(src);
+}
+
+void SQLValues::SummaryTupleSet::setNullKeyIgnorable(bool ignorable) {
+	assert(!columnsCompleted_);
+	keyNullIgnorable_ = ignorable;
+}
+
+void SQLValues::SummaryTupleSet::setOrderedDigestRestricted(bool restricted) {
+	assert(!columnsCompleted_);
+	orderedDigestRestricted_ = restricted;
+}
+
+void SQLValues::SummaryTupleSet::setReaderColumnsDeep(bool deep) {
+	assert(!columnsCompleted_);
+	readerColumnsDeep_ = deep;
+}
+
+void SQLValues::SummaryTupleSet::setHeadNullAccessible(bool accessible) {
+	assert(!columnsCompleted_);
+	headNullAccessible_ = accessible;
+}
+
+bool SQLValues::SummaryTupleSet::isDeepReaderColumnSupported(
+		TupleColumnType type) {
+	return (TypeUtils::isAny(type) || TypeUtils::isSomeFixed(type) ||
+			TypeUtils::isSingleVar(type));
+}
+
+void SQLValues::SummaryTupleSet::addReaderColumnList(
+		const ColumnTypeList &typeList) {
+	uint32_t pos = 0;
+	for (ColumnTypeList::const_iterator it = typeList.begin();
+			it != typeList.end(); ++it, ++pos) {
+		addColumn(*it, &pos);
+	}
+}
+
+void SQLValues::SummaryTupleSet::addReaderColumnList(	
+		const TupleColumnList &columnList) {
+	uint32_t pos = 0;
+	for (TupleColumnList::const_iterator it = columnList.begin();
+			it != columnList.end(); ++it, ++pos) {
+		addColumn(it->getType(), &pos);
+	}
+}
+
+void SQLValues::SummaryTupleSet::addColumnList(const SummaryTupleSet &src) {
+	assert(!columnsCompleted_);
+
+	columnSourceList_.insert(
+			columnSourceList_.end(),
+			src.columnSourceList_.begin(), src.columnSourceList_.end());
+
+	keySourceList_.insert(
+			keySourceList_.end(),
+			src.keySourceList_.begin(), src.keySourceList_.end());
+}
+
+void SQLValues::SummaryTupleSet::addKeyList(
+		const CompColumnList &keyList, bool first, bool rotating) {
+	for (CompColumnList::const_iterator it = keyList.begin();
+			it != keyList.end(); ++it) {
+		const SQLValues::CompColumn &column = *it;
+		assert(column.isColumnPosAssigned(true));
+		const bool second = column.isColumnPosAssigned(false);
+
+		const uint32_t keyPos = column.getColumnPos(first || !second);
+		addKey(keyPos, (rotating || column.isOrdering()), rotating);
+	}
+}
+
+void SQLValues::SummaryTupleSet::addSubReaderColumnList(
+		uint32_t index, const TupleColumnList &columnList) {
+	while (index >= subInputInfoList_.size()) {
+		subInputInfoList_.push_back(ColumnTypeList(alloc_));
+	}
+
+	ColumnTypeList &typeList = subInputInfoList_[index];
+	for (TupleColumnList::const_iterator it = columnList.begin();
+			it != columnList.end(); ++it) {
+		typeList.push_back(it->getType());
+	}
+}
+
+void SQLValues::SummaryTupleSet::completeColumns() {
+	assert(!columnsCompleted_);
+
+	const uint32_t columnCount =
+			static_cast<uint32_t>(columnSourceList_.size());
+
+	uint32_t fixedBodySize = 0;
+	util::Vector<uint32_t> bodySizeList(columnCount, 0, alloc_);
+	bool readableTupleRequired = false;
+
+	util::Vector<bool> nullableList(columnCount, false, alloc_);
+	util::Vector<int32_t> posListByReader(alloc_);
+	ColumnTypeList readerColumnTypeList(alloc_);
+
+	int32_t pos = 0;
+	int32_t firstModPos = -1;
+	for (ColumnSourceList::iterator it = columnSourceList_.begin();
+			it != columnSourceList_.end(); ++it, ++pos) {
+		it->pos_ = pos;
+		const int32_t readerPos = it->tupleColumnPos_;
+
+		const TupleColumnType type = it->type_;
+		uint32_t fieldSize = 0;
+		if (TypeUtils::isSomeFixed(type)) {
+			fieldSize = static_cast<uint32_t>(TypeUtils::getFixedSize(type));
+		}
+		else if (!TypeUtils::isAny(type)) {
+			if (TypeUtils::isLob(type) && readerPos >= 0) {
+				readableTupleRequired = true;
+			}
+			else {
+				fieldSize = sizeof(void*);
+			}
+		}
+
+		fixedBodySize += fieldSize;
+		bodySizeList[pos] = fieldSize;
+		nullableList[pos] = TypeUtils::isNullable(type);
+
+		if (readerPos >= 0) {
+			const size_t posIndex = static_cast<size_t>(readerPos);
+			if (posIndex >= posListByReader.size()) {
+				const size_t readerColumnCount = posIndex + 1;
+				posListByReader.resize(readerColumnCount, -1);
+				readerColumnTypeList.resize(
+						readerColumnCount,
+						static_cast<TupleColumnType>(TupleTypes::TYPE_NULL));
+			}
+			posListByReader[posIndex] = static_cast<int32_t>(pos);
+			readerColumnTypeList[posIndex] = type;
+		}
+		else if (firstModPos < 0) {
+			firstModPos = pos;
+		}
+	}
+
+	assert(
+			std::find(posListByReader.begin(), posListByReader.end(), -1) ==
+			posListByReader.end());
+
+	TupleColumnList tupleColumnList(alloc_);
+	if (!posListByReader.empty()) {
+		TupleList::Info tupleInfo;
+		SQLValues::TypeUtils::setUpTupleInfo(
+				tupleInfo, &readerColumnTypeList[0], readerColumnTypeList.size());
+
+		tupleColumnList.resize(readerColumnTypeList.size());
+		tupleInfo.getColumns(&tupleColumnList[0], tupleColumnList.size());
+	}
+
+	typedef util::Vector<TupleColumnList> AllTupleColumnList;
+	AllTupleColumnList subColumnList(alloc_);
+	for (TupleInfoList::const_iterator it = subInputInfoList_.begin();
+			it != subInputInfoList_.end(); ++it) {
+		const ColumnTypeList &typeList = *it;
+		TupleColumnList columnList(alloc_);
+		if (!typeList.empty()) {
+			assert(typeList.size() == readerColumnTypeList.size());
+			TupleList::Info tupleInfo;
+			SQLValues::TypeUtils::setUpTupleInfo(
+					tupleInfo, &typeList[0], typeList.size());
+
+			columnList.resize(typeList.size());
+			tupleInfo.getColumns(&columnList[0], columnList.size());
+		}
+		subColumnList.push_back(columnList);
+	}
+	subFieldReaderList_.assign(subInputInfoList_.size(), FieldReaderList(alloc_));
+
+	int32_t headKeyPos = -1;
+	for (ColumnSourceList::iterator it = keySourceList_.begin();
+			it != keySourceList_.end(); ++it) {
+		const int32_t readerPos = it->tupleColumnPos_;
+		if (readerPos < 0 ||
+				static_cast<uint32_t>(readerPos) >= posListByReader.size()) {
+			assert(false);
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+		}
+
+		const int32_t pos = posListByReader[readerPos];
+		const bool onHead = (it == keySourceList_.begin());
+
+		const int32_t ordering = it->ordering_;
+		columnSourceList_[pos].ordering_ = ordering;
+
+		const TupleColumnType type = readerColumnTypeList[pos];
+		if (onHead && (ordering >= 0 || (keySourceList_.size() <= 1 &&
+				(TypeUtils::isNormalFixed(type) || TypeUtils::isAny(type)))) &&
+				!orderedDigestRestricted_) {
+			headKeyPos = pos;
+
+			if (!TypeUtils::isLargeFixed(type)) {
+				fixedBodySize -= bodySizeList[pos];
+				bodySizeList[pos] = 0;
+			}
+		}
+
+		if (keyNullIgnorable_ && (onHead || ordering < 0)) {
+			nullableList[pos] = false;
+		}
+	}
+
+	uint32_t fixedBodyOffset = 0;
+	if (readableTupleRequired) {
+		fixedBodyOffset += static_cast<uint32_t>(sizeof(ReadableTuple));
+	}
+
+	const bool nullsRequired =
+			(std::find(nullableList.begin(), nullableList.end(), true) !=
+			nullableList.end());
+	const uint32_t nullsUnitBits =
+			static_cast<uint32_t>(sizeof(NullsUnitType) * CHAR_BIT);
+
+	int32_t nullsStartOffset = -1;
+	uint32_t nullsBytesSize = 0;
+	if (nullsRequired) {
+		nullsStartOffset = static_cast<int32_t>(fixedBodyOffset + fixedBodySize);
+		nullsBytesSize = static_cast<uint32_t>(sizeof(NullsUnitType) *
+				((columnCount + nullsUnitBits - 1) / nullsUnitBits));
+	}
+
+	const uint32_t bodySize = fixedBodyOffset + fixedBodySize + nullsBytesSize;
+
+	void *initialBodyImage = NULL;
+	uint32_t initialBodyOffset = bodySize;
+	if (nullsRequired || firstModPos >= 0) {
+		initialBodyOffset = fixedBodyOffset;
+		for (ColumnSourceList::iterator it = columnSourceList_.begin();
+				it != columnSourceList_.end(); ++it) {
+			if (firstModPos >= it->pos_) {
+				break;
+			}
+			initialBodyOffset += bodySizeList[it->pos_];
+		}
+		initialBodyImage = alloc_.allocate(bodySize - initialBodyOffset);
+
+		const uint32_t nullsOffset = fixedBodyOffset + fixedBodySize;
+
+		assert(nullsOffset >= initialBodyOffset);
+		const uint32_t modSize = nullsOffset - initialBodyOffset;
+
+		memset(initialBodyImage, 0x0, modSize);
+		memset(
+				static_cast<uint8_t*>(initialBodyImage) + modSize,
+				0xff, nullsBytesSize);
+
+		uint32_t offset = 0;
+		for (ColumnSourceList::iterator it = columnSourceList_.begin();
+				it != columnSourceList_.end(); ++it) {
+			if (firstModPos >= it->pos_) {
+				const TupleColumnType type = it->type_;
+				if (!TypeUtils::isSomeFixed(type) && !TypeUtils::isAny(type) &&
+						bodySizeList[it->pos_] > 0) {
+					const void *data = NULL;
+					if (!nullableList[it->pos_]) {
+						ValueContext cxt(ValueContext::ofAllocator(alloc_));
+						TupleValue value =
+								ValueUtils::createEmptyValue(cxt, type);
+						if (TypeUtils::isLob(type)) {
+							LobLink *link = static_cast<LobLink*>(
+									alloc_.allocate(sizeof(LobLink)));
+							link->next_ = NULL;
+							link->prev_ = NULL;
+							link->lob_ = value.getRawData();
+							link->type_ = TypeUtils::toNonNullable(type);
+							data = link;
+						}
+						else {
+							data = value.getRawData();
+						}
+					}
+					assert(sizeof(data) == bodySizeList[it->pos_]);
+					memcpy(
+							static_cast<uint8_t*>(initialBodyImage) + offset,
+							&data, sizeof(data));
+				}
+			}
+
+			offset += bodySizeList[it->pos_];
+		}
+	}
+
+	int32_t nextOffset = static_cast<int32_t>(fixedBodyOffset);
+	for (ColumnSourceList::iterator it = columnSourceList_.begin();
+			it != columnSourceList_.end(); ++it) {
+		const uint32_t pos = it->pos_;
+		it->offset_ = (bodySizeList[pos] > 0 ? nextOffset : -1);
+
+		const bool nullable = nullableList[pos];
+		it->nullsOffset_ = (nullable ?
+				static_cast<int32_t>(
+						nullsStartOffset +
+						sizeof(NullsUnitType) * (pos / nullsUnitBits)) :
+				-1);
+		it->nullsMask_ = (nullable ? (1U << (pos % nullsUnitBits)) : 0);
+
+		if (it->tupleColumnPos_ >= 0) {
+			it->tupleColumn_ = tupleColumnList[pos];
+		}
+		else {
+			it->tupleColumn_.offset_ = std::numeric_limits<uint32_t>::max();
+			it->tupleColumn_.type_ = it->type_;
+			it->tupleColumn_.pos_ = std::numeric_limits<uint16_t>::max();
+		}
+
+		SummaryColumn column(*it);
+
+		const TupleColumnType resolvedType =
+				TypeUtils::setNullable(it->type_, nullable);
+		TypeSwitcher typeSwitcher(resolvedType);
+
+		FieldGetterFunc getter =
+				typeSwitcher.get<const SummaryTuple::FieldGetter>();
+		FieldSetterFunc setter = NULL;
+		FieldPromotedSetterFunc promotedSetter = NULL;
+		if (it->tupleColumnPos_ >= 0) {
+			readerColumnList_.push_back(column);
+			const bool onBody = (it->offset_ >= 0);
+			const bool forLob = TypeUtils::isLob(it->type_);
+			const bool headNullable = (headNullAccessible_ &&
+					!onBody && !forLob && it->nullsOffset_ >= 0);
+			if (onBody || forLob || headNullable) {
+				FieldReaderFunc func = resolveFieldReaderFunc(
+						resolvedType, resolvedType, !readerColumnsDeep_,
+						headNullable);
+				fieldReaderList_.push_back(FieldReaderEntry(column, func));
+
+				for (AllTupleColumnList::const_iterator subIt = subColumnList.begin();
+						subIt != subColumnList.end(); ++subIt) {
+					if (pos >= subIt->size()) {
+						continue;
+					}
+
+					SummaryColumn::Source subSource = *it;
+					subSource.tupleColumn_ = (*subIt)[pos];
+					SummaryColumn subColumn(subSource);
+					const TupleColumnType subType =
+							subColumn.getTupleColumn().getType();
+
+					if (TypeUtils::isAny(subType)) {
+						continue;
+					}
+
+					FieldReaderFunc subFunc = resolveFieldReaderFunc(
+							resolvedType, subType, !readerColumnsDeep_,
+							headNullable);
+					subFieldReaderList_[subIt - subColumnList.begin()].push_back(
+							FieldReaderEntry(subColumn, subFunc));
+				}
+			}
+		}
+		else {
+			modifiableColumnList_.push_back(column);
+			setter = typeSwitcher.get< const SummaryTuple::FieldSetter<false> >();
+			promotedSetter =
+					typeSwitcher.get< const SummaryTuple::FieldSetter<true> >();
+		}
+		totalColumnList_.push_back(column);
+
+		getterFuncList_.push_back(getter);
+		setterFuncList_.push_back(setter);
+		promotedSetterFuncList_.push_back(promotedSetter);
+
+		if (static_cast<int32_t>(pos) == headKeyPos) {
+			readerHeadColumn_ = column;
+		}
+
+		nextOffset += bodySizeList[pos];
+	}
+
+	readableTupleRequired_ = readableTupleRequired;
+	bodySize_ = bodySize;
+	initialBodyImage_ = initialBodyImage;
+	initialBodyOffset_ = initialBodyOffset;
+	columnsCompleted_ = true;
+}
+
+bool SQLValues::SummaryTupleSet::isColumnsCompleted() {
+	return columnsCompleted_;
+}
+
+void SQLValues::SummaryTupleSet::applyKeyList(
+		CompColumnList &keyList, const bool *first) const {
+	assert(columnsCompleted_);
+	for (CompColumnList::iterator it = keyList.begin(); it != keyList.end(); ++it) {
+		for (size_t i = 0; i < 2; i++) {
+			const bool curFirst = (i == 0);
+			if (first != NULL && !!(*first) != curFirst) {
+				continue;
+			}
+			assert(it->isColumnPosAssigned(curFirst));
+			it->setSummaryColumn(
+					readerColumnList_[it->getColumnPos(curFirst)], curFirst);
+		}
+	}
+}
+
+const SQLValues::SummaryTupleSet::ColumnList&
+SQLValues::SummaryTupleSet::getTotalColumnList() const {
+	assert(columnsCompleted_);
+	return totalColumnList_;
+}
+
+const SQLValues::SummaryTupleSet::ColumnList&
+SQLValues::SummaryTupleSet::getReaderColumnList() const {
+	assert(columnsCompleted_);
+	return readerColumnList_;
+}
+
+const SQLValues::SummaryTupleSet::ColumnList&
+SQLValues::SummaryTupleSet::getModifiableColumnList() const {
+	assert(columnsCompleted_);
+	return modifiableColumnList_;
+}
+
+void SQLValues::SummaryTupleSet::applyColumnList(
+		const ColumnList &src, ColumnList &dest) {
+	assert(dest.empty() || dest.size() == src.size());
+	dest.assign(src.begin(), src.end());
+}
+
+size_t SQLValues::SummaryTupleSet::estimateTupleSize() const {
+	assert(columnsCompleted_);
+	const size_t headSize = static_cast<size_t>(
+			std::max<uint64_t>(sizeof(int64_t) * 2, sizeof(SummaryTuple)));
+	return headSize + bodySize_;
+}
+
+bool SQLValues::SummaryTupleSet::isReadableTupleAvailable() const {
+	assert(columnsCompleted_);
+	return readableTupleRequired_;
+}
+
+int32_t SQLValues::SummaryTupleSet::getDefaultReadableTupleOffset() {
+	return 0;
+}
+
+size_t SQLValues::SummaryTupleSet::getFixedFieldSize(uint32_t index) {
+	assert(columnsCompleted_);
+	assert(index < totalColumnList_.size());
+
+	const SummaryColumn &column = totalColumnList_[index];
+	assert(column.getOffset() >= 0);
+
+	const TupleColumnType type = column.getTupleColumn().getType();
+	if (TypeUtils::isSomeFixed(type)) {
+		return TypeUtils::getFixedSize(type);
+	}
+	else if (!TypeUtils::isAny(type)) {
+		return sizeof(void*);
+	}
+
+	return 0;
+}
+
+void* SQLValues::SummaryTupleSet::duplicateVarData(const void *data) {
+	assert(data != NULL);
+
+	const uint32_t bodySize = TupleValueUtils::decodeVarSize(data);
+	const uint32_t size =
+			TupleValueUtils::getEncodedVarSize(bodySize) + bodySize;
+
+	void *dest = allocateDetail(size, NULL);
+	memcpy(dest, data, size);
+
+	return dest;
+}
+
+void SQLValues::SummaryTupleSet::deallocateVarData(void *data) {
+	if (data == NULL) {
+		return;
+	}
+
+	const uint32_t bodySize = TupleValueUtils::decodeVarSize(data);
+	const uint32_t size =
+			TupleValueUtils::getEncodedVarSize(bodySize) + bodySize;
+
+	deallocateDetail(data, size);
+}
+
+void SQLValues::SummaryTupleSet::appendVarData(
+		void *&data, StringReader &reader) {
+	assert(data != NULL);
+
+	for (;;) {
+		const uint32_t size = static_cast<uint32_t>(std::min<uint64_t>(
+				reader.getNext(), std::numeric_limits<uint32_t>::max()));
+		if (size <= 0) {
+			break;
+		}
+
+		const bool limited = true;
+		data = appendVarDataDetail(&reader.get(), size, data, limited);
+		reader.step(size);
+	}
+}
+
+void* SQLValues::SummaryTupleSet::duplicateLob(const TupleValue &value) {
+	LobLink *link = static_cast<LobLink*>(allocateDetail(sizeof(LobLink), NULL));
+
+	link->next_ = lobLink_;
+	link->prev_ = &lobLink_;
+	link->lob_ = NULL;
+	link->tupleSet_ = this;
+
+	link->type_ = TupleTypes::TYPE_NULL;
+	link->small_ = false;
+
+	if (link->next_ != NULL) {
+		link->next_->prev_ = &link->next_;
+	}
+	(*link->prev_) = link;
+
+	const TupleColumnType type = value.getType();
+	if (checkLobSmall(value)) {
+		LocalLobBuilder builder(*this, type);
+
+		LobReader reader(value);
+		builder.append(reader);
+
+		link->lob_ = builder.release(link->small_);
+	}
+	else {
+		link->lob_ = duplicateNormalLob(varCxt_, value);
+	}
+	assert(link->lob_ != NULL);
+	link->type_ = type;
+
+	return link;
+}
+
+void SQLValues::SummaryTupleSet::deallocateLob(void *data) {
+	if (data == NULL) {
+		return;
+	}
+
+	LobLink *link = static_cast<LobLink*>(data);
+	assert(link->tupleSet_ == this);
+	if (link->prev_ == NULL) {
+		return;
+	}
+
+	void *const lob = link->lob_;
+
+	const TupleColumnType type = link->type_;
+	const bool small = link->small_;
+
+	link->lob_ = NULL;
+	link->type_ = TupleTypes::TYPE_NULL;
+	if (link->next_ != NULL) {
+		link->next_->prev_ = link->prev_;
+	}
+	(*link->prev_) = link->next_;
+	link->tupleSet_ = NULL;
+	deallocateDetail(link, sizeof(LobLink));
+
+	if (lob == NULL) {
+		return;
+	}
+
+	if (small) {
+		deallocateSmallLob(lob);
+	}
+	else {
+		deallocateNormalLob(varCxt_, lob, type);
+	}
+}
+
+void SQLValues::SummaryTupleSet::appendLob(void *data, LobReader &reader) {
+	if (data == NULL) {
+		assert(false);
+		return;
+	}
+
+	LobLink *link = static_cast<LobLink*>(data);
+	assert(link->tupleSet_ == this);
+
+	LocalLobBuilder builder(*this, link->type_);
+	if (link->small_) {
+		builder.assignSmall(link->lob_);
+		link->small_ = false;
+	}
+	else {
+		LobReader lastReader(toValueByNormalLob(link->lob_, link->type_));
+		builder.append(lastReader);
+		deallocateNormalLob(varCxt_, link->lob_, link->type_);
+	}
+	link->lob_ = NULL;
+
+	builder.append(reader);
+	link->lob_ = builder.release(link->small_);
+	assert(link->lob_ != NULL);
+}
+
+TupleValue SQLValues::SummaryTupleSet::getLobValue(void *data) {
+	LobLink *link = static_cast<LobLink*>(data);
+	assert(link->lob_ != NULL);
+	assert(link->tupleSet_ != NULL);
+
+	if (link->small_) {
+		return toValueBySmallLob(
+				link->tupleSet_->varCxt_, link->lob_, link->type_);
+	}
+
+	return toValueByNormalLob(link->lob_, link->type_);
+}
+
+size_t SQLValues::SummaryTupleSet::getPoolCapacity() {
+	if (poolAlloc_ == NULL) {
+		return 0;
+	}
+
+	size_t capacity = 0;
+
+	if (initialDataPool_.first != NULL) {
+		capacity += (1U << INITIAL_POOL_DATA_BITS);
+	}
+
+	if (!fixedDataPool_->empty()) {
+		capacity += fixedDataPool_->size() * (1U << getFixedSizeBits());
+	}
+
+	for (Pool::const_iterator it = largeDataPool_->begin();
+			it != largeDataPool_->end(); ++it) {
+		capacity += poolAlloc_->getElementCapacity(*it);
+	}
+
+	return capacity;
+}
+
+void SQLValues::SummaryTupleSet::clearAll() {
+	if (poolAlloc_ == NULL) {
+		return;
+	}
+
+	restBodyData_ = NULL;
+	restBodySize_ = 0;
+
+	while (lobLink_ != NULL) {
+		deallocateLob(lobLink_);
+	}
+
+	const size_t fixedBits = getFixedSizeBits();
+	for (size_t i = 0; i <= fixedBits; i++) {
+		if (i >= varDataPool_->size()) {
+			break;
+		}
+		(*varDataPool_)[i] = NULL;
+	}
+
+	initialDataPool_.second = false;
+
+	if (!fixedDataPool_->empty()) {
+		void *&dataHead = (*varDataPool_)[fixedBits];
+		assert(dataHead == NULL);
+
+		for (Pool::const_iterator it = fixedDataPool_->begin();
+				it != fixedDataPool_->end(); ++it) {
+			void *data = *it;
+			if (data == NULL) {
+				continue;
+			}
+			static_cast<PoolData*>(data)->next_ = dataHead;
+			dataHead = data;
+		}
+	}
+}
+
+SQLValues::SummaryTupleSet::FieldReaderFunc
+SQLValues::SummaryTupleSet::resolveFieldReaderFunc(
+		TupleColumnType destType, TupleColumnType srcType, bool shallow,
+		bool headNullable) {
+	assert(shallow || isDeepReaderColumnSupported(destType));
+
+	if (headNullable) {
+		return resolveFieldReaderFuncBy<true, true>(destType, srcType);
+	}
+	else if (shallow || TypeUtils::isAny(destType) ||
+			TypeUtils::isSomeFixed(destType)) {
+		return resolveFieldReaderFuncBy<true, false>(destType, srcType);
+	}
+	else if (TypeUtils::isSingleVar(destType)) {
+		return resolveFieldReaderFuncBy<false, false>(destType, srcType);
+	}
+	else {
+		assert(false);
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	}
+}
+
+template<bool Shallow, bool HeadNullable>
+SQLValues::SummaryTupleSet::FieldReaderFunc
+SQLValues::SummaryTupleSet::resolveFieldReaderFuncBy(
+		TupleColumnType destType, TupleColumnType srcType) {
+	typedef typename util::BoolType<Shallow>::Result ShallowType;
+	typedef typename util::BoolType<HeadNullable>::Result HeadNullableType;
+	typedef typename SummaryTuple::FieldReaderVariantTraits<
+			ShallowType, HeadNullableType> VariantTraitsType;
+
+	const bool typeSpecific = !HeadNullableType::VALUE;
+	const TypeSwitcher::TypeTarget typeTarget = (ShallowType::VALUE ?
+			TypeSwitcher::TYPE_TARGET_ALL :
+			TypeSwitcher::TYPE_TARGET_SINGLE_VAR);
+
+	typedef TypeSwitcher::OpTraitsOptions<
+			VariantTraitsType, 2, false, true, 1,
+			typeSpecific, typeTarget> OptionsType;
+	typedef TypeSwitcher::OpTraits<void, OptionsType> TraitsType;
+
+	return TypeSwitcher(destType, srcType).getWith<
+			const SummaryTuple::FieldReader, TraitsType>();
+}
+
+void SQLValues::SummaryTupleSet::initializePool(ValueContext &cxt) {
+	if (poolAlloc_ == NULL) {
+		return;
+	}
+
+	varDataPool_ = UTIL_MAKE_LOCAL_UNIQUE(varDataPool_, Pool, *poolAlloc_);
+	fixedDataPool_ = UTIL_MAKE_LOCAL_UNIQUE(fixedDataPool_, Pool, *poolAlloc_);
+	largeDataPool_ = UTIL_MAKE_LOCAL_UNIQUE(largeDataPool_, Pool, *poolAlloc_);
+
+	varDataLimit_ = cxt.getMaxStringLength();
+}
+
+void SQLValues::SummaryTupleSet::deallocateAll() {
+	clearAll();
+
+	if (poolAlloc_ == NULL) {
+		return;
+	}
+
+	while (!fixedDataPool_->empty()) {
+		void *data = fixedDataPool_->back();
+		if (data != NULL) {
+			alloc_.base().deallocate(data);
+		}
+		fixedDataPool_->pop_back();
+	}
+
+	while (!largeDataPool_->empty()) {
+		void *data = largeDataPool_->back();
+		if (data != NULL) {
+			poolAlloc_->deallocate(data);
+		}
+		largeDataPool_->pop_back();
+	}
+
+	{
+		void *&data = initialDataPool_.first;
+		if (data != NULL) {
+			poolAlloc_->deallocate(data);
+			data = NULL;
+		}
+	}
+}
+
+void* SQLValues::SummaryTupleSet::appendVarDataDetail(
+		const void *src, uint32_t size, void *dest, bool limited) {
+	const uint32_t destBodySize =
+			(dest == NULL ? 0 : TupleValueUtils::decodeVarSize(dest));
+	const uint32_t destHeadSize =
+			TupleValueUtils::getEncodedVarSize(destBodySize);
+	const uint32_t destSize = destHeadSize + destBodySize;
+
+	const uint32_t nextBodysize = destBodySize + size;
+	const uint32_t nextHeadSize =
+			TupleValueUtils::getEncodedVarSize(nextBodysize);
+	const uint64_t nextSize =
+			static_cast<uint64_t>(nextHeadSize) + nextBodysize;
+
+	if (limited) {
+		StringBuilder::checkLimit(nextSize, varDataLimit_);
+	}
+
+	const uint32_t destCapacity = 1U << getSizeBits(destSize, true);
+	void *next;
+	if (dest == NULL || nextSize > destCapacity) {
+		next = allocateDetail(static_cast<size_t>(nextSize), NULL);
+		memcpy(
+				static_cast<uint8_t*>(next) + nextHeadSize,
+				static_cast<uint8_t*>(dest) + destHeadSize, destBodySize);
+	}
+	else {
+		next = dest;
+		if (nextHeadSize != destHeadSize) {
+			memmove(
+					static_cast<uint8_t*>(next) + nextHeadSize,
+					static_cast<uint8_t*>(dest) + destHeadSize, destBodySize);
+		}
+	}
+	memcpy(
+			static_cast<uint8_t*>(next) + nextHeadSize + destBodySize,
+			src, size);
+	TupleValueUtils::encodeInt32(nextBodysize, static_cast<uint8_t*>(next));
+
+	return next;
+}
+
+void SQLValues::SummaryTupleSet::reserveBody() {
+	assert(columnsCompleted_);
+	if (restBodySize_ >= bodySize_) {
+		return;
+	}
+
+	const size_t allocSize = (restBodyData_ == NULL ?
+			bodySize_ : static_cast<size_t>(
+					std::max<uint64_t>(bodySize_, 1U << MAX_POOL_DATA_BITS)));
+	restBodyData_ = allocateDetail(allocSize, &restBodySize_);
+
+	assert(restBodySize_ >= bodySize_);
+}
+
+bool SQLValues::SummaryTupleSet::checkLobSmall(const TupleValue &value) {
+	const uint32_t maxSize = getMaxSmallLobBodySize();
+
+	LobReader baseReader(value);
+	LimitedReader<LobReader, uint8_t> reader(baseReader, maxSize + 1);
+
+	const uint64_t minBodySize =
+			static_cast<uint64_t>(ValueUtils::partLength(baseReader));
+
+	return (minBodySize <= maxSize);
+}
+
+TupleValue SQLValues::SummaryTupleSet::toValueBySmallLob(
+		VarContext &varCxt, const void *lob, TupleColumnType type) {
+	LobBuilder builder(varCxt, type, 0);
+
+	const uint32_t bodySize = TupleValueUtils::decodeVarSize(lob);
+	const uint32_t headSize =
+			TupleValueUtils::getEncodedVarSize(bodySize);
+
+	builder.append(static_cast<const uint8_t*>(lob) + headSize, bodySize);
+	return builder.build();
+}
+
+void* SQLValues::SummaryTupleSet::duplicateNormalLob(
+		VarContext &varCxt, const TupleValue &value) {
+	ValueContext cxt(ValueContext::ofVarContext(varCxt));
+	TupleValue dest = ValueUtils::duplicateValue(cxt, value);
+	ValueUtils::moveValueToRoot(cxt, dest, cxt.getVarContextDepth(), 0);
+
+	return dest.getRawData();
+}
+
+void SQLValues::SummaryTupleSet::deallocateNormalLob(
+		VarContext &varCxt, void *lob, TupleColumnType type) {
+	TupleValue value(lob, type);
+	ValueContext cxt(ValueContext::ofVarContext(varCxt));
+	ValueUtils::destroyValue(cxt, value);
+}
+
+TupleValue SQLValues::SummaryTupleSet::toValueByNormalLob(
+		void *lob, TupleColumnType type) {
+	assert(lob != NULL);
+	return TupleValue(lob, type);
+}
+
+void* SQLValues::SummaryTupleSet::toNormalLobByBuilder(
+		VarContext &varCxt, LobBuilder &builder) {
+	ValueContext cxt(ValueContext::ofVarContext(varCxt));
+	TupleValue dest = builder.build();
+	ValueUtils::moveValueToRoot(cxt, dest, cxt.getVarContextDepth(), 0);
+
+	return dest.getRawData();
+}
+
+void SQLValues::SummaryTupleSet::deallocateSmallLob(void *lob) {
+	deallocateVarData(lob);
+}
+
+uint32_t SQLValues::SummaryTupleSet::getMaxSmallLobBodySize() {
+	const uint32_t totalSize = 1U << SMALL_LOB_DATA_BITS;
+
+	const uint32_t headSize = sizeof(uint32_t);
+	return static_cast<uint32_t>(
+			std::max<uint32_t>(totalSize, headSize)) - headSize;
+}
+
+void* SQLValues::SummaryTupleSet::allocateDetail(
+		size_t size, size_t *availableSize) {
+	if (parent_ != NULL) {
+		return parent_->allocateDetail(size, availableSize);
+	}
+
+	if (poolAlloc_ == NULL) {
+		assert(false);
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	}
+
+	const size_t fixedBits = getFixedSizeBits();
+	const size_t initialBits = INITIAL_POOL_DATA_BITS;
+	if (!initialDataPool_.second && initialBits != fixedBits) {
+		if (initialBits >= varDataPool_->size()) {
+			varDataPool_->resize(initialBits + 1);
+		}
+		if (initialDataPool_.first == NULL) {
+			initialDataPool_.first = poolAlloc_->allocate(1U << initialBits);
+		}
+		static_cast<PoolData*>(initialDataPool_.first)->next_ = NULL;
+		(*varDataPool_)[initialBits] = initialDataPool_.first;
+		initialDataPool_.second = true;
+	}
+
+	const size_t minBits = getSizeBits(size, true);
+
+	void *data = NULL;
+	size_t bits = minBits;
+	do {
+		const size_t maxBits =
+				static_cast<size_t>(std::max<uint64_t>(bits, fixedBits));
+		if (maxBits >= varDataPool_->size()) {
+			varDataPool_->resize(maxBits + 1);
+		}
+
+		if (bits <= maxBits) {
+			for (;; bits++) {
+				data = (*varDataPool_)[bits];
+				if (data != NULL || bits >= maxBits) {
+					break;
+				}
+			}
+		}
+
+		if (data == NULL) {
+			const bool fixed = (bits == fixedBits);
+			Pool &pool = *(fixed ? fixedDataPool_ : largeDataPool_);
+
+			if (pool.empty() || pool.back() != NULL) {
+				pool.push_back(NULL);
+			}
+			data = (fixed ?
+					alloc_.base().allocate() : poolAlloc_->allocate(1U << bits));
+
+			pool.back() = data;
+		}
+		else {
+			(*varDataPool_)[bits] = static_cast<PoolData*>(data)->next_;
+		}
+
+		if (availableSize != NULL) {
+			break;
+		}
+
+		while (bits > minBits) {
+			void *restData = static_cast<uint8_t*>(data) + (1U << (--bits));
+			static_cast<PoolData*>(restData)->next_ = NULL;
+			(*varDataPool_)[bits] = restData;
+		}
+	}
+	while (false);
+
+	if (availableSize != NULL) {
+		*availableSize = 1U << bits;
+	}
+
+	return data;
+}
+
+void SQLValues::SummaryTupleSet::deallocateDetail(void *data, size_t size) {
+	if (parent_ != NULL) {
+		parent_->deallocateDetail(data, size);
+		return;
+	}
+
+	const size_t sizeBits = getSizeBits(size, true);
+	if (sizeBits >= varDataPool_->size()) {
+		assert(false);
+		return;
+	}
+
+	void *&ref = (*varDataPool_)[sizeBits];
+	static_cast<PoolData*>(data)->next_ = ref;
+	ref = data;
+}
+
+size_t SQLValues::SummaryTupleSet::getFixedSizeBits() const {
+	return getSizeBits(alloc_.base().getElementSize(), false);
+}
+
+size_t SQLValues::SummaryTupleSet::getSizeBits(size_t size, bool ceil) {
+	uint32_t bits = static_cast<uint32_t>(std::max<uint32_t>(
+		MIN_POOL_DATA_BITS,
+		static_cast<uint32_t>(sizeof(uint32_t) * CHAR_BIT) -
+				util::nlz(static_cast<uint32_t>(size - 1))));
+	if (!ceil && ((1U << bits) > size)) {
+		--bits;
+	}
+	return std::max<uint32_t>(bits, MIN_POOL_DATA_BITS);
+}
+
+
+SQLValues::SummaryTupleSet::LocalLobBuilder::LocalLobBuilder(
+		SummaryTupleSet &tupleSet, TupleColumnType type) :
+		tupleSet_(tupleSet),
 		type_(type),
-		base_(sensitive) {
+		smallLob_(NULL) {
 }
 
-int32_t SQLValues::ValueComparator::operator()(
+SQLValues::SummaryTupleSet::LocalLobBuilder::~LocalLobBuilder() {
+	clear();
+}
+
+void SQLValues::SummaryTupleSet::LocalLobBuilder::assignSmall(void *lob) {
+	clear();
+	smallLob_ = lob;
+}
+
+void* SQLValues::SummaryTupleSet::LocalLobBuilder::release(bool &small) {
+	small = false;
+
+	void *ret = NULL;
+	if (base_.get() != NULL) {
+		ret = tupleSet_.toNormalLobByBuilder(tupleSet_.varCxt_, *base_);
+		base_.reset();
+	}
+	else if (smallLob_ != NULL) {
+		small = true;
+
+		ret = smallLob_;
+		smallLob_ = NULL;
+	}
+
+	return ret;
+}
+
+void SQLValues::SummaryTupleSet::LocalLobBuilder::append(LobReader &src) {
+	bool found = false;
+	for (;;) {
+		const uint32_t size = static_cast<uint32_t>(std::min<uint64_t>(
+				src.getNext(), std::numeric_limits<uint32_t>::max()));
+		if (size <= 0) {
+			break;
+		}
+
+		const void *data = &src.get();
+		found = true;
+
+		prepare(size, false);
+		if (base_.get() != NULL) {
+			base_->append(data, size);
+		}
+		else {
+			smallLob_ =
+					tupleSet_.appendVarDataDetail(data, size, smallLob_, false);
+		}
+
+		src.step(size);
+	}
+
+	if (!found) {
+		prepare(0, true);
+	}
+}
+
+void SQLValues::SummaryTupleSet::LocalLobBuilder::appendSmall(void *lob) {
+	const uint32_t bodySize = TupleValueUtils::decodeVarSize(lob);
+	const uint32_t headSize = TupleValueUtils::getEncodedVarSize(bodySize);
+	const void *body = static_cast<const uint8_t*>(lob) + headSize;
+
+	prepare(bodySize, false);
+	if (base_.get() != NULL) {
+		base_->append(body, bodySize);
+	}
+	else {
+		smallLob_ =
+				tupleSet_.appendVarDataDetail(body, bodySize, smallLob_, false);
+	}
+}
+
+void SQLValues::SummaryTupleSet::LocalLobBuilder::clear() {
+	base_.reset();
+
+	if (smallLob_ != NULL) {
+		tupleSet_.deallocateSmallLob(smallLob_);
+		smallLob_ = NULL;
+	}
+}
+
+void SQLValues::SummaryTupleSet::LocalLobBuilder::prepare(
+		size_t size, bool force) {
+	if (base_.get() != NULL) {
+		return;
+	}
+
+	const uint32_t lastBodySize = (smallLob_ == NULL ?
+			0 : TupleValueUtils::decodeVarSize(smallLob_));
+	const uint64_t nextBodySize = static_cast<uint64_t>(lastBodySize) + size;
+
+	if (nextBodySize > getMaxSmallLobBodySize()) {
+		base_ = UTIL_MAKE_LOCAL_UNIQUE(
+				base_, LobBuilder, tupleSet_.varCxt_, type_, 0);
+
+		if (smallLob_ != NULL) {
+			const uint32_t headSize =
+					TupleValueUtils::getEncodedVarSize(lastBodySize);
+			const void *body = static_cast<uint8_t*>(smallLob_) + headSize;
+			base_->append(body, lastBodySize);
+		}
+	}
+	else if (smallLob_ == NULL && force) {
+		smallLob_ = tupleSet_.appendVarDataDetail(NULL, 0, NULL, false);
+	}
+}
+
+
+SQLValues::DigestArrayTuple::DigestArrayTuple(util::StackAllocator &alloc) :
+		digest_(0),
+		tuple_(alloc) {
+}
+
+
+TupleColumnType SQLValues::ValueAccessor::getColumnType(
+		bool promotable, bool first) const {
+	if (columnList_ == NULL) {
+		assert(promotable || first);
+		assert(!TypeUtils::isNull(type_));
+		return type_;
+	}
+	else {
+		if (promotable) {
+			if (first) {
+				return columnIt_->getTupleColumn1().getType();
+			}
+			else {
+				return columnIt_->getTupleColumn2().getType();
+			}
+		}
+		else {
+			assert(first);
+			return columnIt_->getType();
+		}
+	}
+}
+
+SQLValues::ValueAccessor SQLValues::ValueAccessor::ofValue(
+		const TupleValue &value) {
+	return ValueAccessor(ValueUtils::toColumnType(value));
+}
+
+bool SQLValues::ValueAccessor::isSameVariant(
+		const ValueAccessor &another, bool nullIgnorable,
+		bool anotherNullIgnorable) const {
+	if ((columnList_ == NULL) != (another.columnList_ == NULL)) {
+		return false;
+	}
+
+	const bool promotable = (columnList_ != NULL);
+	for (size_t i = 0; i < 2; i++) {
+		const bool first = (i == 0);
+
+		TupleColumnType typeList[2];
+		for (size_t j = 0; j < 2; j++) {
+			const ValueAccessor &src = (j == 0 ? *this : another);
+			TupleColumnType &type = typeList[j];
+
+			type = src.getColumnType(promotable, first);
+
+			if ((j == 0 ? nullIgnorable : anotherNullIgnorable)) {
+				type = TypeUtils::toNonNullable(type);
+			}
+		}
+
+		if (typeList[0] != typeList[1]) {
+			return false;
+		}
+
+		if (!promotable) {
+			break;
+		}
+	}
+
+	return true;
+}
+
+
+SQLValues::ValueComparator SQLValues::ValueComparator::ofValues(
+		const TupleValue &v1, const TupleValue &v2, bool sensitive,
+		bool ascending) {
+	return ValueComparator(
+			ValueAccessor::ofValue(v1), ValueAccessor::ofValue(v2),
+			NULL, sensitive, ascending);
+}
+
+SQLValues::ValueComparator::DefaultResultType
+SQLValues::ValueComparator::operator()(
 		const TupleValue &v1, const TupleValue &v2) const {
-	return TypeSwitcher(type_)(base_, v1, v2);
+	typedef DefaultSwitcherByValues SwitcherType;
+	const bool nullIgnorable = false;
+	return DefaultSwitcherByValues(*this, nullIgnorable).getWith<
+			const ValueComparator, SwitcherType::DefaultTraitsType>()(*this, v1, v2);
+}
+
+bool SQLValues::ValueComparator::isEmpty() const {
+	return getColumnTypeSwitcher(true, false, NULL).isAny();
+}
+
+bool SQLValues::ValueComparator::isSameVariant(
+		const ValueComparator &another, bool nullIgnorable,
+		bool anotherNullIgnorable, bool orderArranged) const {
+	return (!sensitive_ == !another.sensitive_ &&
+			(orderArranged ?
+					ascending_ : (!ascending_ == !another.ascending_)) &&
+			accessor1_.isSameVariant(
+					another.accessor1_, nullIgnorable, anotherNullIgnorable) &&
+			accessor2_.isSameVariant(
+					another.accessor2_, nullIgnorable, anotherNullIgnorable));
+}
+
+SQLValues::TypeSwitcher
+SQLValues::ValueComparator::getColumnTypeSwitcher(
+		bool promotable, bool nullIgnorable, ValueProfile *profile) const {
+	TypeSwitcher switcher(
+			accessor1_.getColumnType(promotable, true),
+			accessor2_.getColumnType(promotable, (!promotable || false)));
+	if (nullIgnorable) {
+		switcher = switcher.toNonNullable();
+	}
+	if (profile != NULL) {
+		switcher = switcher.withProfile(profile);
+	}
+	return switcher;
 }
 
 
-SQLValues::ValueEq::ValueEq(TupleColumnType type) :
-		comp_(type, false) {
+SQLValues::ValueComparator::Arranged::Arranged(const ValueComparator &base) :
+		base_(base),
+		func_(SwitcherType(base_, false).getWith<
+				const ValueComparator, SwitcherType::DefaultTraitsType>()) {
 }
+
 
 bool SQLValues::ValueEq::operator()(
 		const TupleValue &v1, const TupleValue &v2) const {
-	return comp_(v1, v2) == 0;
+	const bool sensitive = false;
+	return ValueComparator::compareValues(v1, v2, sensitive, true) == 0;
 }
 
-
-SQLValues::ValueLess::ValueLess(TupleColumnType type) :
-		comp_(type, true) {
-}
 
 bool SQLValues::ValueLess::operator()(
 		const TupleValue &v1, const TupleValue &v2) const {
-	return comp_(v1, v2) < 0;
+	const bool sensitive = true;
+	return ValueComparator::compareValues(v1, v2, sensitive, true) < 0;
 }
 
-
-SQLValues::ValueGreater::ValueGreater(TupleColumnType type) :
-		comp_(type, true) {
-}
 
 bool SQLValues::ValueGreater::operator()(
 		const TupleValue &v1, const TupleValue &v2) const {
-	return comp_(v1, v2) > 0;
+	const bool sensitive = true;
+	return ValueComparator::compareValues(v1, v2, sensitive, true) > 0;
 }
 
 
-SQLValues::ValueFnv1aHasher::ValueFnv1aHasher(TupleColumnType type) :
-		type_(type),
-		seed_(ValueUtils::fnv1aHashInit()) {
+SQLValues::ValueFnv1aHasher SQLValues::ValueFnv1aHasher::ofValue(
+		const TupleValue &value) {
+	return ValueFnv1aHasher(ValueAccessor::ofValue(value), NULL);
 }
 
-SQLValues::ValueFnv1aHasher::ValueFnv1aHasher(
-		TupleColumnType type, uint32_t seed) :
-		type_(type),
-		seed_(seed) {
+SQLValues::ValueFnv1aHasher SQLValues::ValueFnv1aHasher::ofValue(
+		const TupleValue &value, int64_t seed) {
+	return ValueFnv1aHasher(ValueAccessor::ofValue(value), NULL, seed);
 }
 
 uint32_t SQLValues::ValueFnv1aHasher::operator()(
 		const TupleValue &value) const {
-	if (ValueUtils::isNull(value)) {
-		return seed_;
-	}
+	typedef TypeSwitcher::OpTraitsOptions<ValueDigester::VariantTraits<
+			false, false, ValueAccessor::ByValue> > Options;
+	typedef TypeSwitcher::OpTraits<int64_t, Options, const TupleValue> Traits;
 
-	switch (type_) {
-	case TupleTypes::TYPE_BYTE:
-		return ValueUtils::fnv1aHashIntegral(
-				seed_, ValueUtils::getValue<int8_t>(value));
-	case TupleTypes::TYPE_SHORT:
-		return ValueUtils::fnv1aHashIntegral(
-				seed_, ValueUtils::getValue<int16_t>(value));
-	case TupleTypes::TYPE_INTEGER:
-		return ValueUtils::fnv1aHashIntegral(
-				seed_, ValueUtils::getValue<int32_t>(value));
-	case TupleTypes::TYPE_LONG:
-		return ValueUtils::fnv1aHashIntegral(seed_, value.get<int64_t>());
-	case TupleTypes::TYPE_FLOAT:
-		return ValueUtils::fnv1aHashFloating(seed_, value.get<float>());
-	case TupleTypes::TYPE_DOUBLE:
-		return ValueUtils::fnv1aHashFloating(seed_, value.get<double>());
-	case TupleTypes::TYPE_TIMESTAMP:
-		return ValueUtils::fnv1aHashIntegral(seed_, value.get<int64_t>());
-	case TupleTypes::TYPE_BOOL:
-		return ValueUtils::fnv1aHashIntegral(
-				seed_, ValueUtils::getValue<int8_t>(value));
-	case TupleTypes::TYPE_STRING:
-		return ValueUtils::fnv1aHashSequence(
-				seed_, *ValueUtils::toStringReader(value));
-	case TupleTypes::TYPE_BLOB:
-		return ValueUtils::fnv1aHashSequence(
-				seed_, *ValueUtils::toLobReader(value));
-	default:
-		assert(false);
-		return 0;
+	const TypeSwitcher switcher(accessor_.getColumnType(false, true));
+	const int64_t ret =
+			switcher.getWith<const ValueFnv1aHasher, Traits>()(*this, value);
+	return static_cast<uint32_t>(ret < 0 ? unmaskNull(ret) : ret);
+}
+
+
+bool SQLValues::ValueDigester::isSameVariant(
+		const ValueDigester &another, bool nullIgnorable,
+		bool anotherNullIgnorable) const {
+	return (!ordering_ == !another.ordering_ &&
+			!rotating_ == !another.rotating_ &&
+			accessor_.isSameVariant(
+					another.accessor_, nullIgnorable, anotherNullIgnorable));
+}
+
+bool SQLValues::ValueDigester::isEmpty() const {
+	return getColumnTypeSwitcher(false, false, NULL).isAny();
+}
+
+SQLValues::TypeSwitcher
+SQLValues::ValueDigester::getColumnTypeSwitcher(
+		bool nullIgnorable, bool nullableAlways, ValueProfile *profile) const {
+	TypeSwitcher switcher(accessor_.getColumnType(false, true));
+	if (nullIgnorable) {
+		switcher = switcher.toNonNullable();
 	}
+	if (nullableAlways) {
+		switcher = switcher.toNullableAlways();
+	}
+	if (profile != NULL) {
+		switcher = switcher.withProfile(profile);
+	}
+	return switcher;
 }
 
 
@@ -493,7 +2509,20 @@ TupleValue SQLValues::ValueConverter::operator()(
 	case TupleTypes::TYPE_DOUBLE:
 		return ValueUtils::toAnyByNumeric(ValueUtils::toFloating<double>(src));
 	case TupleTypes::TYPE_TIMESTAMP:
-		return ValueUtils::toAnyByTimestamp(ValueUtils::toTimestamp(cxt, src));
+		return ValueUtils::toAnyByValue<TupleTypes::TYPE_TIMESTAMP>(
+				ValueUtils::toTimestamp(
+						cxt, src, util::DateTime::FIELD_MILLISECOND).toTimestamp(
+								Types::TimestampTag()));
+	case TupleTypes::TYPE_MICRO_TIMESTAMP:
+		return ValueUtils::toAnyByValue<TupleTypes::TYPE_MICRO_TIMESTAMP>(
+				ValueUtils::toTimestamp(
+						cxt, src, util::DateTime::FIELD_MICROSECOND).toTimestamp(
+								Types::MicroTimestampTag()));
+	case TupleTypes::TYPE_NANO_TIMESTAMP:
+		return ValueUtils::toAnyByWritable<TupleTypes::TYPE_NANO_TIMESTAMP>(
+				cxt, ValueUtils::toTimestamp(
+						cxt, src, util::DateTime::FIELD_NANOSECOND).toTimestamp(
+								Types::NanoTimestampTag()));
 	case TupleTypes::TYPE_BOOL:
 		return ValueUtils::toAnyByBool(ValueUtils::toBool(src));
 	case TupleTypes::TYPE_STRING:
@@ -511,7 +2540,8 @@ SQLValues::ValuePromoter::ValuePromoter(TupleColumnType type) :
 		type_(type) {
 }
 
-TupleValue SQLValues::ValuePromoter::operator()(const TupleValue &src) const {
+TupleValue SQLValues::ValuePromoter::operator()(
+		ValueContext *cxt, const TupleValue &src) const {
 	if (src.getType() == type_) {
 		return src;
 	}
@@ -525,6 +2555,21 @@ TupleValue SQLValues::ValuePromoter::operator()(const TupleValue &src) const {
 		return ValueUtils::toAnyByNumeric(ValueUtils::toIntegral<int64_t>(src));
 	case TupleTypes::TYPE_DOUBLE:
 		return ValueUtils::toAnyByNumeric(ValueUtils::toFloating<double>(src));
+	case TupleTypes::TYPE_TIMESTAMP:
+		return ValueUtils::toAnyByValue<TupleTypes::TYPE_TIMESTAMP>(
+				ValueUtils::promoteValue<TupleTypes::TYPE_TIMESTAMP>(src));
+	case TupleTypes::TYPE_MICRO_TIMESTAMP:
+		return ValueUtils::toAnyByValue<TupleTypes::TYPE_MICRO_TIMESTAMP>(
+				ValueUtils::promoteValue<
+						TupleTypes::TYPE_MICRO_TIMESTAMP>(src));
+	case TupleTypes::TYPE_NANO_TIMESTAMP:
+		if (cxt == NULL) {
+			assert(false);
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+		}
+		return ValueUtils::toAnyByWritable<TupleTypes::TYPE_NANO_TIMESTAMP>(
+				*cxt, ValueUtils::promoteValue<
+						TupleTypes::TYPE_NANO_TIMESTAMP>(src));
 	default:
 		assert(false);
 		return TupleValue();
@@ -532,61 +2577,72 @@ TupleValue SQLValues::ValuePromoter::operator()(const TupleValue &src) const {
 }
 
 
-SQLValues::ValueWriter::ValueWriter(
-		const TupleColumn &srcColumn, const TupleColumn &destColumn) :
-		type_(TupleTypes::TYPE_NULL),
-		srcColumn_(srcColumn),
-		destColumn_(destColumn) {
-	const TupleColumnType srcType = srcColumn.getType();
-	const TupleColumnType destType = destColumn.getType();
+SQLValues::TupleNullChecker::TupleNullChecker(
+		const CompColumnList &columnList) :
+		columnList_(columnList) {
+}
 
-	if (TypeUtils::toNonNullable(srcType) ==
-			TypeUtils::toNonNullable(destType) &&
-			!(TypeUtils::isNullable(srcType) &&
-			!TypeUtils::isNullable(destType))) {
-		type_ = TypeUtils::toNonNullable(destType);
+bool SQLValues::TupleNullChecker::isEmpty() const {
+	for (CompColumnList::const_iterator it = columnList_.begin();
+			it != columnList_.end(); ++it) {
+		if (TypeUtils::isNullable(it->getType())) {
+			return false;
+		}
 	}
+	return true;
 }
 
 
 SQLValues::TupleComparator::TupleComparator(
-		const CompColumnList &columnList, bool sensitive) :
+		const CompColumnList &columnList, VarContext *varCxt, bool sensitive,
+		bool withDigest, bool nullIgnorable, bool orderedDigestRestricted) :
 		columnList_(columnList),
-		promotable_(isPromotable(columnList)),
+		varCxt_(varCxt),
 		sensitive_(sensitive),
-		forKeyOnlyArray_(true) {
+		withDigest_(withDigest),
+		nullIgnorable_(nullIgnorable),
+		orderedDigestRestricted_(orderedDigestRestricted) {
 }
 
-void SQLValues::TupleComparator::setForKeyOnlyArray(bool forKeyOnlyArray) {
-	forKeyOnlyArray_ = forKeyOnlyArray;
+SQLValues::ValueComparator SQLValues::TupleComparator::initialComparatorAt(
+		CompColumnList::const_iterator it, bool ordering) const {
+	bool ascending = it->isAscending();
+	if (ordering && !columnList_.front().isAscending() &&
+			it != columnList_.begin()) {
+		ascending = !ascending;
+	}
+	return ValueComparator(
+			ValueAccessor(it, columnList_), ValueAccessor(it, columnList_),
+			NULL, sensitive_, ascending);
 }
 
-SQLValues::TypeSwitcher SQLValues::TupleComparator::getTypeSwitcher() const {
-	assert(!columnList_.empty());
-	const TupleColumnType type = (promotable_ ?
-			static_cast<TupleColumnType>(TupleTypes::TYPE_ANY) :
-			TypeUtils::toNonNullable(columnList_.front().getType()));
-	return TypeSwitcher(type);
-}
+bool SQLValues::TupleComparator::isEmpty(size_t startIndex) const {
+	if (startIndex >= columnList_.size()) {
+		return true;
+	}
 
-bool SQLValues::TupleComparator::isPromotable(
-		const CompColumnList &columnList) {
-	assert(!columnList.empty());
-	const TupleColumnType frontType =
-			TypeUtils::toNonNullable(columnList.front().getType());
-
-	for (CompColumnList::const_iterator it = columnList.begin();
-			it != columnList.end(); ++it) {
-		const TupleColumnType type = TypeUtils::toNonNullable(it->getType());
-		if (type != frontType) {
-			continue;
+	for (CompColumnList::const_iterator it = columnList_.begin() + startIndex;
+			it != columnList_.end(); ++it) {
+		if (!initialComparatorAt(it, false).isEmpty()) {
+			return false;
 		}
-		if (type != TypeUtils::toNonNullable(
-				it->getTupleColumn1().getType())) {
-			return true;
-		}
-		if (type != TypeUtils::toNonNullable(
-				it->getTupleColumn2().getType())) {
+	}
+
+	return true;
+}
+
+bool SQLValues::TupleComparator::isEitherSideEmpty(size_t startIndex) const {
+	if (startIndex >= columnList_.size()) {
+		return true;
+	}
+
+	for (CompColumnList::const_iterator it = columnList_.begin() + startIndex;
+			it != columnList_.end(); ++it) {
+		const TupleColumnType type1 = it->getTupleColumn1().getType();
+		const TupleColumnType type2 = it->getTupleColumn2().getType();
+		assert(!TypeUtils::isNull(type1) && !TypeUtils::isNull(type2));
+
+		if (TypeUtils::isAny(type1) || TypeUtils::isAny(type2)) {
 			return true;
 		}
 	}
@@ -594,260 +2650,157 @@ bool SQLValues::TupleComparator::isPromotable(
 	return false;
 }
 
+bool SQLValues::TupleComparator::isDigestOnly(bool promotable) const {
+	if (withDigest_ && columnList_.size() == 1) {
+		const CompColumn &column = columnList_.front();
+
+		const TupleColumnType type = column.getType();
+		assert(!TypeUtils::isNull(type));
+
+		if ((TypeUtils::isNormalFixed(type) &&
+				(nullIgnorable_ || !TypeUtils::isNullable(type))) ||
+				TypeUtils::isAny(type)) {
+
+			if (promotable && TypeUtils::isFloating(type)) {
+				const TupleColumnType type1 =
+						column.getTupleColumn1().getType();
+				const TupleColumnType type2 =
+						column.getTupleColumn2().getType();
+				if (TypeUtils::isIntegral(type1) ||
+						TypeUtils::isIntegral(type2)) {
+					return false;
+				}
+			}
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool SQLValues::TupleComparator::isDigestOrdered() const {
+	if (orderedDigestRestricted_) {
+		return false;
+	}
+
+	if (columnList_.size() >= 1) {
+		const CompColumn &column = columnList_.front();
+
+		if (column.isOrdering()) {
+			return true;
+		}
+
+		const TupleColumnType type = column.getType();
+		assert(!TypeUtils::isNull(type));
+
+		if ((TypeUtils::isNormalFixed(type) || TypeUtils::isAny(type)) &&
+				columnList_.size() <= 1) {
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool SQLValues::TupleComparator::isSingleVarHeadOnly(bool ordering) const {
+	if (columnList_.size() == 1) {
+		const CompColumn &column = columnList_.front();
+
+		if (!ordering != !column.isOrdering()) {
+			return false;
+		}
+
+		const TupleColumnType type = column.getType();
+		return TypeUtils::isSingleVar(type);
+	}
+
+	return false;
+}
+
 
 SQLValues::TupleRangeComparator::TupleRangeComparator(
-		const CompColumnList &columnList) :
-		base_(columnList, false),
-		columnList_(columnList) {
-}
-
-int32_t SQLValues::TupleRangeComparator::operator()(
-		const ReadableTuple &t1, const ReadableTuple &t2) const {
-	return base_.getTypeSwitcher()(*this, t1, t2);
-}
-
-template<typename T>
-int32_t SQLValues::TupleRangeComparator::TypeAt<T>::operator()(
-		const ReadableTuple &t1, const ReadableTuple &t2) const {
-	const bool sensitive = false;
-	const bool forKeyOnlyArray = false;
-	for (CompColumnList::const_iterator it = base_.columnList_.begin();
-			it != base_.columnList_.end(); ++it) {
-		const int32_t ret = TupleComparator::compareElement<
-				T, ReadableTuple, ReadableTuple>(
-				*it, static_cast<uint32_t>(it - base_.columnList_.begin()),
-				sensitive, forKeyOnlyArray, t1, t2);
-
-		if (ret != 0) {
-			if (it->isEitherUnbounded()) {
-				if (it->isLowerUnbounded()) {
-					if (ret < 0) {
-						return 0;
-					}
-				}
-				else {
-					if (ret > 0) {
-						return 0;
-					}
-				}
-			}
-			return ret;
-		}
-
-		if (it->isEitherExclusive()) {
-			if (it->isLowerExclusive()) {
-				return -1;
-			}
-			else {
-				return 1;
-			}
-		}
-	}
-
-	return 0;
-}
-
-
-SQLValues::TupleEq::TupleEq(const CompColumnList &columnList) :
-		comp_(columnList, false) {
-}
-
-
-SQLValues::TupleLess::TupleLess(const CompColumnList &columnList) :
-		comp_(columnList, true) {
-}
-
-
-SQLValues::TupleGreater::TupleGreater(const CompColumnList &columnList) :
-		comp_(columnList, true) {
-}
-
-
-SQLValues::TupleFnv1aHasher::TupleFnv1aHasher(
-		const CompColumnList &columnList) :
+		const CompColumnList &columnList, VarContext *varCxt,
+		bool nullIgnorable) :
+		base_(columnList, varCxt, false, false, nullIgnorable),
 		columnList_(columnList),
-		seed_(ValueUtils::fnv1aHashInit()) {
+		varCxt_(varCxt),
+		nullIgnorable_(nullIgnorable) {
 }
 
-SQLValues::TupleFnv1aHasher::TupleFnv1aHasher(
-		const CompColumnList &columnList, uint32_t seed) :
+
+SQLValues::TupleDigester::TupleDigester(
+		const CompColumnList &columnList, VarContext *varCxt, 
+		const bool *ordering, bool rotationAllowed, bool nullIgnorable,
+		bool nullableAlways) :
 		columnList_(columnList),
-		seed_(seed) {
+		varCxt_(varCxt),
+		ordering_((ordering == NULL ?
+				isOrderingAvailable(columnList, false) : *ordering)),
+		rotating_(isRotationAvailable(columnList, ordering_, rotationAllowed)),
+		nullIgnorable_(nullIgnorable),
+		nullableAlways_(nullableAlways) {
 }
 
-uint32_t SQLValues::TupleFnv1aHasher::operator()(
-		const ReadableTuple &tuple) const {
-	uint32_t hash = seed_;
-	for (CompColumnList::const_iterator it = columnList_.begin();
-			it != columnList_.end(); ++it) {
-		const TupleColumn &column = it->getTupleColumn1();
-		hash = ValueFnv1aHasher(it->getType(), hash)(tuple.get(column));
+bool SQLValues::TupleDigester::isOrdering() const {
+	return ordering_;
+}
+
+bool SQLValues::TupleDigester::isRotating() const {
+	return rotating_;
+}
+
+bool SQLValues::TupleDigester::isOrderingAvailable(
+		const CompColumnList &columnList, bool promotable) {
+	if (columnList.empty() || columnList.front().isOrdering()) {
+		return true;
 	}
-	return hash;
+	return TupleComparator(
+			columnList, NULL, false, true, true).isDigestOnly(promotable);
 }
 
-
-SQLValues::TupleConverter::TupleConverter(
-		const CompColumnList &srcColumnList,
-		const CompColumnList &destColumnList) :
-		srcColumnList_(srcColumnList),
-		destColumnList_(destColumnList) {
-}
-
-void SQLValues::TupleConverter::operator()(
-		ValueContext &cxt,
-		const ReadableTuple &src, WritableTuple &dest) const {
-	CompColumnList::const_iterator srcIt = srcColumnList_.begin();
-	CompColumnList::const_iterator destIt = destColumnList_.begin();
-	for (; srcIt != srcColumnList_.end(); ++srcIt, ++destIt) {
-		const TupleColumn &srcColumn = srcIt->getTupleColumn1();
-		const TupleColumn &destColumn = destIt->getTupleColumn1();
-		const ValueConverter conv(srcIt->getType());
-		dest.set(destColumn, conv(cxt, src.get(srcColumn)));
+bool SQLValues::TupleDigester::isRotationAvailable(
+		const CompColumnList &columnList, bool ordering,
+		bool rotationAllowed) {
+	if (!ordering || !rotationAllowed) {
+		return false;
 	}
+	return (!columnList.empty() && !columnList.front().isOrdering());
+}
+
+SQLValues::ValueDigester SQLValues::TupleDigester::initialDigesterAt(
+		CompColumnList::const_iterator it) const {
+	return ValueDigester(
+			ValueAccessor(it, columnList_), NULL, ordering_, rotating_, 0);
 }
 
 
-SQLValues::TuplePromoter::TuplePromoter(
-		const CompColumnList &srcColumnList,
-		const CompColumnList &destColumnList) :
-		srcColumnList_(srcColumnList),
-		destColumnList_(destColumnList) {
-}
+void SQLValues::StringBuilder::expandCapacity(size_t actualSize) {
+	reserve(capacity() * 2, actualSize);
 
-void SQLValues::TuplePromoter::operator()(
-		const ReadableTuple &src, WritableTuple &dest) const {
-	CompColumnList::const_iterator srcIt = srcColumnList_.begin();
-	CompColumnList::const_iterator destIt = destColumnList_.begin();
-	for (; srcIt != srcColumnList_.end(); ++srcIt, ++destIt) {
-		const TupleColumn &srcColumn = srcIt->getTupleColumn1();
-		const TupleColumn &destColumn = destIt->getTupleColumn1();
-		const ValuePromoter promo(srcIt->getType());
-		dest.set(destColumn, promo(src.get(srcColumn)));
+	if (data_ != localBuffer_) {
+		dynamicBuffer_.resize(actualSize);
 	}
 }
 
+void SQLValues::StringBuilder::initializeDynamicBuffer(
+		size_t newCapacity, size_t actualSize) {
+	assert(data_ == localBuffer_);
 
-SQLValues::StringBuilder::StringBuilder(ValueContext &cxt, size_t capacity) :
-		data_(NULL),
-		dynamicBuffer_(resolveAllocator(cxt)),
-		size_(0),
-		limit_(cxt.getMaxStringLength()) {
-	data_ = localBuffer_;
-
-	if (capacity > 0) {
-		resize(std::min(capacity, limit_));
-		resize(0);
-	}
+	dynamicBuffer_.resize(newCapacity);
+	data_ = dynamicBuffer_.data();
+	memcpy(data_, localBuffer_, actualSize);
 }
 
-SQLValues::StringBuilder::StringBuilder(
-		const util::StdAllocator<void, void> &alloc) :
-		data_(NULL),
-		dynamicBuffer_(alloc),
-		size_(0),
-		limit_(std::numeric_limits<size_t>::max()) {
-	data_ = localBuffer_;
+void SQLValues::StringBuilder::errorLimit(uint64_t size, size_t limit) {
+	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_LIMIT_EXCEEDED,
+			"Too large string (limit=" << limit <<
+			", requested=" << size << ")");
 }
 
-void SQLValues::StringBuilder::setLimit(size_t limit) {
-	limit_ = limit;
-	resize(size_);
-}
-
-void SQLValues::StringBuilder::appendCode(util::CodePoint c) {
-	char8_t *it = data_ + size_;
-	while (!util::UTF8Utils::encodeRaw(&it, data_ + capacity(), c)) {
-		const size_t orgSize = size_;
-		const size_t orgLimit = limit_;
-
-		limit_ = std::numeric_limits<size_t>::max();
-		resize(capacity() * 2);
-		size_ = orgSize;
-		limit_ = orgLimit;
-
-		it = data_ + size_;
-	}
-
-	resize(it - data_);
-}
-
-void SQLValues::StringBuilder::append(const char8_t *data, size_t size) {
-	if (std::numeric_limits<size_t>::max() - size < size_) {
-		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_LIMIT_EXCEEDED,
-				"Too large string in appending (currentSize=" << size_ <<
-				", appendingSize=" << size << ")");
-	}
-
-	resize(size_ + size);
-	memcpy(data_ + size_ - size, data, size);
-}
-
-void SQLValues::StringBuilder::appendAll(const char8_t *str) {
-	appendAll(*util::SequenceUtils::toReader(str));
-}
-
-template<typename R>
-void SQLValues::StringBuilder::appendAll(R &reader) {
-	for (size_t next; (next = reader.getNext()) > 0; reader.step(next)) {
-		append(&reader.get(), next);
-	}
-}
-
-TupleValue SQLValues::StringBuilder::build(ValueContext &cxt) {
-	TupleValue::SingleVarBuilder builder(
-			cxt.getVarContext(), TupleTypes::TYPE_STRING, size_);
-	builder.append(data_, size_);
-	return builder.build();
-}
-
-size_t SQLValues::StringBuilder::size() const {
-	return size_;
-}
-
-size_t SQLValues::StringBuilder::capacity() const {
-	if (data_ == localBuffer_) {
-		return sizeof(localBuffer_);
-	}
-	else {
-		return dynamicBuffer_.capacity();
-	}
-}
-
-void SQLValues::StringBuilder::resize(size_t size) {
-	if (size > limit_) {
-		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_LIMIT_EXCEEDED,
-				"Too large string (limit=" << limit_ <<
-				", requested=" << size << ")");
-	}
-
-	if (data_ == localBuffer_) {
-		if (size > sizeof(localBuffer_)) {
-			dynamicBuffer_.resize(size);
-			data_ = dynamicBuffer_.data();
-			memcpy(data_, localBuffer_, size_);
-		}
-	}
-	else {
-		dynamicBuffer_.resize(size);
-		data_ = dynamicBuffer_.data();
-	}
-	size_ = size;
-}
-
-char8_t* SQLValues::StringBuilder::data() {
-	return data_;
-}
-
-util::StdAllocator<void, void> SQLValues::StringBuilder::resolveAllocator(
-		ValueContext &cxt) {
-	SQLVarSizeAllocator *varAlloc = cxt.getVarContext().getVarAllocator();
-	if (varAlloc != NULL) {
-		return *varAlloc;
-	}
-	else {
-		return cxt.getAllocator();
-	}
+void SQLValues::StringBuilder::errorMaxSize(size_t current, size_t appending) {
+	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_LIMIT_EXCEEDED,
+			"Too large string in appending (currentSize=" << current <<
+			", appendingSize=" << appending << ")");
 }
 
 
@@ -1006,258 +2959,6 @@ SQLValues::LobReader& SQLValues::LobReaderRef::operator*() const {
 }
 
 
-bool SQLValues::TypeUtils::isAny(TupleColumnType type) {
-	return BaseUtils::isAny(type);
-}
-
-bool SQLValues::TypeUtils::isNull(TupleColumnType type) {
-	return BaseUtils::isNull(type);
-}
-
-bool SQLValues::TypeUtils::isFixed(TupleColumnType type) {
-	return BaseUtils::isFixed(type);
-}
-
-bool SQLValues::TypeUtils::isArray(TupleColumnType type) {
-	return BaseUtils::isArray(type);
-}
-
-bool SQLValues::TypeUtils::isIntegral(TupleColumnType type) {
-	return BaseUtils::isIntegral(type);
-}
-
-bool SQLValues::TypeUtils::isFloating(TupleColumnType type) {
-	return BaseUtils::isFloating(type);
-}
-
-bool SQLValues::TypeUtils::isDeclarable(TupleColumnType type) {
-	return BaseUtils::isDeclarable(type);
-}
-
-bool SQLValues::TypeUtils::isSupported(TupleColumnType type) {
-	return BaseUtils::isSupported(type);
-}
-
-bool SQLValues::TypeUtils::isNullable(TupleColumnType type) {
-	return BaseUtils::isNullable(type);
-}
-
-TupleColumnType SQLValues::TypeUtils::setNullable(
-		TupleColumnType type, bool nullable) {
-	const TupleColumnType baseType = toNonNullable(type);
-	if (!nullable || isAny(baseType) || isNull(baseType)) {
-		return baseType;
-	}
-
-	return static_cast<TupleColumnType>(
-			baseType | TupleTypes::TYPE_MASK_NULLABLE);
-}
-
-TupleColumnType SQLValues::TypeUtils::toNonNullable(TupleColumnType type) {
-	return static_cast<TupleColumnType>(
-			type & ~TupleTypes::TYPE_MASK_NULLABLE);
-}
-
-TupleColumnType SQLValues::TypeUtils::toNullable(TupleColumnType type) {
-	return setNullable(type, true);
-}
-
-TupleColumnType SQLValues::TypeUtils::findPromotionType(
-		TupleColumnType type1, TupleColumnType type2, bool anyAsNull) {
-	const TupleColumnType base1 = toNonNullable(type1);
-	const TupleColumnType base2 = toNonNullable(type2);
-	const bool eitherNullable = (isNullable(type1) || isNullable(type2));
-
-	if (base1 == base2) {
-		return setNullable(base1, eitherNullable);
-	}
-
-	if (anyAsNull) {
-		if (isAny(base1)) {
-			return setNullable(base2, true);
-		}
-		if (isAny(base2)) {
-			return setNullable(base1, true);
-		}
-	}
-
-	const TypeCategory category1 = getStaticTypeCategory(base1);
-	const TypeCategory category2 = getStaticTypeCategory(base2);
-
-	const int32_t maskedCategory1 =
-			category1 & ~TYPE_CATEGORY_NUMERIC_MASK;
-	const int32_t maskedCategory2 =
-			category2 & ~TYPE_CATEGORY_NUMERIC_MASK;
-	if (maskedCategory1 == maskedCategory2) {
-		const int32_t bothCategory = (category1 | category2);
-
-		if (bothCategory == TYPE_CATEGORY_LONG) {
-			return setNullable(TupleTypes::TYPE_LONG, eitherNullable);
-		}
-		else {
-			assert((category1 & TYPE_CATEGORY_NUMERIC_FLAG) != 0);
-			assert((category2 & TYPE_CATEGORY_NUMERIC_FLAG) != 0);
-			return setNullable(TupleTypes::TYPE_DOUBLE, eitherNullable);
-		}
-	}
-
-	return TupleTypes::TYPE_NULL;
-}
-
-TupleColumnType SQLValues::TypeUtils::resolveConversionType(
-		TupleColumnType src, TupleColumnType desired, bool implicit,
-		bool anyAsNull) {
-	const TupleColumnType convType =
-			findConversionType(src, desired, implicit, anyAsNull);
-	if (isNull(convType)) {
-		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_UNSUPPORTED_TYPE_CONVERSION,
-				(implicit ? "Unacceptable implicit" : "Unsupported") <<
-				" type conversion (from=" << toString(src) <<
-				", to=" <<toString(desired) << ")");
-	}
-
-	return convType;
-}
-
-TupleColumnType SQLValues::TypeUtils::findEvaluatingConversionType(
-		TupleColumnType src, TupleColumnType desired, bool implicit,
-		bool anyAsNull, bool evaluating) {
-	TupleColumnType result =
-			findConversionType(src, desired, implicit, anyAsNull);
-
-	if (isNull(result) && !evaluating) {
-		result = findConversionType(
-				toNonNullable(src), desired, implicit, anyAsNull);
-
-		if (isNull(result) && anyAsNull && isAny(src) && !isAny(desired)) {
-			result = toNonNullable(desired);
-		}
-	}
-
-	return result;
-}
-
-TupleColumnType SQLValues::TypeUtils::findConversionType(
-		TupleColumnType src, TupleColumnType desired, bool implicit,
-		bool anyAsNull) {
-	const TupleColumnType srcBase = toNonNullable(src);
-	const TupleColumnType desiredBase = toNonNullable(desired);
-	const bool srcNullable = isNullable(src);
-	const bool desiredNullable = isNullable(desired);
-
-	if (srcBase == desiredBase) {
-		if (srcNullable && !desiredNullable) {
-			return TupleTypes::TYPE_NULL;
-		}
-		if (desiredBase == TupleTypes::TYPE_NUMERIC) {
-			return TupleTypes::TYPE_ANY;
-		}
-		return setNullable(desiredBase, srcNullable);
-	}
-
-	if (desired == TupleTypes::TYPE_ANY) {
-		return src;
-	}
-
-	if (anyAsNull && isAny(src)) {
-		if (!desiredNullable) {
-			return TupleTypes::TYPE_NULL;
-		}
-		if (desiredBase == TupleTypes::TYPE_NUMERIC) {
-			return TupleTypes::TYPE_ANY;
-		}
-		return setNullable(desiredBase, true);
-	}
-
-	const TypeCategory srcCategory = getStaticTypeCategory(srcBase);
-	const TypeCategory desiredCategory = getStaticTypeCategory(desiredBase);
-
-	if (!implicit) {
-		if (srcCategory == TYPE_CATEGORY_STRING ||
-				desiredCategory == TYPE_CATEGORY_STRING ||
-				(srcCategory == TYPE_CATEGORY_BOOL &&
-						desiredCategory == TYPE_CATEGORY_LONG) ||
-				(srcCategory == TYPE_CATEGORY_LONG &&
-						desiredCategory == TYPE_CATEGORY_BOOL)) {
-			return setNullable(desiredBase, srcNullable);
-		}
-	}
-
-	if ((srcCategory & TYPE_CATEGORY_NUMERIC_FLAG) != 0 &&
-			(desiredCategory & TYPE_CATEGORY_NUMERIC_FLAG) != 0) {
-		if (desiredCategory == TYPE_CATEGORY_NUMERIC_FLAG) {
-			if (srcCategory == TYPE_CATEGORY_LONG) {
-				return setNullable(TupleTypes::TYPE_LONG, srcNullable);
-			}
-			else if (srcCategory == TYPE_CATEGORY_DOUBLE) {
-				return setNullable(TupleTypes::TYPE_DOUBLE, srcNullable);
-			}
-			else {
-				assert(false);
-				return TupleTypes::TYPE_NULL;
-			}
-		}
-		return setNullable(desiredBase, srcNullable);
-	}
-
-	return TupleTypes::TYPE_NULL;
-}
-
-TupleColumnType SQLValues::TypeUtils::filterColumnType(TupleColumnType type) {
-	if (!isSupported(type) || isArray(type)) {
-		return TupleTypes::TYPE_ANY;
-	}
-
-	return type;
-}
-
-SQLValues::TypeUtils::TypeCategory
-SQLValues::TypeUtils::getStaticTypeCategory(TupleColumnType type) {
-	if (type == TupleTypes::TYPE_NULL) {
-		return TYPE_CATEGORY_NULL;
-	}
-	else if (isIntegral(type)) {
-		return TYPE_CATEGORY_LONG;
-	}
-	else if (isFloating(type)) {
-		return TYPE_CATEGORY_DOUBLE;
-	}
-	else if (type == TupleTypes::TYPE_STRING) {
-		return TYPE_CATEGORY_STRING;
-	}
-	else if (type == TupleTypes::TYPE_BLOB) {
-		return TYPE_CATEGORY_BLOB;
-	}
-	else if (type == TupleTypes::TYPE_BOOL) {
-		return TYPE_CATEGORY_BOOL;
-	}
-	else if (type == TupleTypes::TYPE_TIMESTAMP) {
-		return TYPE_CATEGORY_TIMESTAMP;
-	}
-	else if (type == TupleTypes::TYPE_NUMERIC) {
-		return TYPE_CATEGORY_NUMERIC_FLAG;
-	}
-
-	assert(false);
-	return TYPE_CATEGORY_NULL;
-}
-
-void SQLValues::TypeUtils::setUpTupleInfo(
-		TupleList::Info &info, const TupleColumnType *list, size_t count) {
-	info.columnTypeList_ = list;
-	info.columnCount_ = count;
-}
-
-const char8_t* SQLValues::TypeUtils::toString(
-		TupleColumnType type, bool nullOnUnknown) {
-	const char8_t *str = TupleList::TupleColumnTypeCoder()(type);
-	if (str == NULL && !nullOnUnknown) {
-		return "";
-	}
-	return str;
-}
-
-
 int32_t SQLValues::ValueUtils::compareFloating(
 		double v1, double v2, bool sensitive) {
 	if (v1 < v2) {
@@ -1280,9 +2981,148 @@ int32_t SQLValues::ValueUtils::compareFloating(
 			util::isNaN(v1) ? 1 : 0, util::isNaN(v2) ? 1 : 0);
 }
 
+int32_t SQLValues::ValueUtils::compareString(
+		const TupleString &v1, const TupleString &v2) {
+	typedef ValueComparator::ThreeWay PredType;
+
+	const TupleString::BufferInfo &buf1 = v1.getBuffer();
+	const TupleString::BufferInfo &buf2 = v2.getBuffer();
+
+	const ptrdiff_t sizeDiff =
+			static_cast<ptrdiff_t>(buf1.second) -
+			static_cast<ptrdiff_t>(buf2.second);
+
+	const ptrdiff_t rest =
+			static_cast<ptrdiff_t>(sizeDiff <= 0 ? buf1.second : buf2.second);
+
+	return compareBuffer<PredType, int32_t>(
+			reinterpret_cast<const uint8_t*>(buf1.first),
+			reinterpret_cast<const uint8_t*>(buf2.first),
+			rest, sizeDiff, PredType());
+}
+
+bool SQLValues::ValueUtils::isUpperBoundaryAsLong(
+		const TupleValue &value, int64_t unit) {
+	const int32_t direction = getBoundaryDirectionAsLong(value, unit);
+	if (direction == 0) {
+		return isSmallestBoundaryUnitAsLong(value, unit);
+	}
+	return (direction < 0);
+}
+
+bool SQLValues::ValueUtils::isLowerBoundaryAsLong(
+		const TupleValue &value, int64_t unit) {
+	const int32_t direction = getBoundaryDirectionAsLong(value, unit);
+	return (direction == 0);
+}
+
+TupleColumnType SQLValues::ValueUtils::getBoundaryCategoryAsLong(
+		TupleColumnType type) {
+	const TypeUtils::TypeCategory typeCategory =
+			TypeUtils::getStaticTypeCategory(type);
+
+	if (type == TupleTypes::TYPE_TIMESTAMP ||
+			typeCategory == TypeUtils::TYPE_CATEGORY_LONG) {
+		return TupleTypes::TYPE_LONG;
+	}
+	else if (typeCategory == TypeUtils::TYPE_CATEGORY_TIMESTAMP) {
+		return TupleTypes::TYPE_NANO_TIMESTAMP;
+	}
+	else {
+		return TupleTypes::TYPE_NULL;
+	}
+}
+
+bool SQLValues::ValueUtils::isSmallestBoundaryUnitAsLong(
+		const TupleValue &value, int64_t unit) {
+	if (unit > 1) {
+		return false;
+	}
+
+	return (getBoundaryCategoryAsLong(value.getType()) ==
+			TupleTypes::TYPE_LONG);
+}
+
+int32_t SQLValues::ValueUtils::getBoundaryDirectionAsLong(
+		const TupleValue &value, int64_t unit) {
+	if (unit <= 0) {
+		assert(false);
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	}
+
+	const TupleColumnType type = value.getType();
+	const TupleColumnType boundaryCategory =
+			getBoundaryCategoryAsLong(type);
+
+	if (boundaryCategory == TupleTypes::TYPE_LONG) {
+		const int64_t baseValue = toLong(value);
+		if (baseValue >= 0) {
+			const int64_t mod = baseValue % unit;
+			if (mod == 0) {
+				return 0;
+			}
+			else if (mod == unit - 1) {
+				return -1;
+			}
+			return 1;
+		}
+		else {
+			const int64_t absValue =
+					(baseValue == std::numeric_limits<int64_t>::min() ?
+							-(baseValue + unit) :
+							-baseValue);
+			const int64_t mod = absValue % unit;
+			if (mod == 0) {
+				return 0;
+			}
+			else if (mod == 1) {
+				return -1;
+			}
+			return 1;
+		}
+	}
+	else if (boundaryCategory == TupleTypes::TYPE_NANO_TIMESTAMP) {
+		const int32_t base = getBoundaryDirectionAsLong(
+				TupleValue(toLong(value)), unit);
+		if (base > 0) {
+			return base;
+		}
+
+		uint32_t subUnit;
+		uint32_t subValue;
+		switch (type) {
+		case TupleTypes::TYPE_MICRO_TIMESTAMP:
+			subUnit = 1000;
+			subValue = DateTimeElements(
+					value.get<MicroTimestamp>()).getNanoSeconds() / 1000;
+			break;
+		case TupleTypes::TYPE_NANO_TIMESTAMP:
+			subUnit = 1000 * 1000;
+			subValue = DateTimeElements(
+					value.get<TupleNanoTimestamp>()).getNanoSeconds();
+			break;
+		default:
+			assert(false);
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+		}
+
+		if (base < 0 || (unit == 1 && subValue != 0)) {
+			return (subValue == subUnit - 1 ? -1 : 1);
+		}
+		else {
+			return (subValue == 0 ? 0 : 1);
+		}
+	}
+	else {
+		assert(false);
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	}
+}
+
 
 uint32_t SQLValues::ValueUtils::fnv1aHashInit() {
-	const uint32_t fnvOffsetBasis = 2166136261U;
+	const uint32_t fnvOffsetBasis =
+			ValueFnv1aHasher::Constants::FNV_OFFSET_BASIS;
 	return fnvOffsetBasis;
 }
 
@@ -1305,9 +3145,21 @@ uint32_t SQLValues::ValueUtils::fnv1aHashFloating(
 	return fnv1aHashBytes(base, &value, sizeof(value));
 }
 
+uint32_t SQLValues::ValueUtils::fnv1aHashPreciseTimestamp(
+		uint32_t base, const DateTimeElements &value) {
+	uint32_t hash = fnv1aHashIntegral(base, value.getUnixTimeMillis());
+
+	const uint32_t nanos = value.getNanoSeconds();
+	if (nanos != 0) {
+		hash = fnv1aHashBytes(hash, &nanos, sizeof(nanos));
+	}
+
+	return hash;
+}
+
 uint32_t SQLValues::ValueUtils::fnv1aHashBytes(
 		uint32_t base, const void *value, size_t size) {
-	const uint32_t fnvPrime = 16777619U;
+	const uint32_t fnvPrime = ValueFnv1aHasher::Constants::FNV_PRIME;
 
 	uint32_t hash = base;
 	for (size_t i = 0; i < size; i++) {
@@ -1337,18 +3189,25 @@ double SQLValues::ValueUtils::toDouble(const TupleValue &src) {
 	return src.get<double>();
 }
 
-int64_t SQLValues::ValueUtils::toTimestamp(
-		ValueContext &cxt, const TupleValue &src) {
-	if (src.getType() == TupleTypes::TYPE_STRING) {
+SQLValues::DateTimeElements SQLValues::ValueUtils::toTimestamp(
+		ValueContext &cxt, const TupleValue &src,
+		util::DateTime::FieldType precision) {
+	const TupleColumnType type = src.getType();
+
+	if (type == TupleTypes::TYPE_STRING) {
 		util::StackAllocator &alloc = cxt.getAllocator();
 		util::StackAllocator::Scope scope(alloc);
 
 		const TupleString::BufferInfo &strBuf = TupleString(src).getBuffer();
 		const bool zoneSpecified = false;
-		return parseTimestamp(strBuf, cxt.getTimeZone(), zoneSpecified, alloc);
+		return parseTimestamp(
+				strBuf, cxt.getTimeZone(), zoneSpecified, precision, alloc);
 	}
 
-	return checkTimestamp(toLong(src));
+	return checkTimestamp(TypeUtils::isTimestampFamily(type) ?
+			DateTimeElements(
+					promoteValue<TupleTypes::TYPE_NANO_TIMESTAMP>(src)) :
+			DateTimeElements(toLong(src)));
 }
 
 bool SQLValues::ValueUtils::toBool(const TupleValue &src) {
@@ -1492,11 +3351,23 @@ TupleString::BufferInfo SQLValues::ValueUtils::toNumericStringByBlob(
 }
 
 bool SQLValues::ValueUtils::findLong(const TupleValue &src, int64_t &dest) {
-	const int32_t type = src.getType();
+	const TupleColumnType type = src.getType();
 
-	if ((type & TupleTypes::TYPE_MASK_ARRAY_VAR) ||
-			(type & TupleTypes::TYPE_MASK_SUB) ==
-					(TupleTypes::TYPE_DOUBLE & TupleTypes::TYPE_MASK_SUB)) {
+	if ((type & TupleTypes::TYPE_MASK_ARRAY_VAR)) {
+		dest = int64_t();
+		return false;
+	}
+
+	switch (type & TupleTypes::TYPE_MASK_SUB) {
+	case TupleTypes::TYPE_LONG & TupleTypes::TYPE_MASK_SUB:
+		break;
+	case TupleTypes::TYPE_BOOL & TupleTypes::TYPE_MASK_SUB:
+		break;
+	default:
+		if (TypeUtils::isTimestampFamily(type)) {
+			dest = promoteValue<TupleTypes::TYPE_TIMESTAMP>(src);
+			return true;
+		}
 		dest = int64_t();
 		return false;
 	}
@@ -1547,8 +3418,12 @@ void SQLValues::ValueUtils::formatValue(
 		builder.appendAll(*toStringReader(value));
 		return;
 	}
-	else if (type == TupleTypes::TYPE_TIMESTAMP) {
-		formatTimestamp(builder, value.get<int64_t>(), cxt.getTimeZone());
+	else if (TypeUtils::isTimestampFamily(type)) {
+		formatTimestamp(
+				builder, DateTimeElements(
+						promoteValue<TupleTypes::TYPE_NANO_TIMESTAMP>(value)),
+						cxt.getTimeZone(),
+				TypeUtils::getTimePrecision(type));
 		return;
 	}
 	else if (type == TupleTypes::TYPE_BOOL) {
@@ -1590,13 +3465,19 @@ void SQLValues::ValueUtils::formatDouble(
 }
 
 void SQLValues::ValueUtils::formatTimestamp(
-		StringBuilder &builder, const util::DateTime &value,
-		const util::TimeZone &zone) {
+		StringBuilder &builder, const DateTimeElements &value,
+		const util::TimeZone &zone, util::DateTime::FieldType precision) {
+	const util::PreciseDateTime &tsValue =
+			value.toDateTime(Types::NanoTimestampTag());
+
 	util::DateTime::ZonedOption option;
 	applyDateTimeOption(option);
 	option.zone_ = zone;
 
-	value.writeTo(builder, option, TimeErrorHandler());
+	util::DateTime::Formatter formatter = tsValue.getFormatter(option);
+	formatter.setDefaultPrecision(precision);
+
+	formatter.writeTo(builder, TimeErrorHandler());
 }
 
 void SQLValues::ValueUtils::formatBool(StringBuilder &builder, bool value) {
@@ -1637,9 +3518,10 @@ bool SQLValues::ValueUtils::parseDouble(
 	return true;
 }
 
-int64_t SQLValues::ValueUtils::parseTimestamp(
+SQLValues::DateTimeElements SQLValues::ValueUtils::parseTimestamp(
 		const TupleString::BufferInfo &src, const util::TimeZone &zone,
-		bool zoneSpecified, util::StdAllocator<void, void> alloc) {
+		bool zoneSpecified, util::DateTime::FieldType precision,
+		util::StdAllocator<void, void> alloc) {
 	typedef util::BasicString<
 			char8_t, std::char_traits<char8_t>,
 			util::StdAllocator<char8_t, void> > String;
@@ -1647,14 +3529,15 @@ int64_t SQLValues::ValueUtils::parseTimestamp(
 	String str(src.first, src.second, alloc);
 
 	bool zoned = true;
-	const size_t size = str.size();
-	if (size <= 11 && str.find('-') != util::String::npos) {
-		str.append("T00:00:00");
-		zoned = false;
-	}
-	else if ((size == 12 || size == 8) && str.find(':') != util::String::npos) {
-		str.insert(0, "1970-01-01T");
-		zoned = false;
+	if (str.find('T') == util::String::npos) {
+		if (str.find(':') == util::String::npos) {
+			str.append("T00:00:00");
+			zoned = false;
+		}
+		else {
+			str.insert(0, "1970-01-01T");
+			zoned = false;
+		}
 	}
 
 	size_t zoneStrLen = 0;
@@ -1689,15 +3572,15 @@ int64_t SQLValues::ValueUtils::parseTimestamp(
 	util::DateTime::ZonedOption option;
 	applyDateTimeOption(option);
 
-	int64_t time;
+	util::PreciseDateTime dateTime;
 	util::TimeZone zoneByStr;
 	try {
 		const bool throwOnError = true;
 
 		{
-			util::DateTime dateTime;
-			dateTime.parse(str.c_str(), str.size(), throwOnError, option);
-			time = dateTime.getUnixTime();
+			util::DateTime::Parser parser = dateTime.getParser(option);
+			parser.setDefaultPrecision(precision);
+			parser(str.c_str(), str.size(), throwOnError);
 		}
 
 		if (zoneStrLen > 0) {
@@ -1723,7 +3606,7 @@ int64_t SQLValues::ValueUtils::parseTimestamp(
 				str << ", specifiedZone=" << zone << ")");
 	}
 
-	return time;
+	return DateTimeElements(dateTime);
 }
 
 bool SQLValues::ValueUtils::parseBool(
@@ -1755,14 +3638,6 @@ void SQLValues::ValueUtils::parseBlob(
 }
 
 
-TupleValue SQLValues::ValueUtils::toAnyByTimestamp(int64_t src) {
-	return TupleValue(&src, TupleTypes::TYPE_TIMESTAMP);
-}
-
-TupleValue SQLValues::ValueUtils::toAnyByBool(bool src) {
-	return TupleValue(src);
-}
-
 TupleValue SQLValues::ValueUtils::createEmptyValue(
 		ValueContext &cxt, TupleColumnType type) {
 	if (TypeUtils::isAny(type) || TypeUtils::isNullable(type)) {
@@ -1770,7 +3645,7 @@ TupleValue SQLValues::ValueUtils::createEmptyValue(
 	}
 
 	const TupleColumnType baseType = TypeUtils::toNonNullable(type);
-	if (TypeUtils::isFixed(baseType)) {
+	if (TypeUtils::isSomeFixed(baseType)) {
 		const int64_t emptyLong = 0;
 		return ValueConverter(baseType)(cxt, TupleValue(emptyLong));
 	}
@@ -1780,8 +3655,16 @@ TupleValue SQLValues::ValueUtils::createEmptyValue(
 		return builder.build(cxt);
 	}
 	else if (baseType == TupleTypes::TYPE_BLOB) {
-		LobBuilder builder(cxt.getVarContext(), TupleTypes::TYPE_BLOB, 0);
-		return builder.build();
+		VarContext &varCxt = cxt.getVarContext();
+		if (varCxt.getVarAllocator() == NULL) {
+			TupleValue::StackAllocLobBuilder builder(
+					varCxt, TupleTypes::TYPE_BLOB, 0);
+			return builder.build();
+		}
+		else {
+			LobBuilder builder(varCxt, TupleTypes::TYPE_BLOB, 0);
+			return builder.build();
+		}
 	}
 	else {
 		assert(false);
@@ -1800,50 +3683,11 @@ TupleString::BufferInfo SQLValues::ValueUtils::toStringBuffer(
 	return src.getBuffer();
 }
 
-SQLValues::StringReaderRef SQLValues::ValueUtils::toStringReader(
-		const char8_t *src) {
-	return util::SequenceUtils::toReader(src);
-}
-
-SQLValues::StringReaderRef SQLValues::ValueUtils::toStringReader(
-		const TupleString &src) {
-	const TupleString::BufferInfo &buf = src.getBuffer();
-	return util::SequenceUtils::toReader(buf.first, buf.first + buf.second);
-}
-
-SQLValues::StringReaderRef SQLValues::ValueUtils::toStringReader(
-		const TupleString::BufferInfo &src) {
-	return util::SequenceUtils::toReader(src.first, src.first + src.second);
-}
-
 SQLValues::LobReaderRef SQLValues::ValueUtils::toLobReader(
 		const TupleValue &src) {
 	return LobReaderRef(src);
 }
 
-SQLValues::StringBuilder& SQLValues::ValueUtils::initializeWriter(
-		ValueContext &cxt, util::LocalUniquePtr<StringBuilder> &writerPtr,
-		uint64_t initialCapacity) {
-	const size_t strCapacity = static_cast<size_t>(std::min<uint64_t>(
-			std::numeric_limits<size_t>::max(), initialCapacity));
-	writerPtr = UTIL_MAKE_LOCAL_UNIQUE(
-			writerPtr, StringBuilder, cxt, strCapacity);
-	return *writerPtr;
-}
-
-SQLValues::LobBuilder& SQLValues::ValueUtils::initializeWriter(
-		ValueContext &cxt, util::LocalUniquePtr<LobBuilder> &writerPtr,
-		uint64_t initialCapacity) {
-	writerPtr = UTIL_MAKE_LOCAL_UNIQUE(
-			writerPtr, LobBuilder, cxt.getVarContext(),
-			TupleTypes::TYPE_BLOB, toLobCapacity(initialCapacity));
-	return *writerPtr;
-}
-
-
-bool SQLValues::ValueUtils::isNull(const TupleValue &value) {
-	return TypeUtils::isNull(value.getType());
-}
 
 TupleColumnType SQLValues::ValueUtils::toColumnType(const TupleValue &value) {
 	const TupleColumnType type = value.getType();
@@ -1853,25 +3697,15 @@ TupleColumnType SQLValues::ValueUtils::toColumnType(const TupleValue &value) {
 	return type;
 }
 
-TupleColumnType SQLValues::ValueUtils::toCompType(
-		const TupleValue &v1, const TupleValue &v2) {
-	const bool anyAsNull = true;
-	const TupleColumnType anyType = TupleTypes::TYPE_ANY;
-	const TupleColumnType type = TypeUtils::findPromotionType(
-			(isNull(v1) ? anyType : v1.getType()),
-			(isNull(v2) ? anyType : v2.getType()),
-			anyAsNull);
-	return type;
-}
 
-
-int64_t SQLValues::ValueUtils::checkTimestamp(int64_t tsValue) {
+SQLValues::DateTimeElements SQLValues::ValueUtils::checkTimestamp(
+		const DateTimeElements &tsValue) {
 	util::DateTime::Option option;
 	applyDateTimeOption(option);
 
 	util::DateTime dateTime;
 	try {
-		dateTime.setUnixTime(tsValue, option);
+		dateTime.setUnixTime(tsValue.getUnixTimeMillis(), option);
 	}
 	catch (std::exception &e) {
 		GS_RETHROW_USER_ERROR_CODED(
@@ -1880,7 +3714,15 @@ int64_t SQLValues::ValueUtils::checkTimestamp(int64_t tsValue) {
 						e, "Unacceptable timestamp value specified"));
 	}
 
-	return dateTime.getUnixTime();
+	const uint32_t nanos = tsValue.getNanoSeconds();
+	if (nanos >= 1000 * 1000) {
+		GS_THROW_USER_ERROR(
+				GS_ERROR_SQL_PROC_VALUE_OVERFLOW,
+				"Unacceptable nano seconds of timestamp specified");
+	}
+
+	return DateTimeElements(
+			util::PreciseDateTime::ofNanoSeconds(dateTime, nanos));
 }
 
 void SQLValues::ValueUtils::applyDateTimeOption(
@@ -1904,6 +3746,8 @@ util::DateTime::FieldType SQLValues::ValueUtils::toTimestampField(
 	case util::DateTime::FIELD_MINUTE:
 	case util::DateTime::FIELD_SECOND:
 	case util::DateTime::FIELD_MILLISECOND:
+	case util::DateTime::FIELD_MICROSECOND:
+	case util::DateTime::FIELD_NANOSECOND:
 	case util::DateTime::FIELD_DAY_OF_WEEK:
 	case util::DateTime::FIELD_DAY_OF_YEAR:
 		break;
@@ -1934,8 +3778,12 @@ size_t SQLValues::ValueUtils::toLobCapacity(uint64_t size) {
 TupleValue SQLValues::ValueUtils::duplicateValue(
 		ValueContext &cxt, const TupleValue &src) {
 	const TupleColumnType type = src.getType();
-	if (TypeUtils::isFixed(type)) {
+	if (TypeUtils::isNormalFixed(type)) {
 		return src;
+	}
+	else if (type == TupleTypes::TYPE_NANO_TIMESTAMP) {
+		return createNanoTimestampValue(
+				cxt, getValue<TupleNanoTimestamp>(src));
 	}
 	else if (type == TupleTypes::TYPE_STRING) {
 		const TupleString::BufferInfo &info = TupleString(src).getBuffer();
@@ -1996,13 +3844,94 @@ void SQLValues::ValueUtils::moveValueToRoot(
 	assert(currentDepth == cxt.getVarContextDepth());
 	assert(currentDepth > targetDepth);
 
-	if (!TypeUtils::isFixed(value.getType())) {
+	if (!TypeUtils::isNormalFixed(value.getType())) {
 		if (currentDepth <= 0) {
 			errorVarContextDepth();
 		}
 		VarContext &varCxt = cxt.getVarContext();
 		varCxt.moveValueToParent(currentDepth - targetDepth, value);
 	}
+}
+
+size_t SQLValues::ValueUtils::estimateTupleSize(
+		const TupleColumnList &list) {
+	size_t size = 0;
+	bool nullable = false;
+
+	for (TupleColumnList::const_iterator it = list.begin();
+			it != list.end(); ++it) {
+		TupleColumnType type = it->getType();
+		assert(!TypeUtils::isNull(type));
+
+		size += TypeUtils::getFixedSize(type);
+		nullable |= TypeUtils::isNullable(type);
+
+		if (!TypeUtils::isAny(type) && !TypeUtils::isSomeFixed(type)) {
+			size += 1;
+		}
+	}
+
+	if (nullable) {
+		size += TupleValueUtils::calcNullsByteSize(
+				static_cast<uint32_t>(list.size()));
+	}
+
+	return size;
+}
+
+uint64_t SQLValues::ValueUtils::getApproxPrimeNumber(uint64_t base) {
+	uint64_t num = base;
+	for (;; num++) {
+		if (num % 2 != 0 && num % 3 != 0 && num % 5 != 0) {
+			break;
+		}
+		assert(num < std::numeric_limits<uint64_t>::max());
+	}
+	return num;
+}
+
+uint64_t SQLValues::ValueUtils::findLargestPrimeNumber(uint64_t base) {
+	const uint32_t *list = Constants::LARGEST_PRIME_OF_BITS;
+	const uint32_t *listEnd = list + Constants::LARGEST_PRIME_OF_BITS_COUNT;
+
+	const uint32_t *it = (base <= std::numeric_limits<uint32_t>::max() ?
+			std::lower_bound(list, listEnd, static_cast<uint32_t>(base)) :
+			listEnd);
+	if (it == list || it == listEnd) {
+		return base;
+	}
+	else if (*it > base) {
+		return *(it - 1);
+	}
+
+	return *it;
+}
+
+
+TupleValue SQLValues::ValueUtils::readCurrentAny(
+		TupleListReader &reader, const TupleColumn &column) {
+	return reader.get().get(column);
+}
+
+TupleValue SQLValues::ValueUtils::readAny(
+		const ReadableTuple &tuple, const TupleColumn &column) {
+	return tuple.get(column);
+}
+
+void SQLValues::ValueUtils::writeAny(
+		WritableTuple &tuple, const TupleColumn &column,
+		const TupleValue &value) {
+	tuple.set(column, value);
+}
+
+void SQLValues::ValueUtils::writeNull(
+		WritableTuple &tuple, const TupleColumn &column) {
+	tuple.set(column, TupleValue());
+}
+
+void SQLValues::ValueUtils::updateKeepInfo(TupleListReader &reader) {
+	assert(reader.exists());
+	static_cast<void>(TupleList::ReadableTuple(reader));
 }
 
 
@@ -2088,6 +4017,20 @@ SQLValues::ValueUtils::Constants::TIMESTAMP_MAX_FIELDS =
 const int64_t SQLValues::ValueUtils::Constants::TIMESTAMP_MAX_UNIX_TIME =
 		resolveTimestampMaxUnixTime();
 
+const uint32_t SQLValues::ValueUtils::Constants::LARGEST_PRIME_OF_BITS[] = {
+	2, 3, 7, 13,
+	31, 61, 127, 251,
+	509, 1021, 2039, 4093,
+	8191, 16381, 32749, 65521,
+	131071, 262139, 524287, 1048573,
+	2097143, 4194301, 8388593, 16777213,
+	33554393, 67108859, 134217689, 268435399,
+	536870909, 1073741789, 2147483647, 4294967291
+};
+
+const size_t SQLValues::ValueUtils::Constants::LARGEST_PRIME_OF_BITS_COUNT =
+		sizeof(LARGEST_PRIME_OF_BITS) / sizeof(*LARGEST_PRIME_OF_BITS);
+
 
 void SQLValues::ValueUtils::TimeErrorHandler::errorTimeFormat(
 		std::exception &e) const {
@@ -2098,124 +4041,13 @@ void SQLValues::ValueUtils::TimeErrorHandler::errorTimeFormat(
 }
 
 
-SQLValues::ReadableTupleRef::ReadableTupleRef(TupleListReader &reader) :
-		reader_(&reader) {
-}
-
-
-SQLValues::TupleListReader& SQLValues::ReadableTupleRef::getReader() const {
-	return *reader_;
-}
-
-
-SQLValues::ReadableTupleRef::operator SQLValues::ReadableTuple() const {
-	return reader_->get();
-}
-
-
-SQLValues::ArrayTupleRef::ArrayTupleRef(ArrayTuple &tuple) :
-		tuple_(&tuple) {
-}
-
-SQLValues::ArrayTuple& SQLValues::ArrayTupleRef::getTuple() const {
-	return *tuple_;
-}
-
-
-SQLValues::ArrayTupleRef::operator SQLValues::ArrayTuple&() const {
-	return *tuple_;
-}
-
-
-SQLValues::SharedId::SharedId() :
-		index_(0),
-		id_(0),
-		manager_(NULL) {
-}
-
-SQLValues::SharedId::SharedId(const SharedId &another) :
-		index_(0),
-		id_(0),
-		manager_(NULL) {
-	*this = another;
-}
-
-SQLValues::SharedId& SQLValues::SharedId::operator=(const SharedId &another) {
-	assign(another.manager_, another.index_, another.id_);
-	return *this;
-}
-
-SQLValues::SharedId::~SharedId() {
-	try {
-		clear();
-	}
-	catch (...) {
-		assert(false);
-	}
-}
-
 void SQLValues::SharedId::assign(SharedIdManager &manager) {
 	assign(&manager, 0, 0);
 }
 
-void SQLValues::SharedId::clear() {
-	SharedIdManager *orgManager = manager_;
-	if (orgManager == NULL) {
-		return;
-	}
-
-	const size_t orgIndex = index_;
-	const uint64_t orgId = id_;
-
-	index_ = 0;
-	id_ = 0;
-	manager_ = NULL;
-
-	orgManager->release(orgIndex, orgId, this);
-}
-
-bool SQLValues::SharedId::isEmpty() const {
-	return (manager_ == NULL);
-}
-
-bool SQLValues::SharedId::operator==(const SharedId &another) const {
-	if (manager_ != another.manager_) {
-		assert(false);
-		return false;
-	}
-	return (index_ == another.index_);
-}
-
-bool SQLValues::SharedId::operator<(const SharedId &another) const {
-	if (manager_ != another.manager_) {
-		assert(false);
-		return false;
-	}
-	return (index_ < another.index_);
-}
-
-size_t SQLValues::SharedId::getIndex(const SharedIdManager &manager) const {
-	if (manager_ != &manager) {
-		assert(false);
-		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
-	}
-	return index_;
-}
-
-void SQLValues::SharedId::assign(
-		SharedIdManager *manager, size_t orgIndex, uint64_t orgId) {
-	clear();
-
-	if (manager == NULL) {
-		return;
-	}
-
-	const size_t nextIndex = manager->allocate(orgIndex, orgId, this);
-	const uint64_t nextId = manager->getId(nextIndex);
-
-	index_ = nextIndex;
-	id_ = nextId;
-	manager_ = manager;
+size_t SQLValues::SharedId::errorIndex() {
+	assert(false);
+	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
 }
 
 
@@ -2235,86 +4067,52 @@ SQLValues::SharedIdManager::~SharedIdManager() {
 	}
 }
 
-size_t SQLValues::SharedIdManager::allocate(
-		size_t orgIndex, uint64_t orgId, void *key) {
+
+SQLValues::SharedIdManager::Entry& SQLValues::SharedIdManager::createEntry(
+		size_t *nextIndex) {
+	const uint64_t orgId = 0;
 	size_t index;
 	Entry *entry;
-	if (orgId == 0) {
-		if (freeList_.empty()) {
-			index = entryList_.size();
-			freeList_.reserve(entryList_.capacity());
-			entryList_.push_back(Entry());
-			entry = &getEntry(index, orgId);
-		}
-		else {
-			index = static_cast<size_t>(freeList_.back());
-			entry = &getEntry(index, orgId);
-			if (entry->id_ != 0 || entry->refCount_ != 0) {
-				assert(false);
-				GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
-			}
-			freeList_.pop_back();
-		}
-		do {
-			entry->id_ = ++lastId_;
-		}
-		while (entry->id_ == 0);
-	}
-	else {
-		index = orgIndex;
+	if (freeList_.empty()) {
+		index = entryList_.size();
+		freeList_.reserve(entryList_.capacity());
+		entryList_.push_back(Entry());
 		entry = &getEntry(index, orgId);
 	}
-
-	checkKey(true, entry->id_, key);
-	++entry->refCount_;
-	return index;
-}
-
-void SQLValues::SharedIdManager::release(size_t index, uint64_t id, void *key) {
-	Entry &entry = getEntry(index, id);
-	if (entry.refCount_ <= 0) {
-		assert(false);
-		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	else {
+		index = static_cast<size_t>(freeList_.back());
+		entry = &getEntry(index, orgId);
+		if (entry->id_ != 0 || entry->refCount_ != 0) {
+			assert(false);
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+		}
+		freeList_.pop_back();
 	}
-	--entry.refCount_;
-	checkKey(false, id, key);
-
-	if (entry.refCount_ <= 0) {
-		entry.id_ = 0;
-		freeList_.push_back(index);
+	do {
+		entry->id_ = ++lastId_;
 	}
+	while (entry->id_ == 0);
+
+	*nextIndex = index;
+	return *entry;
 }
 
-void SQLValues::SharedIdManager::checkKey(
-		bool allocating, uint64_t id, void *key) {
-	static_cast<void>(allocating);
-	static_cast<void>(id);
-	static_cast<void>(key);
+void SQLValues::SharedIdManager::removeEntry(Entry &entry, size_t index) {
+	assert(entry.refCount_ <= 0);
+	assert(&entry == &entryList_[index]);
+
+	entry.id_ = 0;
+	freeList_.push_back(index);
 }
 
-uint64_t SQLValues::SharedIdManager::getId(size_t index) {
-	return getEntry(index, 0).id_;
+void SQLValues::SharedIdManager::errorRefCount() {
+	assert(false);
+	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
 }
 
-SQLValues::SharedIdManager::Entry& SQLValues::SharedIdManager::getEntry(
-		size_t index, uint64_t id) {
-	if (index >= entryList_.size()) {
-		assert(false);
-		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
-	}
-	Entry &entry = entryList_[index];
-
-	if (id != 0 && entry.id_ != id) {
-		assert(false);
-		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
-	}
-
-	return entry;
-}
-
-SQLValues::SharedIdManager::Entry::Entry() :
-		id_(0),
-		refCount_(0) {
+SQLValues::SharedIdManager::Entry& SQLValues::SharedIdManager::errorEntry() {
+	assert(false);
+	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
 }
 
 
@@ -2340,4 +4138,11 @@ void SQLValues::LatchHolder::close() throw() {
 	if (target != NULL) {
 		target->close();
 	}
+}
+
+
+SQLValues::BaseLatchTarget::~BaseLatchTarget() {
+}
+
+SQLValues::BaseLatchTarget::BaseLatchTarget() {
 }

@@ -186,10 +186,12 @@ struct FileLib {
 
 #ifdef _WIN32
 	static int64_t getUnixTime(const FILETIME &fileTime);
-	static FILETIME getFileTime(SYSTEMTIME &systemTime, bool asLocalTimeZone);
+	static FILETIME getFileTime(
+			SYSTEMTIME &systemTime, bool asLocalTimeZone, bool dstIgnored);
 	static FILETIME getFileTime(int64_t unixTime);
 	static SYSTEMTIME getSystemTime(
-			const FILETIME &fileTime, bool asLocalTimeZone);
+			const FILETIME &fileTime, bool asLocalTimeZone, bool dstIgnored);
+	static TIME_ZONE_INFORMATION getTimeZoneInformation(bool dstIgnored);
 #else
 	static int64_t getUnixTime(
 			tm &time, int32_t milliSecond, bool asLocalTimeZone);
@@ -290,6 +292,47 @@ struct FileLib {
 	}
 #endif 
 };
+
+class Mutex;
+namespace detail {
+struct DirectMemoryUtils {
+	static void* mallocDirect(size_t size) UTIL_NOEXCEPT;
+	static void freeDirect(void *ptr) UTIL_NOEXCEPT;
+};
+
+class DirectMutex {
+public:
+	DirectMutex() throw();
+	~DirectMutex();
+
+	void lock() throw();
+	void unlock() throw();
+
+private:
+	struct Binder;
+
+	struct LocalData {
+#ifdef UTIL_HAVE_POSIX_MUTEX
+		pthread_mutex_t mutex_;
+#else
+		CRITICAL_SECTION cs_;
+#endif
+	};
+
+	void* data() throw();
+
+	LocalData data_;
+};
+
+class DirectMutex::Binder {
+public:
+	Binder(DirectMutex &src, Mutex &target) throw();
+	~Binder();
+
+private:
+	Mutex &target_;
+};
+} 
 
 } 
 

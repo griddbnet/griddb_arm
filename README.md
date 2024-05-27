@@ -1,7 +1,7 @@
 <img src="https://griddb.org/brand-resources/griddb-logo/png/color.png" align="center" height="240" alt="GridDB"/>
 
-[![Visit Website](https://img.shields.io/badge/website-visit-orange.svg)](https://griddb.net) 
-![GitHub All Releases](https://img.shields.io/github/downloads/griddb/griddb_nosql/total.svg) 
+[![Visit Website](https://img.shields.io/badge/website-visit-orange.svg)](https://griddb.net)
+![GitHub All Releases](https://img.shields.io/github/downloads/griddb/griddb_nosql/total.svg)
 ![GitHub release](https://img.shields.io/github/release/griddb/griddb_nosql.svg)
 ## Overview
   GridDB is Database for IoT with both NoSQL interface and SQL Interface.
@@ -11,15 +11,18 @@
   This repository includes server and Java client. And [jdbc repository](https://github.com/griddb/jdbc) includes JDBC Driver.
 
 ## Quick start (Using source code)
-  We have confirmed the operation on CentOS 7.6 (gcc 4.8.5), Ubuntu 18.04 (gcc 4.8.5) and openSUSE Leap 15.1 (gcc 4.8.5).
+  We have confirmed the operation with Linux(x64).
+  - CentOS 7.9 (gcc 4.8.5)
 
-  Note: Please install tcl like "yum install tcl.x86_64" in advance.
+Note:
+- Please install Python3 in advance.
+- Please install tcl like "yum install tcl.x86_64" in advance.
 
 ### Build a server and client(Java)
     $ ./bootstrap.sh
     $ ./configure
-    $ make 
-    
+    $ make
+
   Note: When you use maven build for Java client, please run the following command. Then gridstore-X.X.X.jar file is created on target/.  
 
     $ cd java_client
@@ -52,16 +55,20 @@
     $ bin/gs_stopcluster -u admin/your_password
     $ bin/gs_stopnode -u admin/your_password
 
+## [Quick start (Using GridDB Service and CLI)](docs/UsingServiceAndCLI.md)
+
 ## Quick start (Using RPM or DEB)
 
-  We have confirmed the operation on CentOS 7.6, Ubuntu 18.04 and openSUSE Leap 15.1.
+  We have confirmed the operation with Linux(x64).
+  - CentOS 7.9, Ubuntu 22.04
 
 Note:
+- Please install Python3 in advance.
 - When you install this package, a gsadm OS user are created in the OS.  
   Execute the operating command as the gsadm user.  
 - You don't need to set environment vatiable GS_HOME and GS_LOG.
 - There is Java client library (gridstore.jar) on /usr/share/java and a sample on /usr/gridb-XXX/docs/sample/programs.
-- The packages for Ubuntu and openSUSE don't include trigger function.
+- If old version has been installed, please uninstall and remove conf/ and data/ on /var/lib/gridstore.
 
 ### Install
 
@@ -71,12 +78,13 @@ Note:
     (Ubuntu)
     $ sudo dpkg -i griddb_X.X.X_amd64.deb
 
-    (openSUSE)
-    $ sudo rpm -ivh griddb-X.X.X-opensuse.x86_64.rpm
-
     Note: X.X.X is the GridDB version.
 
 ### Start a server
+    [gsadm]$ cp /usr/griddb-X.X.X/conf_multicast/* conf/.
+
+    Note: Default is only for local connection. So, please change the configure files.
+
     [gsadm]$ gs_passwd admin
       #input your_password
     [gsadm]$ vi conf/gs_cluster.json
@@ -96,6 +104,7 @@ Note:
     [gsadm]$ gs_stopcluster -u admin/your_password
     [gsadm]$ gs_stopnode -u admin/your_password
 
+If necessary, please refer to [Installation Troubleshooting](docs/TroubleShootingTips.md).
 
 ## Document
   Refer to the file below for more detailed information.  
@@ -112,40 +121,59 @@ Note:
   - [V4.2 Release Notes](docs/GridDB-4.2-CE-RELEASE_NOTES.md)
   - [V4.3 Release Notes](docs/GridDB-4.3-CE-RELEASE_NOTES.md)
   - [V4.5 Release Notes](docs/GridDB-4.5-CE-RELEASE_NOTES.md)
+  - [V4.6 Release Notes](docs/GridDB-4.6-CE-RELEASE_NOTES.md)
+  - [V5.0 Release Notes](docs/GridDB-5.0-CE-RELEASE_NOTES.md)
+  - [V5.1 Release Notes](docs/GridDB-5.1-CE-RELEASE_NOTES.md)
+  - [V5.3 Release Notes](docs/GridDB-5.3-CE-RELEASE_NOTES.md)
+  - [V5.5 Release Notes](docs/GridDB-5.5-CE-RELEASE_NOTES.md)
 
 ## Client and Connector
   There are other clients and API for GridDB.
+  
+  (NoSQL Interface)
   * [GridDB C Client](https://github.com/griddb/c_client)
   * [GridDB Python Client](https://github.com/griddb/python_client)
   * [GridDB Ruby Client](https://github.com/griddb/ruby_client)
   * [GridDB Go Client](https://github.com/griddb/go_client)
-  * [GridDB Node.JS Client](https://github.com/griddb/nodejs_client)
+  * [GridDB Node.JS Client (SWIG based)](https://github.com/griddb/nodejs_client)
+  * [GridDB Node API (node-addon-api based)](https://github.com/griddb/node-api)
   * [GridDB PHP Client](https://github.com/griddb/php_client)
   * [GridDB Perl Client](https://github.com/griddb/perl_client)
-  * [GridDB WebAPI](https://github.com/griddb/webapi)
+  * [GridDB Rust Client](https://github.com/griddb/rust_client)
+    
+  (SQL Interface)
   * [GridDB JDBC Driver](https://github.com/griddb/jdbc)
   
+  (NoSQL & SQL Interface)
+  * [GridDB WebAPI](https://github.com/griddb/webapi)
+  * [GridDB CLI](https://github.com/griddb/cli)
+  
+  (Others)
+  * [GridDB Export/Import](https://github.com/griddb/expimp)
+
   There are some connectors for other OSS.
   * [GridDB connector for Apache Hadoop MapReduce](https://github.com/griddb/griddb_hadoop_mapreduce)
   * [GridDB connector for YCSB (https://github.com/brianfrankcooper/YCSB/tree/master/griddb)](https://github.com/brianfrankcooper/YCSB/tree/master/griddb)
   * [GridDB connector for KairosDB](https://github.com/griddb/griddb_kairosdb)
   * [GridDB connector for Apache Spark](https://github.com/griddb/griddb_spark)
   * [GridDB Foreign Data Wrapper for PostgreSQL (https://github.com/pgspider/griddb_fdw)](https://github.com/pgspider/griddb_fdw)
-  * [GridDB Sample Application for Apache Kafka](https://github.com/griddb/griddb_kafka_sample_app)
   * [GridDB Data Source for Grafana](https://github.com/griddb/griddb-datasource)
   * [GridDB Plugin for Redash](https://github.com/griddb/griddb-redash)
   * [GridDB Plugin for Fluentd](https://github.com/griddb/fluent-plugin-griddb)
+  * [GridDB Plugin for Tableau](https://github.com/griddb/tableau-plugin-griddb)
+  * [GridDB connector for Apache Kafka](https://github.com/griddb/griddb-kafka-connect)
+
+## [Packages](docs/Packages.md)
 
 ## Community
   * Issues  
-    Use the GitHub issue function if you have any requests, questions, or bug reports. 
+    Use the GitHub issue function if you have any requests, questions, or bug reports.
   * PullRequest  
     Use the GitHub pull request function if you want to contribute code.
     You'll need to agree GridDB Contributor License Agreement(CLA_rev1.1.pdf).
     By using the GitHub pull request function, you shall be deemed to have agreed to GridDB Contributor License Agreement.
 
 ## License
-  The server source license is GNU Affero General Public License (AGPL), 
+  The server source license is GNU Affero General Public License (AGPL),
   while the Java client library license and the operational commands is Apache License, version 2.0.
   See 3rd_party/3rd_party.md for the source and license of the third party.
-

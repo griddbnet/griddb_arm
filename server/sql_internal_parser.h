@@ -76,13 +76,36 @@ typedef SyntaxTree::Select Select;
 typedef SyntaxTree::QualifiedName QualifiedName;
 
 struct LikeOp {
-	SQLToken operator_;		
-	bool existNot_;			
+	SQLToken operator_;		/* "like"または"glob"または"regexp" */
+	bool existNot_;			/* NOTがあればtrue */
 };
 
 struct IntervalOption {
 	int64_t value_;			
 	int64_t unit_;			
+};
+
+struct IntervalOptionDetail {
+	int64_t offset_;
+	int64_t timeZone_;
+	bool withTimeZone_;
+};
+
+struct GroupIntervalOption {
+	IntervalOption base_;
+	IntervalOptionDetail detail_;
+};
+
+struct DateTimeField {
+	static DateTimeField of(util::DateTime::FieldType unit, const SQLToken &token) {
+		DateTimeField field;
+		field.unit_ = unit;
+		field.token_ = token;
+		return field;
+	}
+
+	util::DateTime::FieldType unit_;
+	SQLToken token_;
 };
 
 #include <iostream>
@@ -136,32 +159,38 @@ struct IntervalOption {
  **                       defined, then do no error processing.
  */
 #define SQLParser_YYCODETYPE unsigned short int
-#define SQLParser_YYNOCODE 264
+#define SQLParser_YYNOCODE 280
 #define SQLParser_YYACTIONTYPE unsigned short int
-#define SQLParser_YYWILDCARD 102
+#define SQLParser_YYWILDCARD 110
 #define SQLParserTOKENTYPE SQLToken
 typedef union {
   int yyinit;
   SQLParserTOKENTYPE yy0;
-  SyntaxTree::TableColumn* yy12;
-  SyntaxTree::TableColumnList* yy18;
-  Expr* yy60;
-  SyntaxTree::SetOp yy69;
-  uint8_t yy78;
-  SyntaxTree::WindowOption* yy115;
-  SyntaxTree::Set* yy158;
-  SyntaxTree::AggrOpt yy168;
-  SQLType::JoinType yy173;
-  SyntaxTree::ColumnInfo* yy232;
-  ExprList* yy294;
-  QualifiedName* yy295;
-  SyntaxTree::CreateIndexOption * yy329;
-  bool yy371;
-  int32_t yy428;
-  SyntaxTree::PartitioningOption* yy437;
-  struct LikeOp yy472;
-  SyntaxTree::Select* yy474;
-  struct IntervalOption yy482;
+  SyntaxTree::Set* yy72;
+  QualifiedName* yy82;
+  DateTimeField yy122;
+  SyntaxTree::WindowOption* yy139;
+  SyntaxTree::SetOp yy187;
+  bool yy209;
+  SyntaxTree::PartitioningOption* yy231;
+  SyntaxTree::TableColumn* yy252;
+  int32_t yy262;
+  SQLType::Id yy284;
+  ExprList* yy304;
+  struct GroupIntervalOption yy319;
+  struct IntervalOption yy336;
+  TupleList::TupleColumnType yy359;
+  SyntaxTree::Select* yy378;
+  struct LikeOp yy396;
+  SyntaxTree::ColumnInfo* yy400;
+  uint8_t yy401;
+  SyntaxTree::CreateIndexOption * yy437;
+  struct IntervalOptionDetail yy471;
+  SyntaxTree::TableColumnList* yy480;
+  Expr* yy512;
+  int64_t yy531;
+  SQLType::JoinType yy533;
+  SyntaxTree::AggrOpt yy536;
 } SQLParser_YYMINORTYPE;
 #ifndef SQLParser_YYSTACKDEPTH
 #define SQLParser_YYSTACKDEPTH 2000
@@ -169,8 +198,8 @@ typedef union {
 #define SQLParserARG_SDECL SQLParserContext* parser
 #define SQLParserARG_PDECL ,SQLParserContext* parser
 #define SQLParserARG_STORE this->parser = parser
-#define SQLParser_YYNSTATE 610
-#define SQLParser_YYNRULE 276
+#define SQLParser_YYNSTATE 670
+#define SQLParser_YYNRULE 308
 #define SQLParser_YYFALLBACK 1
 #define SQLParser_YY_NO_ACTION      (SQLParser_YYNSTATE+SQLParser_YYNRULE+2)
 #define SQLParser_YY_ACCEPT_ACTION  (SQLParser_YYNSTATE+SQLParser_YYNRULE+1)
@@ -252,16 +281,16 @@ namespace lemon_SQLParser {
 		 **  yy_default[]       Default action for each state.
 		 */
 
-#define SQLParser_YY_ACTTAB_COUNT (1350)
-#define SQLParser_YY_SHIFT_USE_DFLT (-141)
-#define SQLParser_YY_SHIFT_COUNT (442)
-#define SQLParser_YY_SHIFT_MIN   (-140)
-#define SQLParser_YY_SHIFT_MAX   (1266)
-#define SQLParser_YY_REDUCE_USE_DFLT (-179)
-#define SQLParser_YY_REDUCE_COUNT (288)
-#define SQLParser_YY_REDUCE_MIN   (-178)
-#define SQLParser_YY_REDUCE_MAX   (1113)
-#define SQLParser_YYNFALLBACK  (102)
+#define SQLParser_YY_ACTTAB_COUNT (1471)
+#define SQLParser_YY_SHIFT_USE_DFLT (-142)
+#define SQLParser_YY_SHIFT_COUNT (473)
+#define SQLParser_YY_SHIFT_MIN   (-141)
+#define SQLParser_YY_SHIFT_MAX   (1375)
+#define SQLParser_YY_REDUCE_USE_DFLT (-230)
+#define SQLParser_YY_REDUCE_COUNT (300)
+#define SQLParser_YY_REDUCE_MIN   (-229)
+#define SQLParser_YY_REDUCE_MAX   (1212)
+#define SQLParser_YYNFALLBACK  (110)
 
 		static const SQLParser_YYACTIONTYPE yy_action[SQLParser_YY_ACTTAB_COUNT];
 		static const SQLParser_YYCODETYPE yy_lookahead[SQLParser_YY_ACTTAB_COUNT];
@@ -439,97 +468,98 @@ namespace lemon_SQLParser {
 				 ** which appear on the RHS of the rule, but which are not used
 				 ** inside the C code.
 				 */
-    case 188: /* columnlist */
-    case 220: /* addcolumnlist */
+    case 198: /* columnlist */
+    case 232: /* addcolumnlist */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy18));
+SQLPARSER_SAFE_DELETE((yypminor->yy480));
 }
       break;
-    case 189: /* conslist_opt */
-    case 191: /* createtable_opt */
-    case 200: /* createtable_optlist */
-    case 206: /* conslist */
-    case 208: /* idxlist */
-    case 217: /* exprlist */
-    case 218: /* idxlist_opt */
-    case 222: /* hint_opt */
-    case 227: /* selcollist */
-    case 232: /* orderby_opt */
-    case 235: /* nexprlist */
-    case 236: /* hintlist */
-    case 237: /* hintlist1 */
-    case 239: /* hintexprlist */
-    case 240: /* hintexprlist1 */
-    case 243: /* sclp */
-    case 249: /* using_opt */
-    case 250: /* idlist */
-    case 251: /* sortlist */
-    case 252: /* setlist */
-    case 254: /* inscollist_opt */
-    case 256: /* partitionby_opt */
-    case 261: /* case_exprlist */
+    case 199: /* conslist_opt */
+    case 201: /* createtable_opt */
+    case 212: /* createtable_optlist */
+    case 218: /* conslist */
+    case 220: /* idxlist */
+    case 229: /* exprlist */
+    case 230: /* idxlist_opt */
+    case 235: /* hint_opt */
+    case 240: /* selcollist */
+    case 245: /* orderby_opt */
+    case 248: /* nexprlist */
+    case 249: /* hintlist */
+    case 250: /* hintlist1 */
+    case 252: /* hintexprlist */
+    case 253: /* hintexprlist1 */
+    case 256: /* sclp */
+    case 262: /* using_opt */
+    case 263: /* idlist */
+    case 264: /* sortlist */
+    case 267: /* setlist */
+    case 269: /* inscollist_opt */
+    case 272: /* partitionby_opt */
+    case 277: /* case_exprlist */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy294));
+SQLPARSER_SAFE_DELETE((yypminor->yy304));
 }
       break;
-    case 192: /* partitioning_options */
+    case 202: /* partitioning_options */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy437));
+SQLPARSER_SAFE_DELETE((yypminor->yy231));
 }
       break;
-    case 193: /* column */
-    case 221: /* addcolumn */
+    case 203: /* column */
+    case 233: /* renamecolumn */
+    case 234: /* addcolumn */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy12));
+SQLPARSER_SAFE_DELETE((yypminor->yy252));
 }
       break;
-    case 195: /* carglist */
+    case 205: /* carglist */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy232));
+SQLPARSER_SAFE_DELETE((yypminor->yy400));
 }
       break;
-    case 196: /* expr */
-    case 207: /* tcons */
-    case 228: /* from */
-    case 229: /* where_opt */
-    case 231: /* having_opt */
-    case 238: /* onehint */
-    case 241: /* hintexpr */
-    case 242: /* term */
-    case 245: /* seltabtree */
-    case 246: /* stl_prefix */
-    case 248: /* on_opt */
-    case 260: /* case_operand */
-    case 262: /* case_else */
+    case 206: /* expr */
+    case 219: /* tcons */
+    case 241: /* from */
+    case 242: /* where_opt */
+    case 244: /* having_opt */
+    case 251: /* onehint */
+    case 254: /* hintexpr */
+    case 255: /* term */
+    case 258: /* seltabtree */
+    case 259: /* stl_prefix */
+    case 261: /* on_opt */
+    case 276: /* case_operand */
+    case 278: /* case_else */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy60));
+SQLPARSER_SAFE_DELETE((yypminor->yy512));
 }
       break;
-    case 212: /* fullname */
+    case 224: /* fullname */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy295));
+SQLPARSER_SAFE_DELETE((yypminor->yy82));
 }
       break;
-    case 215: /* select */
-    case 223: /* selectnowith */
-    case 234: /* valuelist */
+    case 227: /* select */
+    case 236: /* selectnowith */
+    case 247: /* valuelist */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy158));
+SQLPARSER_SAFE_DELETE((yypminor->yy72));
 }
       break;
-    case 224: /* oneselect */
+    case 237: /* oneselect */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy474));
+SQLPARSER_SAFE_DELETE((yypminor->yy378));
 }
       break;
-    case 230: /* groupby_opt */
+    case 243: /* groupby_opt */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy294));SQLPARSER_SAFE_DELETE((yypminor->yy294));
+SQLPARSER_SAFE_DELETE((yypminor->yy304));SQLPARSER_SAFE_DELETE((yypminor->yy304));
 }
       break;
-    case 255: /* window_opt */
+    case 271: /* window_opt */
 {
-SQLPARSER_SAFE_DELETE((yypminor->yy115));
+SQLPARSER_SAFE_DELETE((yypminor->yy139));
 }
       break;
 			default:  break;   /* If no destructor action specified: do nothing */
@@ -859,139 +889,138 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 	select->targetName_ = qName;
 
-	select->cmdOptionValue_ = yymsp[-9].minor.yy428;
+	select->cmdOptionValue_ = yymsp[-9].minor.yy262;
 
-	if (yymsp[-4].minor.yy294) {
-		SyntaxTree::checkTableConstraint(parser->getSQLAllocator(), yymsp[-5].minor.yy18, yymsp[-4].minor.yy294);
+	if (yymsp[-4].minor.yy304) {
+		SyntaxTree::checkTableConstraint(parser->getSQLAllocator(), yymsp[-5].minor.yy480, yymsp[-4].minor.yy304);
 	}
 	select->createTableOpt_ =
 		SyntaxTree::makeCreateTableOption(
-				parser->getSQLAllocator(), yymsp[-5].minor.yy18, yymsp[-4].minor.yy294, yymsp[0].minor.yy437, yymsp[-1].minor.yy294, yymsp[-9].minor.yy428, NULL, false, yymsp[-2].minor.yy371);
+				parser->getSQLAllocator(), yymsp[-5].minor.yy480, yymsp[-4].minor.yy304, yymsp[0].minor.yy231, yymsp[-1].minor.yy304, yymsp[-9].minor.yy262, NULL, false, yymsp[-2].minor.yy209);
 
 	parser->setTopSelect(select);
 }
         break;
       case 18: /* ifnotexists ::= */
-      case 67: /* ifexists ::= */ yytestcase(yyruleno==67);
-      case 70: /* force ::= */ yytestcase(yyruleno==70);
-      case 256: /* between_op ::= BETWEEN */ yytestcase(yyruleno==256);
-      case 259: /* in_op ::= IN */ yytestcase(yyruleno==259);
-{yygotominor.yy428 = 0;}
+      case 72: /* ifexists ::= */ yytestcase(yyruleno==72);
+      case 75: /* force ::= */ yytestcase(yyruleno==75);
+      case 288: /* between_op ::= BETWEEN */ yytestcase(yyruleno==288);
+      case 291: /* in_op ::= IN */ yytestcase(yyruleno==291);
+{yygotominor.yy262 = 0;}
         break;
       case 19: /* ifnotexists ::= IF NOT EXISTS */
-      case 66: /* ifexists ::= IF EXISTS */ yytestcase(yyruleno==66);
-      case 71: /* force ::= FORCE */ yytestcase(yyruleno==71);
-      case 257: /* between_op ::= NOT BETWEEN */ yytestcase(yyruleno==257);
-      case 260: /* in_op ::= NOT IN */ yytestcase(yyruleno==260);
-{yygotominor.yy428 = 1;}
+      case 71: /* ifexists ::= IF EXISTS */ yytestcase(yyruleno==71);
+      case 76: /* force ::= FORCE */ yytestcase(yyruleno==76);
+      case 289: /* between_op ::= NOT BETWEEN */ yytestcase(yyruleno==289);
+      case 292: /* in_op ::= NOT IN */ yytestcase(yyruleno==292);
+{yygotominor.yy262 = 1;}
         break;
       case 20: /* columnlist ::= column */
-      case 97: /* addcolumnlist ::= addcolumn */ yytestcase(yyruleno==97);
+      case 106: /* addcolumnlist ::= addcolumn */ yytestcase(yyruleno==106);
 {
-	yygotominor.yy18 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy480 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::TableColumnList(parser->getSQLAllocator());
-	yygotominor.yy18->push_back(yymsp[0].minor.yy12);
+	yygotominor.yy480->push_back(yymsp[0].minor.yy252);
 }
         break;
       case 21: /* columnlist ::= columnlist COMMA column */
-      case 98: /* addcolumnlist ::= addcolumnlist COMMA addcolumn */ yytestcase(yyruleno==98);
+      case 107: /* addcolumnlist ::= addcolumnlist COMMA addcolumn */ yytestcase(yyruleno==107);
 {
-	yygotominor.yy18 = yymsp[-2].minor.yy18;
-	if (!yygotominor.yy18) {
-		yygotominor.yy18 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy480 = yymsp[-2].minor.yy480;
+	if (!yygotominor.yy480) {
+		yygotominor.yy480 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::TableColumnList(parser->getSQLAllocator());
 	}
-	yygotominor.yy18->push_back(yymsp[0].minor.yy12);
+	yygotominor.yy480->push_back(yymsp[0].minor.yy252);
 }
         break;
       case 22: /* column ::= nm typetoken carglist */
-      case 99: /* addcolumn ::= ADD nm typetoken carglist */ yytestcase(yyruleno==99);
-      case 100: /* addcolumn ::= ADD COLUMNKW nm typetoken carglist */ yytestcase(yyruleno==100);
+      case 108: /* addcolumn ::= ADD nm typetoken carglist */ yytestcase(yyruleno==108);
+      case 109: /* addcolumn ::= ADD COLUMNKW nm typetoken carglist */ yytestcase(yyruleno==109);
 {
-	yygotominor.yy12 = SyntaxTree::makeCreateTableColumn(parser->getSQLAllocator(), &yymsp[-2].minor.yy0, &yymsp[-1].minor.yy0, yymsp[0].minor.yy232);
+	yygotominor.yy252 = SyntaxTree::makeCreateTableColumn(parser->getSQLAllocator(), &yymsp[-2].minor.yy0, yymsp[-1].minor.yy359, yymsp[0].minor.yy400);
 }
         break;
       case 23: /* carglist ::= */
-{yygotominor.yy232 = 0;}
+{yygotominor.yy400 = 0;}
         break;
       case 24: /* carglist ::= carglist PRIMARY KEY */
 {
-	if (!yymsp[-2].minor.yy232) {
-		yymsp[-2].minor.yy232 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::ColumnInfo;
+	if (!yymsp[-2].minor.yy400) {
+		yymsp[-2].minor.yy400 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::ColumnInfo;
 	}
 	int32_t flag = SyntaxTree::COLUMN_OPT_PRIMARY_KEY;
-	if ((yymsp[-2].minor.yy232->option_ & flag) == flag) {
+	if ((yymsp[-2].minor.yy400->option_ & flag) == flag) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"PRIMARY KEY option duplicated");
 	}
-	if ((yymsp[-2].minor.yy232->option_ & SyntaxTree::COLUMN_OPT_VIRTUAL) != 0) {
+	if ((yymsp[-2].minor.yy400->option_ & SyntaxTree::COLUMN_OPT_VIRTUAL) != 0) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"PRIMARY KEY and VIRTUAL options can not be specified at the same time");
 	}
-	if ((yymsp[-2].minor.yy232->option_ & SyntaxTree::COLUMN_OPT_NULLABLE) != 0) {
+	if ((yymsp[-2].minor.yy400->option_ & SyntaxTree::COLUMN_OPT_NULLABLE) != 0) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"PRIMARY KEY and NULL options can not be specified at the same time");
 	}
-	yymsp[-2].minor.yy232->option_ |= flag;
-	yygotominor.yy232 = yymsp[-2].minor.yy232;
+	yymsp[-2].minor.yy400->option_ |= flag;
+	yygotominor.yy400 = yymsp[-2].minor.yy400;
 }
         break;
       case 25: /* carglist ::= carglist NOT NULL */
 {
-	if (!yymsp[-2].minor.yy232) {
-		yymsp[-2].minor.yy232 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::ColumnInfo;
+	if (!yymsp[-2].minor.yy400) {
+		yymsp[-2].minor.yy400 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::ColumnInfo;
 	}
 	const int32_t flag = SyntaxTree::COLUMN_OPT_NOT_NULL;
-	if ((yymsp[-2].minor.yy232->option_ & flag) == flag) {
+	if ((yymsp[-2].minor.yy400->option_ & flag) == flag) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"NOT NULL option duplicated");
 	}
-	if ((yymsp[-2].minor.yy232->option_ & SyntaxTree::COLUMN_OPT_NULLABLE) != 0) {
+	if ((yymsp[-2].minor.yy400->option_ & SyntaxTree::COLUMN_OPT_NULLABLE) != 0) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"NOT NULL and NULL options can not be specified at the same time");
 	}
-	yymsp[-2].minor.yy232->option_ |= flag;
-	yygotominor.yy232 = yymsp[-2].minor.yy232;
+	yymsp[-2].minor.yy400->option_ |= flag;
+	yygotominor.yy400 = yymsp[-2].minor.yy400;
 }
         break;
       case 26: /* carglist ::= carglist NULL */
 {
-	if (!yymsp[-1].minor.yy232) {
-		yymsp[-1].minor.yy232 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::ColumnInfo;
+	if (!yymsp[-1].minor.yy400) {
+		yymsp[-1].minor.yy400 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::ColumnInfo;
 	}
 	const int32_t flag = SyntaxTree::COLUMN_OPT_NULLABLE;
-	if ((yymsp[-1].minor.yy232->option_ & flag) == flag) {
+	if ((yymsp[-1].minor.yy400->option_ & flag) == flag) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"NULL option duplicated");
 	}
-	if ((yymsp[-1].minor.yy232->option_ & SyntaxTree::COLUMN_OPT_PRIMARY_KEY) != 0) {
+	if ((yymsp[-1].minor.yy400->option_ & SyntaxTree::COLUMN_OPT_PRIMARY_KEY) != 0) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"PRIMARY KEY and NULL options can not be specified at the same time");
 	}
-	if ((yymsp[-1].minor.yy232->option_ & SyntaxTree::COLUMN_OPT_NOT_NULL) != 0) {
+	if ((yymsp[-1].minor.yy400->option_ & SyntaxTree::COLUMN_OPT_NOT_NULL) != 0) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"NOT NULL and NULL options can not be specified at the same time");
 	}
-	yymsp[-1].minor.yy232->option_ |= flag;
-	yygotominor.yy232 = yymsp[-1].minor.yy232;
+	yymsp[-1].minor.yy400->option_ |= flag;
+	yygotominor.yy400 = yymsp[-1].minor.yy400;
 }
         break;
       case 27: /* carglist ::= carglist AS LP expr RP VIRTUAL */
 {
 	SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-4].minor.yy0,
 			"Syntax error");
-	yygotominor.yy232 = yymsp[-5].minor.yy232;
-  yy_destructor(196,&yymsp[-2].minor);
+	yygotominor.yy400 = yymsp[-5].minor.yy400;
 }
         break;
       case 28: /* partitioning_options ::= */
-{yygotominor.yy437 = 0;}
+{yygotominor.yy231 = 0;}
         break;
       case 29: /* partitioning_options ::= PARTITION BY HASH singlecol PARTITIONS INTEGER */
 {
-	yygotominor.yy437 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::PartitioningOption;
-	yygotominor.yy437->partitionType_ = SyntaxTree::TABLE_PARTITION_TYPE_HASH;
-	yygotominor.yy437->partitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy231 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::PartitioningOption;
+	yygotominor.yy231->partitionType_ = SyntaxTree::TABLE_PARTITION_TYPE_HASH;
+	yygotominor.yy231->partitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[-2].minor.yy0);
 	/* yymsp[0].minor.yy0: Token */
 	int64_t int64Value;
@@ -1001,28 +1030,28 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"Table partitioning count must be a positive integer");
 	}
-	yygotominor.yy437->partitionCount_ = static_cast<int32_t>(int64Value);
-	yygotominor.yy437->optInterval_ = 0;
+	yygotominor.yy231->partitionCount_ = static_cast<int32_t>(int64Value);
+	yygotominor.yy231->optInterval_ = 0;
 }
         break;
       case 30: /* partitioning_options ::= PARTITION BY RANGE|INTERVAL singlecol intervalOption */
 {
-	yygotominor.yy437 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::PartitioningOption;
-	yygotominor.yy437->partitionType_ = SyntaxTree::TABLE_PARTITION_TYPE_RANGE;
-	yygotominor.yy437->partitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy231 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::PartitioningOption;
+	yygotominor.yy231->partitionType_ = SyntaxTree::TABLE_PARTITION_TYPE_RANGE;
+	yygotominor.yy231->partitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[-1].minor.yy0);
-	yygotominor.yy437->optInterval_ = yymsp[0].minor.yy482.value_;
-	yygotominor.yy437->optIntervalUnit_ = yymsp[0].minor.yy482.unit_;
+	yygotominor.yy231->optInterval_ = yymsp[0].minor.yy336.value_;
+	yygotominor.yy231->optIntervalUnit_ = yymsp[0].minor.yy336.unit_;
 }
         break;
       case 31: /* partitioning_options ::= PARTITION BY RANGE|INTERVAL singlecol intervalOption SUBPARTITION BY HASH singlecol SUBPARTITIONS INTEGER */
 {
 
-	yygotominor.yy437 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::PartitioningOption;
-	yygotominor.yy437->partitionType_ = SyntaxTree::TABLE_PARTITION_TYPE_RANGE_HASH;
-	yygotominor.yy437->partitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy231 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::PartitioningOption;
+	yygotominor.yy231->partitionType_ = SyntaxTree::TABLE_PARTITION_TYPE_RANGE_HASH;
+	yygotominor.yy231->partitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[-7].minor.yy0);
-	yygotominor.yy437->subPartitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy231->subPartitionColumn_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[-2].minor.yy0);
 	/* yymsp[0].minor.yy0: Token */
 	int64_t int64Value;
@@ -1032,9 +1061,9 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"Table partitioning count must be a positive integer");
 	}
-	yygotominor.yy437->partitionCount_ = static_cast<int32_t>(int64Value);
-	yygotominor.yy437->optInterval_ = yymsp[-6].minor.yy482.value_;
-	yygotominor.yy437->optIntervalUnit_ = yymsp[-6].minor.yy482.unit_;
+	yygotominor.yy231->partitionCount_ = static_cast<int32_t>(int64Value);
+	yygotominor.yy231->optInterval_ = yymsp[-6].minor.yy336.value_;
+	yygotominor.yy231->optIntervalUnit_ = yymsp[-6].minor.yy336.unit_;
 }
         break;
       case 32: /* intervalOption ::= EVERY LP INTEGER RP */
@@ -1047,23 +1076,20 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"Table partitioning interval must be a positive integer");
 	}
-	yygotominor.yy482.value_ = int64Value;
-	yygotominor.yy482.unit_ = -1;
+	yygotominor.yy336.value_ = int64Value;
+	yygotominor.yy336.unit_ = -1;
 }
         break;
-      case 33: /* intervalOption ::= EVERY LP INTEGER COMMA field RP */
+      case 33: /* intervalOption ::= EVERY LP INTEGER COMMA fieldType RP */
 {
-	assert(yymsp[-1].minor.yy60); 
-	assert(yymsp[-1].minor.yy60->value_.getType() == TupleList::TYPE_LONG);
-	int64_t fieldType = yymsp[-1].minor.yy60->value_.get<int64_t>();
-	switch(fieldType) {
-	case util::DateTime::FIELD_DAY_OF_MONTH:
-		break;
-	default:
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy60->startToken_,
+	const util::DateTime::FieldType unit = yymsp[-1].minor.yy122.unit_;
+	const SQLToken &unitToken = yymsp[-1].minor.yy122.token_;
+	if (!SyntaxTree::checkPartitioningIntervalTimeField(unit)) {
+		SQL_PARSER_THROW_ERROR(
+				GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, unitToken,
 				"Specified unit is not allowed");
-		break;
 	}
+
 	/* yymsp[-3].minor.yy0: Token */
 	int64_t int64Value;
 	bool succeeded = SQLProcessor::ValueUtils::toLong(
@@ -1072,174 +1098,260 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-3].minor.yy0,
 				"Table partitioning interval must be a positive integer");
 	}
-	yygotominor.yy482.value_ = int64Value;
-	yygotominor.yy482.unit_ = fieldType;
+
+	yygotominor.yy336.value_ = int64Value;
+	yygotominor.yy336.unit_ = static_cast<int64_t>(unit);
 }
         break;
-      case 34: /* is_timeseries ::= */
-      case 90: /* sortascending ::= DESC */ yytestcase(yyruleno==90);
-{yygotominor.yy371 = false;}
+      case 34: /* groupIntervalOption ::= EVERY LP INTEGER COMMA fieldType intervalOptionDetail RP */
+{
+	const util::DateTime::FieldType unit = yymsp[-2].minor.yy122.unit_;
+	const SQLToken &unitToken = yymsp[-2].minor.yy122.token_;
+	if (!SyntaxTree::checkGroupIntervalTimeField(unit)) {
+		SQL_PARSER_THROW_ERROR(
+				GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, unitToken,
+				"Specified unit is not allowed");
+	}
+
+	/* yymsp[-4].minor.yy0: Token */
+	int64_t int64Value;
+	bool succeeded = SQLProcessor::ValueUtils::toLong(
+			yymsp[-4].minor.yy0.value_, yymsp[-4].minor.yy0.size_, int64Value);
+	if (!succeeded || int64Value <= 0) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-4].minor.yy0,
+				"Range group interval must be a positive integer");
+	}
+
+	yygotominor.yy319.base_.value_ = int64Value;
+	yygotominor.yy319.base_.unit_ = static_cast<int64_t>(unit);
+	yygotominor.yy319.detail_ = yymsp[-1].minor.yy471;
+}
         break;
-      case 35: /* is_timeseries ::= USING TIMESERIES */
-      case 89: /* sortascending ::= ASC */ yytestcase(yyruleno==89);
-      case 91: /* sortascending ::= */ yytestcase(yyruleno==91);
-{yygotominor.yy371 = true;}
+      case 35: /* intervalOptionDetail ::= */
+{
+	yygotominor.yy471.offset_ = 0;
+	yygotominor.yy471.timeZone_ = 0;
+	yygotominor.yy471.withTimeZone_ = false;
+}
         break;
-      case 36: /* singlecol ::= nm */
-      case 44: /* plus_num ::= PLUS INTEGER|FLOAT */ yytestcase(yyruleno==44);
-      case 45: /* plus_num ::= INTEGER|FLOAT */ yytestcase(yyruleno==45);
-      case 46: /* minus_num ::= MINUS INTEGER|FLOAT */ yytestcase(yyruleno==46);
-      case 47: /* nm ::= ID */ yytestcase(yyruleno==47);
-      case 48: /* typetoken ::= typename */ yytestcase(yyruleno==48);
-      case 53: /* typename ::= ID */ yytestcase(yyruleno==53);
-      case 141: /* as ::= AS nm */ yytestcase(yyruleno==141);
-      case 142: /* as ::= ID */ yytestcase(yyruleno==142);
-      case 153: /* dbnm ::= DOT nm */ yytestcase(yyruleno==153);
+      case 36: /* intervalOptionDetail ::= COMMA INTEGER */
+{
+	if (!SyntaxTree::resolveRangeGroupOffset(yymsp[0].minor.yy0, yygotominor.yy471.offset_)) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
+				"Range group offset must be a non negetive integer");
+	}
+	yygotominor.yy471.timeZone_ = 0;
+	yygotominor.yy471.withTimeZone_ = false;
+}
+        break;
+      case 37: /* intervalOptionDetail ::= COMMA STRING */
+{
+	yygotominor.yy471.offset_ = 0;
+	if (!SyntaxTree::resolveRangeGroupTimeZone(
+			parser->getSQLAllocator(), yymsp[0].minor.yy0, yygotominor.yy471.timeZone_)) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
+				"Syntax error at range group time zone");
+	}
+	yygotominor.yy471.withTimeZone_ = true;
+}
+        break;
+      case 38: /* intervalOptionDetail ::= COMMA INTEGER COMMA STRING */
+{
+	if (!SyntaxTree::resolveRangeGroupOffset(yymsp[-2].minor.yy0, yygotominor.yy471.offset_)) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-2].minor.yy0,
+				"Range group offset must be a non negetive integer");
+	}
+	if (!SyntaxTree::resolveRangeGroupTimeZone(
+			parser->getSQLAllocator(), yymsp[0].minor.yy0, yygotominor.yy471.timeZone_)) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
+				"Syntax error at range group time zone");
+	}
+	yygotominor.yy471.withTimeZone_ = true;
+}
+        break;
+      case 39: /* is_timeseries ::= */
+      case 97: /* sortascending ::= DESC */ yytestcase(yyruleno==97);
+{yygotominor.yy209 = false;}
+        break;
+      case 40: /* is_timeseries ::= USING TIMESERIES */
+      case 96: /* sortascending ::= ASC */ yytestcase(yyruleno==96);
+      case 98: /* sortascending ::= */ yytestcase(yyruleno==98);
+{yygotominor.yy209 = true;}
+        break;
+      case 41: /* singlecol ::= nm */
+      case 49: /* plus_num ::= PLUS INTEGER|FLOAT */ yytestcase(yyruleno==49);
+      case 50: /* plus_num ::= INTEGER|FLOAT */ yytestcase(yyruleno==50);
+      case 51: /* minus_num ::= MINUS INTEGER|FLOAT */ yytestcase(yyruleno==51);
+      case 52: /* nm ::= ID */ yytestcase(yyruleno==52);
+      case 58: /* typename ::= ID */ yytestcase(yyruleno==58);
+      case 150: /* as ::= AS nm */ yytestcase(yyruleno==150);
+      case 151: /* as ::= ID */ yytestcase(yyruleno==151);
+      case 162: /* dbnm ::= DOT nm */ yytestcase(yyruleno==162);
 {yygotominor.yy0 = yymsp[0].minor.yy0;}
         break;
-      case 37: /* singlecol ::= LP nm RP */
+      case 42: /* singlecol ::= LP nm RP */
 {yygotominor.yy0 = yymsp[-1].minor.yy0;}
         break;
-      case 38: /* createtable_opt ::= */
-      case 57: /* conslist_opt ::= */ yytestcase(yyruleno==57);
-      case 116: /* hint_opt ::= */ yytestcase(yyruleno==116);
-      case 118: /* hintlist ::= */ yytestcase(yyruleno==118);
-      case 123: /* hintexprlist ::= */ yytestcase(yyruleno==123);
-      case 174: /* using_opt ::= */ yytestcase(yyruleno==174);
-      case 175: /* orderby_opt ::= */ yytestcase(yyruleno==175);
-      case 179: /* groupby_opt ::= */ yytestcase(yyruleno==179);
-      case 196: /* inscollist_opt ::= */ yytestcase(yyruleno==196);
-      case 223: /* partitionby_opt ::= */ yytestcase(yyruleno==223);
-      case 273: /* exprlist ::= */ yytestcase(yyruleno==273);
-{yygotominor.yy294 = 0;}
+      case 43: /* createtable_opt ::= */
+      case 62: /* conslist_opt ::= */ yytestcase(yyruleno==62);
+      case 125: /* hint_opt ::= */ yytestcase(yyruleno==125);
+      case 127: /* hintlist ::= */ yytestcase(yyruleno==127);
+      case 132: /* hintexprlist ::= */ yytestcase(yyruleno==132);
+      case 185: /* using_opt ::= */ yytestcase(yyruleno==185);
+      case 186: /* orderby_opt ::= */ yytestcase(yyruleno==186);
+      case 190: /* groupby_opt ::= */ yytestcase(yyruleno==190);
+      case 215: /* inscollist_opt ::= */ yytestcase(yyruleno==215);
+      case 254: /* partitionby_opt ::= */ yytestcase(yyruleno==254);
+      case 305: /* exprlist ::= */ yytestcase(yyruleno==305);
+{yygotominor.yy304 = 0;}
         break;
-      case 39: /* createtable_opt ::= WITH LP createtable_optlist RP */
+      case 44: /* createtable_opt ::= WITH LP createtable_optlist RP */
 {
-	yygotominor.yy294 = yymsp[-1].minor.yy294;
+	yygotominor.yy304 = yymsp[-1].minor.yy304;
 }
         break;
-      case 40: /* createtable_optlist ::= createtable_optlist COMMA nm EQ expr */
+      case 45: /* createtable_optlist ::= createtable_optlist COMMA nm EQ expr */
 {
-	assert(yymsp[0].minor.yy60);
-	if (yymsp[0].minor.yy60->op_ != SQLType::EXPR_CONSTANT) {
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy60->startToken_,
+	assert(yymsp[0].minor.yy512);
+	if (yymsp[0].minor.yy512->op_ != SQLType::EXPR_CONSTANT) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy512->startToken_,
 				"Option value must be constant");
 	}
-	if (!yymsp[-4].minor.yy294) {
-		yymsp[-4].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-4].minor.yy304) {
+		yymsp[-4].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
 	util::String *keyStr = SyntaxTree::tokenToString(
 			parser->getSQLAllocator(), yymsp[-2].minor.yy0, false);
-	yymsp[0].minor.yy60->aliasName_ = keyStr;
+	yymsp[0].minor.yy512->aliasName_ = keyStr;
 
-	yygotominor.yy294 = yymsp[-4].minor.yy294;
-	yygotominor.yy294->push_back(yymsp[0].minor.yy60);
+	yygotominor.yy304 = yymsp[-4].minor.yy304;
+	yygotominor.yy304->push_back(yymsp[0].minor.yy512);
 }
         break;
-      case 41: /* createtable_optlist ::= nm EQ expr */
+      case 46: /* createtable_optlist ::= nm EQ expr */
 {
-	assert(yymsp[0].minor.yy60);
-	if (yymsp[0].minor.yy60->op_ != SQLType::EXPR_CONSTANT) {
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy60->startToken_,
+	assert(yymsp[0].minor.yy512);
+	if (yymsp[0].minor.yy512->op_ != SQLType::EXPR_CONSTANT) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy512->startToken_,
 				"Option value must be constant");
 	}
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
 
 	util::String *keyStr = SyntaxTree::tokenToString(
 			parser->getSQLAllocator(), yymsp[-2].minor.yy0, false);
-	yymsp[0].minor.yy60->aliasName_ = keyStr;
+	yymsp[0].minor.yy512->aliasName_ = keyStr;
 
-	yygotominor.yy294->push_back(yymsp[0].minor.yy60);
+	yygotominor.yy304->push_back(yymsp[0].minor.yy512);
 }
         break;
-      case 43: /* create_virtual_table ::= createkw VIRTUAL TABLE ifnotexists nm dbnm LP columnlist conslist_opt RP USING nm createtable_opt partitioning_options */
+      case 48: /* create_virtual_table ::= createkw VIRTUAL TABLE ifnotexists nm dbnm LP columnlist conslist_opt RP USING nm createtable_opt partitioning_options */
 {
 	SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-12].minor.yy0,
 			"Syntax error");
-  yy_destructor(188,&yymsp[-6].minor);
-  yy_destructor(189,&yymsp[-5].minor);
-  yy_destructor(192,&yymsp[0].minor);
 }
         break;
-      case 49: /* typetoken ::= typename LP signed RP */
+      case 53: /* typetoken ::= typename */
 {
-	yygotominor.yy0 = yymsp[-3].minor.yy0;
+	yygotominor.yy359 = SyntaxTree::toColumnType(parser->getSQLAllocator(), yymsp[0].minor.yy0, NULL, NULL);
 }
         break;
-      case 50: /* typetoken ::= typename LP signed RP typename */
+      case 54: /* typetoken ::= typename LP signed RP */
 {
-	yygotominor.yy0 = yymsp[-4].minor.yy0;
+	yygotominor.yy359 = SyntaxTree::toColumnType(parser->getSQLAllocator(), yymsp[-3].minor.yy0, &yymsp[-1].minor.yy531, NULL);
 }
         break;
-      case 51: /* typetoken ::= typename LP signed COMMA signed RP */
+      case 55: /* typetoken ::= typename LP signed RP typename */
 {
-	yygotominor.yy0 = yymsp[-5].minor.yy0;
+	yygotominor.yy359 = SyntaxTree::toColumnType(parser->getSQLAllocator(), yymsp[-4].minor.yy0, &yymsp[-2].minor.yy531, NULL);
 }
         break;
-      case 52: /* typetoken ::= typename LP signed COMMA signed RP typename */
+      case 56: /* typetoken ::= typename LP signed COMMA signed RP */
 {
-	yygotominor.yy0 = yymsp[-6].minor.yy0;
+	yygotominor.yy359 = SyntaxTree::toColumnType(parser->getSQLAllocator(), yymsp[-5].minor.yy0, &yymsp[-3].minor.yy531, &yymsp[-1].minor.yy531);
 }
         break;
-      case 54: /* typename ::= typename ID */
+      case 57: /* typetoken ::= typename LP signed COMMA signed RP typename */
+{
+	yygotominor.yy359 = SyntaxTree::toColumnType(parser->getSQLAllocator(), yymsp[-6].minor.yy0, &yymsp[-4].minor.yy531, &yymsp[-2].minor.yy531);
+}
+        break;
+      case 59: /* typename ::= typename ID */
 {
 	yygotominor.yy0 = yymsp[-1].minor.yy0;
 }
         break;
-      case 58: /* conslist_opt ::= COMMA conslist */
-      case 117: /* hintlist ::= hintlist1 */ yytestcase(yyruleno==117);
-      case 122: /* hintexprlist ::= hintexprlist1 */ yytestcase(yyruleno==122);
-      case 176: /* orderby_opt ::= ORDER BY sortlist */ yytestcase(yyruleno==176);
-      case 180: /* groupby_opt ::= GROUP BY nexprlist */ yytestcase(yyruleno==180);
-      case 224: /* partitionby_opt ::= PARTITION BY nexprlist */ yytestcase(yyruleno==224);
-      case 272: /* exprlist ::= nexprlist */ yytestcase(yyruleno==272);
-{yygotominor.yy294 = yymsp[0].minor.yy294;}
-        break;
-      case 59: /* conslist ::= tcons */
+      case 60: /* signed ::= plus_num */
 {
-	if (yymsp[0].minor.yy60) {
-		yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
-				SyntaxTree::ExprList(parser->getSQLAllocator());
-		yygotominor.yy294->push_back(yymsp[0].minor.yy60);
-	}
-	else {
-		yygotominor.yy294 = 0;
+	if (!SyntaxTree::toSignedValue(yymsp[0].minor.yy0, false, yygotominor.yy531)) {
+		SQL_PARSER_THROW_ERROR(
+				GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
+				yymsp[0].minor.yy0, "Invalid number for column type option");
 	}
 }
         break;
-      case 60: /* tcons ::= PRIMARY KEY LP idxlist RP */
+      case 61: /* signed ::= minus_num */
+{
+	if (!SyntaxTree::toSignedValue(yymsp[0].minor.yy0, true, yygotominor.yy531)) {
+		SQL_PARSER_THROW_ERROR(
+				GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
+				yymsp[0].minor.yy0, "Invalid number for column type option");
+	}
+}
+        break;
+      case 63: /* conslist_opt ::= COMMA conslist */
+      case 126: /* hintlist ::= hintlist1 */ yytestcase(yyruleno==126);
+      case 131: /* hintexprlist ::= hintexprlist1 */ yytestcase(yyruleno==131);
+      case 187: /* orderby_opt ::= ORDER BY sortlist */ yytestcase(yyruleno==187);
+      case 191: /* groupby_opt ::= GROUP BY nexprlist */ yytestcase(yyruleno==191);
+      case 255: /* partitionby_opt ::= PARTITION BY nexprlist */ yytestcase(yyruleno==255);
+      case 304: /* exprlist ::= nexprlist */ yytestcase(yyruleno==304);
+{yygotominor.yy304 = yymsp[0].minor.yy304;}
+        break;
+      case 64: /* conslist ::= tcons */
+{
+	if (yymsp[0].minor.yy512) {
+		yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
+				SyntaxTree::ExprList(parser->getSQLAllocator());
+		yygotominor.yy304->push_back(yymsp[0].minor.yy512);
+	}
+	else {
+		yygotominor.yy304 = 0;
+	}
+}
+        break;
+      case 65: /* tcons ::= PRIMARY KEY LP idxlist RP */
 {
 	SyntaxTree::Expr* expr = SyntaxTree::Expr::makeExpr(
 		parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
-	expr->next_ = yymsp[-1].minor.yy294;
-	yygotominor.yy60 = expr;
+	expr->next_ = yymsp[-1].minor.yy304;
+	yygotominor.yy512 = expr;
 }
         break;
-      case 61: /* orconf ::= */
-{yygotominor.yy428 = SyntaxTree::RESOLVETYPE_DEFAULT;}
+      case 66: /* orconf ::= */
+{yygotominor.yy262 = SyntaxTree::RESOLVETYPE_DEFAULT;}
         break;
-      case 62: /* orconf ::= OR resolvetype */
-{yygotominor.yy428 = yymsp[0].minor.yy428;}
+      case 67: /* orconf ::= OR resolvetype */
+{yygotominor.yy262 = yymsp[0].minor.yy262;}
         break;
-      case 63: /* resolvetype ::= IGNORE */
-{yygotominor.yy428 = SyntaxTree::RESOLVETYPE_IGNORE;}
+      case 68: /* resolvetype ::= IGNORE */
+{yygotominor.yy262 = SyntaxTree::RESOLVETYPE_IGNORE;}
         break;
-      case 64: /* resolvetype ::= REPLACE */
-{yygotominor.yy428 = SyntaxTree::RESOLVETYPE_REPLACE;}
+      case 69: /* resolvetype ::= REPLACE */
+{yygotominor.yy262 = SyntaxTree::RESOLVETYPE_REPLACE;}
         break;
-      case 65: /* cmd ::= DROP TABLE ifexists fullname */
+      case 70: /* cmd ::= DROP TABLE ifexists fullname */
 {
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
 			parser->getSQLAllocator(), SyntaxTree::CMD_DROP_TABLE);
 
-	select->targetName_ = yymsp[0].minor.yy295;
-	select->cmdOptionValue_ = yymsp[-1].minor.yy428;
+	select->targetName_ = yymsp[0].minor.yy82;
+	select->cmdOptionValue_ = yymsp[-1].minor.yy262;
 	parser->setTopSelect(select);
 }
         break;
-      case 69: /* create_view ::= CREATE force VIEW nm dbnm AS select */
+      case 74: /* create_view ::= CREATE force VIEW nm dbnm AS select */
 {
 	assert(!parser->topSelect_);
 	SyntaxTree::Select *select = Select::makeSelect(
@@ -1262,12 +1374,12 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 	select->targetName_ = qName;
 
-	assert(yymsp[0].minor.yy158);
-	if (yymsp[0].minor.yy158 && yymsp[0].minor.yy158->right_ && yymsp[0].minor.yy158->right_->hintList_) {
+	assert(yymsp[0].minor.yy72);
+	if (yymsp[0].minor.yy72 && yymsp[0].minor.yy72->right_ && yymsp[0].minor.yy72->right_->hintList_) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 				yymsp[-1].minor.yy0, "Hint specified in View definition");
 	}
-	select->insertSet_ = yymsp[0].minor.yy158;
+	select->insertSet_ = yymsp[0].minor.yy72;
 	SQLAllocator &alloc = parser->getSQLAllocator();
 
 	SQLToken tokenAs = yymsp[-1].minor.yy0;
@@ -1280,27 +1392,27 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 			ALLOC_NEW(alloc) SyntaxTree::CreateTableOption(alloc);
 	opt->optionString_ = viewSelectStr;
 	select->createTableOpt_ = opt;
-	select->cmdOptionValue_ = yymsp[-5].minor.yy428;
+	select->cmdOptionValue_ = yymsp[-5].minor.yy262;
 
 	parser->setTopSelect(select);
 
-	if (yymsp[-5].minor.yy428 == 1) {
+	if (yymsp[-5].minor.yy262 == 1) {
 		parser->createForceView_ = true;
 	}
 
 }
         break;
-      case 72: /* cmd ::= DROP VIEW ifexists fullname */
+      case 77: /* cmd ::= DROP VIEW ifexists fullname */
 {
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
 			parser->getSQLAllocator(), SyntaxTree::CMD_DROP_VIEW);
 
-	select->targetName_ = yymsp[0].minor.yy295;
-	select->cmdOptionValue_ = yymsp[-1].minor.yy428;
+	select->targetName_ = yymsp[0].minor.yy82;
+	select->cmdOptionValue_ = yymsp[-1].minor.yy262;
 	parser->setTopSelect(select);
 }
         break;
-      case 73: /* cmd ::= CREATE DATABASE nm */
+      case 78: /* cmd ::= CREATE DATABASE nm */
 {
 	/* yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1323,7 +1435,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 74: /* cmd ::= DROP DATABASE nm */
+      case 79: /* cmd ::= DROP DATABASE nm */
 {
 	/* yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1345,7 +1457,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 75: /* cmd ::= CREATE USER nm IDENTIFIED BY STRING */
+      case 80: /* cmd ::= CREATE USER nm IDENTIFIED BY STRING */
 {
 	/* yymsp[-3].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1378,7 +1490,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 76: /* cmd ::= CREATE USER nm */
+      case 81: /* cmd ::= CREATE USER nm */
 {
 	/* yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1402,7 +1514,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 77: /* cmd ::= SET PASSWORD FOR nm EQ STRING */
+      case 82: /* cmd ::= SET PASSWORD FOR nm EQ STRING */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1434,7 +1546,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 78: /* cmd ::= SET PASSWORD EQ STRING */
+      case 83: /* cmd ::= SET PASSWORD EQ STRING */
 {
 	/* yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1458,7 +1570,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 79: /* cmd ::= DROP USER nm */
+      case 84: /* cmd ::= DROP USER nm */
 {
 	/* yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1481,7 +1593,53 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 80: /* cmd ::= GRANT ALL ON nm TO nm */
+      case 85: /* cmd ::= CREATE ROLE nm */
+{
+	/* yymsp[0].minor.yy0: Token */
+	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
+			parser->getSQLAllocator(), SyntaxTree::CMD_CREATE_ROLE);
+
+	select->cmdOptionList_ = ALLOC_NEW(parser->getSQLAllocator())
+			SyntaxTree::ExprList(parser->getSQLAllocator());
+
+	SyntaxTree::Expr* nameExpr = SyntaxTree::Expr::makeExpr(
+			parser->getSQLAllocator(), SQLType::EXPR_ID);
+	nameExpr->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[0].minor.yy0);
+
+	if (!nameExpr->qName_->name_ || nameExpr->qName_->name_->size() == 0) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
+				"Role name must not be empty");
+	}
+	select->cmdOptionList_->push_back(nameExpr);
+
+	parser->setTopSelect(select);
+}
+        break;
+      case 86: /* cmd ::= DROP ROLE nm */
+{
+	/* yymsp[0].minor.yy0: Token */
+	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
+			parser->getSQLAllocator(), SyntaxTree::CMD_DROP_USER);
+
+	select->cmdOptionList_ = ALLOC_NEW(parser->getSQLAllocator())
+			SyntaxTree::ExprList(parser->getSQLAllocator());
+
+	SyntaxTree::Expr* nameExpr = SyntaxTree::Expr::makeExpr(
+			parser->getSQLAllocator(), SQLType::EXPR_ID);
+	nameExpr->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[0].minor.yy0);
+
+	if (!nameExpr->qName_->name_ || nameExpr->qName_->name_->size() == 0) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
+				"Role name must not be empty");
+	}
+	select->cmdOptionList_->push_back(nameExpr);
+
+	parser->setTopSelect(select);
+}
+        break;
+      case 87: /* cmd ::= GRANT ALL ON nm TO nm */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1519,7 +1677,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 81: /* cmd ::= GRANT SELECT ON nm TO nm */
+      case 88: /* cmd ::= GRANT SELECT ON nm TO nm */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1558,7 +1716,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 82: /* cmd ::= REVOKE ALL ON nm FROM nm */
+      case 89: /* cmd ::= REVOKE ALL ON nm FROM nm */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1597,7 +1755,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 83: /* cmd ::= REVOKE SELECT ON nm FROM nm */
+      case 90: /* cmd ::= REVOKE SELECT ON nm FROM nm */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0: Token */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1637,9 +1795,9 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 84: /* cmd ::= CREATE INDEX ifnotexists nm ON nm dbnm LP idxlist RP using_options */
+      case 91: /* cmd ::= CREATE INDEX ifnotexists nm ON nm dbnm LP idxlist RP using_options */
 {
-	/* yymsp[-7].minor.yy0, yymsp[-5].minor.yy0, yymsp[-4].minor.yy0: Token, yymsp[-2].minor.yy294: ExprList */
+	/* yymsp[-7].minor.yy0, yymsp[-5].minor.yy0, yymsp[-4].minor.yy0: Token, yymsp[-2].minor.yy304: ExprList */
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
 			parser->getSQLAllocator(), SyntaxTree::CMD_CREATE_INDEX);
 
@@ -1683,12 +1841,12 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 	select->targetName_ = qName;
 
-	select->insertList_ = yymsp[-2].minor.yy294;
-	select->cmdOptionValue_ = yymsp[-8].minor.yy428;
+	select->insertList_ = yymsp[-2].minor.yy304;
+	select->cmdOptionValue_ = yymsp[-8].minor.yy262;
 
 	select->createIndexOpt_ =
 		SyntaxTree::makeCreateIndexOption(
-			parser->getSQLAllocator(), yymsp[-2].minor.yy294, yymsp[-8].minor.yy428, yymsp[0].minor.yy329);
+			parser->getSQLAllocator(), yymsp[-2].minor.yy304, yymsp[-8].minor.yy262, yymsp[0].minor.yy437);
 
 	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
 			parser->getSQLAllocator(), qName, NULL);
@@ -1697,14 +1855,14 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 85: /* using_options ::= */
-{yygotominor.yy329 = 0;}
+      case 92: /* using_options ::= */
+{yygotominor.yy437 = 0;}
         break;
-      case 86: /* using_options ::= USING nm LP exprlist RP */
+      case 93: /* using_options ::= USING nm LP exprlist RP */
 {
-	if (yymsp[-1].minor.yy294) {
-		SyntaxTree::ExprList::iterator itr = yymsp[-1].minor.yy294->begin();
-		for (; itr != yymsp[-1].minor.yy294->end(); ++itr) {
+	if (yymsp[-1].minor.yy304) {
+		SyntaxTree::ExprList::iterator itr = yymsp[-1].minor.yy304->begin();
+		for (; itr != yymsp[-1].minor.yy304->end(); ++itr) {
 			if (((*itr)->op_ != SQLType::EXPR_CONSTANT)
 				&& ((*itr)->op_ != SQLType::EXPR_PLACEHOLDER)) {
 				GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -1712,32 +1870,32 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 			}
 		}
 	}
-	yygotominor.yy329 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::CreateIndexOption;
-	yygotominor.yy329->extensionName_ = SyntaxTree::tokenToString(
+	yygotominor.yy437 = ALLOC_NEW(parser->getSQLAllocator()) SyntaxTree::CreateIndexOption;
+	yygotominor.yy437->extensionName_ = SyntaxTree::tokenToString(
 			parser->getSQLAllocator(), yymsp[-3].minor.yy0, true);
-	yygotominor.yy329->extensionOptionList_ = yymsp[-1].minor.yy294;
+	yygotominor.yy437->extensionOptionList_ = yymsp[-1].minor.yy304;
 }
         break;
-      case 87: /* idxlist ::= idxlist COMMA nm sortascending */
+      case 94: /* idxlist ::= idxlist COMMA nm sortascending */
 {
 	SyntaxTree::Expr* expr = SyntaxTree::Expr::makeExpr(
 			parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
 	expr->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[-1].minor.yy0);
-	expr->sortAscending_ = yymsp[0].minor.yy371;
+	expr->sortAscending_ = yymsp[0].minor.yy209;
 	if (!expr->qName_->name_) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"Zero-length delimited identifier");
 	}
-	if (!yymsp[-3].minor.yy294) {
-		yymsp[-3].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-3].minor.yy304) {
+		yymsp[-3].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	yymsp[-3].minor.yy294->push_back(expr);
-	yygotominor.yy294 = yymsp[-3].minor.yy294;
+	yymsp[-3].minor.yy304->push_back(expr);
+	yygotominor.yy304 = yymsp[-3].minor.yy304;
 }
         break;
-      case 88: /* idxlist ::= nm sortascending */
+      case 95: /* idxlist ::= nm sortascending */
 {
 	SyntaxTree::Expr* expr = SyntaxTree::Expr::makeExpr(
 			parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
@@ -1747,14 +1905,14 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"Zero-length delimited identifier");
 	}
-	expr->sortAscending_ = yymsp[0].minor.yy371;
+	expr->sortAscending_ = yymsp[0].minor.yy209;
 
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yygotominor.yy294->push_back(expr);
+	yygotominor.yy304->push_back(expr);
 }
         break;
-      case 92: /* cmd ::= DROP INDEX ifexists nm ON nm dbnm */
+      case 99: /* cmd ::= DROP INDEX ifexists nm ON nm dbnm */
 {
 	SyntaxTree::QualifiedName* qName = NULL;
 	if (yymsp[0].minor.yy0.size_ > 0) {
@@ -1770,7 +1928,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 			parser->getSQLAllocator(), SyntaxTree::CMD_DROP_INDEX);
 
 	select->targetName_ = qName;
-	select->cmdOptionValue_ = yymsp[-4].minor.yy428;
+	select->cmdOptionValue_ = yymsp[-4].minor.yy262;
 
 	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
 			parser->getSQLAllocator(), qName, NULL);
@@ -1779,7 +1937,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 93: /* cmd ::= DROP INDEX ifexists nm DOT nm dbnm */
+      case 100: /* cmd ::= DROP INDEX ifexists nm DOT nm dbnm */
 {
 	SyntaxTree::QualifiedName* qName = NULL;
 	if (yymsp[0].minor.yy0.size_ > 0) {
@@ -1796,12 +1954,12 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 			parser->getSQLAllocator(), SyntaxTree::CMD_DROP_INDEX);
 
 	select->targetName_ = qName;
-	select->cmdOptionValue_ = yymsp[-4].minor.yy428;
+	select->cmdOptionValue_ = yymsp[-4].minor.yy262;
 
 	parser->setTopSelect(select);
 }
         break;
-      case 94: /* cmd ::= DROP INDEX ifexists nm */
+      case 101: /* cmd ::= DROP INDEX ifexists nm */
 {
 	SyntaxTree::QualifiedName* qName = NULL;
 	SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
@@ -1810,12 +1968,12 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 			parser->getSQLAllocator(), SyntaxTree::CMD_DROP_INDEX);
 
 	select->targetName_ = qName;
-	select->cmdOptionValue_ = yymsp[-1].minor.yy428;
+	select->cmdOptionValue_ = yymsp[-1].minor.yy262;
 
 	parser->setTopSelect(select);
 }
         break;
-      case 95: /* cmd ::= ALTER TABLE nm DROP PARTITION FOR LP expr RP */
+      case 102: /* cmd ::= ALTER TABLE nm DROP PARTITION FOR LP expr RP */
 {
 	SyntaxTree::QualifiedName* largeQName = NULL;
 	largeQName = SyntaxTree::QualifiedName::makeQualifiedName(
@@ -1829,11 +1987,11 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	select->cmdOptionList_ = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
 
-	if (yymsp[-1].minor.yy60 && yymsp[-1].minor.yy60->op_ == SQLType::EXPR_CONSTANT) {
-		SQLToken T = yymsp[-1].minor.yy60->startToken_;
-		if ((yymsp[-1].minor.yy60->value_.getType() == TupleList::TYPE_LONG)
-				|| (yymsp[-1].minor.yy60->value_.getType() == TupleList::TYPE_STRING)) {
-			select->cmdOptionList_->push_back(yymsp[-1].minor.yy60);
+	if (yymsp[-1].minor.yy512 && yymsp[-1].minor.yy512->op_ == SQLType::EXPR_CONSTANT) {
+		SQLToken T = yymsp[-1].minor.yy512->startToken_;
+		if ((yymsp[-1].minor.yy512->value_.getType() == TupleList::TYPE_LONG)
+				|| (yymsp[-1].minor.yy512->value_.getType() == TupleList::TYPE_STRING)) {
+			select->cmdOptionList_->push_back(yymsp[-1].minor.yy512);
 		}
 		else {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -1842,7 +2000,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 	else {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
-				yymsp[-1].minor.yy60->startToken_, "Parameter must be constant");
+				yymsp[-1].minor.yy512->startToken_, "Parameter must be constant");
 	}
 
 	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
@@ -1852,7 +2010,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->setTopSelect(select);
 }
         break;
-      case 96: /* cmd ::= ALTER TABLE nm addcolumnlist */
+      case 103: /* cmd ::= ALTER TABLE nm addcolumnlist */
 {
 	SyntaxTree::QualifiedName* largeQName = NULL;
 	largeQName = SyntaxTree::QualifiedName::makeQualifiedName(
@@ -1871,37 +2029,72 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->tableList_.push_back(table);
 
 	select->createTableOpt_ =
-		SyntaxTree::makeAlterTableAddColumnOption(parser->getSQLAllocator(), yymsp[0].minor.yy18);
+		SyntaxTree::makeAlterTableAddColumnOption(parser->getSQLAllocator(), yymsp[0].minor.yy480);
 
 	parser->setTopSelect(select);
 }
         break;
-      case 101: /* cmd ::= PRAGMA nm DOT nm DOT nm EQ nm */
+      case 104: /* cmd ::= ALTER TABLE nm RENAME COLUMNKW renamecolumn TO renamecolumn */
+{
+	SyntaxTree::QualifiedName* largeQName = NULL;
+	largeQName = SyntaxTree::QualifiedName::makeQualifiedName(
+			parser->getSQLAllocator(), parser->viewNsId_, NULL, &yymsp[-5].minor.yy0, NULL);
+
+	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
+			parser->getSQLAllocator(), SyntaxTree::CMD_ALTER_TABLE_RENAME_COLUMN);
+
+	select->targetName_ = largeQName;
+
+	select->cmdOptionList_ = ALLOC_NEW(parser->getSQLAllocator())
+			SyntaxTree::ExprList(parser->getSQLAllocator());
+
+	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
+			parser->getSQLAllocator(), largeQName, NULL);
+	parser->tableList_.push_back(table);
+
+	SyntaxTree::TableColumnList* colList = ALLOC_NEW(parser->getSQLAllocator())
+				SyntaxTree::TableColumnList(parser->getSQLAllocator());
+	colList->push_back(yymsp[-2].minor.yy252);
+	colList->push_back(yymsp[0].minor.yy252);
+	
+	select->createTableOpt_ =
+		SyntaxTree::makeAlterTableAddColumnOption(parser->getSQLAllocator(), colList);
+
+	parser->setTopSelect(select);
+}
+        break;
+      case 105: /* renamecolumn ::= nm */
+{
+	SyntaxTree::ColumnInfo* colInfo = NULL;
+	yygotominor.yy252 = SyntaxTree::makeCreateTableColumn(parser->getSQLAllocator(), &yymsp[0].minor.yy0, colInfo);
+}
+        break;
+      case 110: /* cmd ::= PRAGMA nm DOT nm DOT nm EQ nm */
 {
 	parser->setPragma(yymsp[-6].minor.yy0, yymsp[-4].minor.yy0, yymsp[-2].minor.yy0, yymsp[0].minor.yy0, 0);
 }
         break;
-      case 102: /* cmd ::= PRAGMA nm DOT nm DOT nm EQ plus_num */
+      case 111: /* cmd ::= PRAGMA nm DOT nm DOT nm EQ plus_num */
 {
 	parser->setPragma(yymsp[-6].minor.yy0, yymsp[-4].minor.yy0, yymsp[-2].minor.yy0, yymsp[0].minor.yy0, 1);
 }
         break;
-      case 103: /* cmd ::= PRAGMA nm DOT nm DOT nm EQ minus_num */
+      case 112: /* cmd ::= PRAGMA nm DOT nm DOT nm EQ minus_num */
 {
 	parser->setPragma(yymsp[-6].minor.yy0, yymsp[-4].minor.yy0, yymsp[-2].minor.yy0, yymsp[0].minor.yy0, 2);
 }
         break;
-      case 104: /* cmd ::= hint_opt select */
+      case 113: /* cmd ::= hint_opt select */
 {
-	if (yymsp[0].minor.yy158) {
-		if (!yymsp[0].minor.yy158->left_ && yymsp[0].minor.yy158->right_ && !yymsp[0].minor.yy158->unionAllList_) {
-			if (yymsp[-1].minor.yy294) {
-				yymsp[0].minor.yy158->right_->hintList_ = yymsp[-1].minor.yy294;
+	if (yymsp[0].minor.yy72) {
+		if (!yymsp[0].minor.yy72->left_ && yymsp[0].minor.yy72->right_ && !yymsp[0].minor.yy72->unionAllList_) {
+			if (yymsp[-1].minor.yy304) {
+				yymsp[0].minor.yy72->right_->hintList_ = yymsp[-1].minor.yy304;
 				const SyntaxTree::Select* hintSelect = parser->getHintSelect();
-				if (hintSelect != NULL && hintSelect != yymsp[0].minor.yy158->right_) {
+				if (hintSelect != NULL && hintSelect != yymsp[0].minor.yy72->right_) {
 					SQLToken token;
-					if (yymsp[-1].minor.yy294->size() > 0) {
-						token = yymsp[-1].minor.yy294->at(0)->startToken_;
+					if (yymsp[-1].minor.yy304->size() > 0) {
+						token = yymsp[-1].minor.yy304->at(0)->startToken_;
 					}
 					else if (hintSelect->hintList_ &&
 							 hintSelect->hintList_->size() > 0) {
@@ -1911,10 +2104,10 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 							token, "Hint specified more than once");
 				}
 				else {
-					parser->setHintSelect(yymsp[0].minor.yy158->right_);
+					parser->setHintSelect(yymsp[0].minor.yy72->right_);
 				}
 			}
-			parser->setTopSelect(yymsp[0].minor.yy158->right_);
+			parser->setTopSelect(yymsp[0].minor.yy72->right_);
 		}
 		else {
 			SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
@@ -1929,13 +2122,13 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 
 			SyntaxTree::Expr* selectExpr = SyntaxTree::Expr::makeExpr(
 					parser->getSQLAllocator(), SQLType::EXPR_SELECTION);
-					selectExpr->subQuery_ = yymsp[0].minor.yy158;
+					selectExpr->subQuery_ = yymsp[0].minor.yy72;
 
-			if (yymsp[-1].minor.yy294) {
-				select->hintList_ = yymsp[-1].minor.yy294;
+			if (yymsp[-1].minor.yy304) {
+				select->hintList_ = yymsp[-1].minor.yy304;
 			}
 			else {
-				SyntaxTree::Set* leftMostSet = yymsp[0].minor.yy158;
+				SyntaxTree::Set* leftMostSet = yymsp[0].minor.yy72;
 				while(leftMostSet->left_) {
 					leftMostSet = leftMostSet->left_;
 				}
@@ -1980,28 +2173,28 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 }
         break;
-      case 105: /* select ::= oneselect */
+      case 114: /* select ::= oneselect */
 {
-	yygotominor.yy158 = SyntaxTree::Set::makeSet(parser->getSQLAllocator(),
-		SyntaxTree::SET_OP_NONE, yymsp[0].minor.yy474);
-	parser->currentSelect_ = yymsp[0].minor.yy474;
+	yygotominor.yy72 = SyntaxTree::Set::makeSet(parser->getSQLAllocator(),
+		SyntaxTree::SET_OP_NONE, yymsp[0].minor.yy378);
+	parser->currentSelect_ = yymsp[0].minor.yy378;
 }
         break;
-      case 106: /* select ::= select multiselect_op oneselect */
+      case 115: /* select ::= select multiselect_op oneselect */
 {
-	assert(yymsp[-2].minor.yy158);
-	if (yymsp[0].minor.yy474) {
+	assert(yymsp[-2].minor.yy72);
+	if (yymsp[0].minor.yy378) {
 		SyntaxTree::Select* lastSelect = NULL;
-		if (yymsp[-2].minor.yy158->right_) {
-			lastSelect = yymsp[-2].minor.yy158->right_;
+		if (yymsp[-2].minor.yy72->right_) {
+			lastSelect = yymsp[-2].minor.yy72->right_;
 		}
 		else {
-			assert(yymsp[-2].minor.yy158->unionAllList_);
-			lastSelect = yymsp[-2].minor.yy158->unionAllList_->back();
+			assert(yymsp[-2].minor.yy72->unionAllList_);
+			lastSelect = yymsp[-2].minor.yy72->unionAllList_->back();
 		}
 		if (lastSelect->orderByList_ || lastSelect->limitList_) {
 			util::String unionOpName(parser->getSQLAllocator());
-			switch (yymsp[-1].minor.yy69) {
+			switch (yymsp[-1].minor.yy187) {
 			case SyntaxTree::SET_OP_UNION:
 				unionOpName = "UNION";
 				break;
@@ -2019,68 +2212,68 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 				"ORDER BY or LIMIT clause should come after " 
 				<< unionOpName.c_str() << " not before");
 		}
-		if (yymsp[-1].minor.yy69 == SyntaxTree::SET_OP_UNION_ALL) {
-			if (yymsp[-2].minor.yy158->type_ == SyntaxTree::SET_OP_UNION_ALL) {
-				assert(yymsp[-2].minor.yy158->unionAllList_);
-				yygotominor.yy158 = yymsp[-2].minor.yy158;
-				yygotominor.yy158->unionAllList_->push_back(yymsp[0].minor.yy474);
+		if (yymsp[-1].minor.yy187 == SyntaxTree::SET_OP_UNION_ALL) {
+			if (yymsp[-2].minor.yy72->type_ == SyntaxTree::SET_OP_UNION_ALL) {
+				assert(yymsp[-2].minor.yy72->unionAllList_);
+				yygotominor.yy72 = yymsp[-2].minor.yy72;
+				yygotominor.yy72->unionAllList_->push_back(yymsp[0].minor.yy378);
 			}
-			else if (yymsp[-2].minor.yy158->type_ == SyntaxTree::SET_OP_NONE) {
-				assert(!yymsp[-2].minor.yy158->unionAllList_);
-				yymsp[-2].minor.yy158->unionAllList_ = ALLOC_NEW(parser->getSQLAllocator())
+			else if (yymsp[-2].minor.yy72->type_ == SyntaxTree::SET_OP_NONE) {
+				assert(!yymsp[-2].minor.yy72->unionAllList_);
+				yymsp[-2].minor.yy72->unionAllList_ = ALLOC_NEW(parser->getSQLAllocator())
 						SyntaxTree::SelectList(parser->getSQLAllocator());
-				if (yymsp[-2].minor.yy158->right_) {
-					yymsp[-2].minor.yy158->unionAllList_->push_back(yymsp[-2].minor.yy158->right_);
-					yymsp[-2].minor.yy158->right_ = NULL;
+				if (yymsp[-2].minor.yy72->right_) {
+					yymsp[-2].minor.yy72->unionAllList_->push_back(yymsp[-2].minor.yy72->right_);
+					yymsp[-2].minor.yy72->right_ = NULL;
 				}
-				yymsp[-2].minor.yy158->type_ = yymsp[-1].minor.yy69; 
-				yygotominor.yy158 = yymsp[-2].minor.yy158;
-				yygotominor.yy158->unionAllList_->push_back(yymsp[0].minor.yy474);
+				yymsp[-2].minor.yy72->type_ = yymsp[-1].minor.yy187; 
+				yygotominor.yy72 = yymsp[-2].minor.yy72;
+				yygotominor.yy72->unionAllList_->push_back(yymsp[0].minor.yy378);
 			}
 			else {
 				SyntaxTree::SelectList* unionAllList = ALLOC_NEW(parser->getSQLAllocator())
 						SyntaxTree::SelectList(parser->getSQLAllocator());
-				unionAllList->push_back(yymsp[0].minor.yy474);
+				unionAllList->push_back(yymsp[0].minor.yy378);
 
-				yygotominor.yy158 = SyntaxTree::Set::makeSet(
-						parser->getSQLAllocator(), yymsp[-1].minor.yy69, yymsp[-2].minor.yy158, NULL, unionAllList);
+				yygotominor.yy72 = SyntaxTree::Set::makeSet(
+						parser->getSQLAllocator(), yymsp[-1].minor.yy187, yymsp[-2].minor.yy72, NULL, unionAllList);
 			}
 		}
 		else {
-			yygotominor.yy158 = SyntaxTree::Set::makeSet(parser->getSQLAllocator(), yymsp[-1].minor.yy69, yymsp[-2].minor.yy158, yymsp[0].minor.yy474, NULL);
+			yygotominor.yy72 = SyntaxTree::Set::makeSet(parser->getSQLAllocator(), yymsp[-1].minor.yy187, yymsp[-2].minor.yy72, yymsp[0].minor.yy378, NULL);
 		}
 	}
 	else {
-		yygotominor.yy158 = yymsp[-2].minor.yy158;
+		yygotominor.yy72 = yymsp[-2].minor.yy72;
 	}
 }
         break;
-      case 107: /* multiselect_op ::= UNION */
-{yygotominor.yy69 = SyntaxTree::SET_OP_UNION;}
+      case 116: /* multiselect_op ::= UNION */
+{yygotominor.yy187 = SyntaxTree::SET_OP_UNION;}
         break;
-      case 108: /* multiselect_op ::= UNION ALL */
-{yygotominor.yy69 = SyntaxTree::SET_OP_UNION_ALL;}
+      case 117: /* multiselect_op ::= UNION ALL */
+{yygotominor.yy187 = SyntaxTree::SET_OP_UNION_ALL;}
         break;
-      case 109: /* multiselect_op ::= EXCEPT */
-{yygotominor.yy69 = SyntaxTree::SET_OP_EXCEPT;}
+      case 118: /* multiselect_op ::= EXCEPT */
+{yygotominor.yy187 = SyntaxTree::SET_OP_EXCEPT;}
         break;
-      case 110: /* multiselect_op ::= INTERSECT */
-{yygotominor.yy69 = SyntaxTree::SET_OP_INTERSECT;}
+      case 119: /* multiselect_op ::= INTERSECT */
+{yygotominor.yy187 = SyntaxTree::SET_OP_INTERSECT;}
         break;
-      case 111: /* oneselect ::= SELECT hint_opt distinct selcollist from where_opt groupby_opt having_opt orderby_opt limit_opt */
+      case 120: /* oneselect ::= SELECT hint_opt distinct selcollist from where_opt groupby_opt having_opt orderby_opt limit_opt */
 {
 	/* yymsp[-9].minor.yy0: Token */
-	yygotominor.yy474 = SyntaxTree::Select::makeSelect(
+	yygotominor.yy378 = SyntaxTree::Select::makeSelect(
 			parser->getSQLAllocator(), SyntaxTree::CMD_SELECT,
-			yymsp[-6].minor.yy294, yymsp[-7].minor.yy168, yymsp[-5].minor.yy60, yymsp[-4].minor.yy60, yymsp[-3].minor.yy294, yymsp[-2].minor.yy60, yymsp[-1].minor.yy294, yymsp[0].minor.yy294, yymsp[-8].minor.yy294);
+			yymsp[-6].minor.yy304, yymsp[-7].minor.yy536, yymsp[-5].minor.yy512, yymsp[-4].minor.yy512, yymsp[-3].minor.yy304, yymsp[-2].minor.yy512, yymsp[-1].minor.yy304, yymsp[0].minor.yy304, yymsp[-8].minor.yy304);
 
-	if (yymsp[-8].minor.yy294 != NULL) {
+	if (yymsp[-8].minor.yy304 != NULL) {
 		const SyntaxTree::Select* hintSelect = parser->getHintSelect();
 		if (hintSelect != NULL && hintSelect->hintList_ != NULL &&
-				hintSelect->hintList_ != yymsp[-8].minor.yy294) {
+				hintSelect->hintList_ != yymsp[-8].minor.yy304) {
 			SQLToken token;
-			if (yymsp[-8].minor.yy294->size() > 0) {
-				token = yymsp[-8].minor.yy294->at(0)->startToken_;
+			if (yymsp[-8].minor.yy304->size() > 0) {
+				token = yymsp[-8].minor.yy304->at(0)->startToken_;
 			}
 			else if (hintSelect->hintList_->size() > 0) {
 				token = hintSelect->hintList_->at(0)->startToken_;
@@ -2089,30 +2282,30 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 					token, "Hint specified more than once");
 		}
 		else {
-			parser->setHintSelect(yygotominor.yy474);
+			parser->setHintSelect(yygotominor.yy378);
 		}
 	}
 
-	parser->currentSelect_ = yygotominor.yy474;
+	parser->currentSelect_ = yygotominor.yy378;
 	if (parser->childrenList_.size() > 0) {
 		for (size_t pos = 0; pos < parser->childrenList_.size(); ++pos) {
-			parser->childrenList_[pos]->parent_ = yygotominor.yy474;
+			parser->childrenList_[pos]->parent_ = yygotominor.yy378;
 		}
 		parser->childrenList_.clear();
 	}
-	parser->childrenList_.push_back(yygotominor.yy474);
+	parser->childrenList_.push_back(yygotominor.yy378);
 }
         break;
-      case 112: /* select ::= valuelist */
-{yygotominor.yy158 = yymsp[0].minor.yy158;}
+      case 121: /* select ::= valuelist */
+{yygotominor.yy72 = yymsp[0].minor.yy72;}
         break;
-      case 113: /* valuelist ::= VALUES LP nexprlist RP */
+      case 122: /* valuelist ::= VALUES LP nexprlist RP */
 {
 	SyntaxTree::Select* select =  SyntaxTree::Select::makeSelect(
 			parser->getSQLAllocator(), SyntaxTree::CMD_SELECT,
-			yymsp[-1].minor.yy294, SyntaxTree::AGGR_OPT_ALL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+			yymsp[-1].minor.yy304, SyntaxTree::AGGR_OPT_ALL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
-	yygotominor.yy158 = SyntaxTree::Set::makeSet(parser->getSQLAllocator(),
+	yygotominor.yy72 = SyntaxTree::Set::makeSet(parser->getSQLAllocator(),
 			SyntaxTree::SET_OP_NONE, select);
 	parser->currentSelect_ = select;
 	if (parser->childrenList_.size() > 0) {
@@ -2124,29 +2317,29 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->childrenList_.push_back(select);
 }
         break;
-      case 114: /* valuelist ::= valuelist COMMA LP exprlist RP */
+      case 123: /* valuelist ::= valuelist COMMA LP exprlist RP */
 {
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
 			parser->getSQLAllocator(), SyntaxTree::CMD_SELECT,
-			yymsp[-1].minor.yy294, SyntaxTree::AGGR_OPT_ALL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+			yymsp[-1].minor.yy304, SyntaxTree::AGGR_OPT_ALL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
 
-	assert(yymsp[-4].minor.yy158);
-	if (yymsp[-4].minor.yy158->type_ == SyntaxTree::SET_OP_NONE) {
-		assert(!yymsp[-4].minor.yy158->unionAllList_);
-		yymsp[-4].minor.yy158->unionAllList_ = ALLOC_NEW(parser->getSQLAllocator())
+	assert(yymsp[-4].minor.yy72);
+	if (yymsp[-4].minor.yy72->type_ == SyntaxTree::SET_OP_NONE) {
+		assert(!yymsp[-4].minor.yy72->unionAllList_);
+		yymsp[-4].minor.yy72->unionAllList_ = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::SelectList(parser->getSQLAllocator());
-		if (yymsp[-4].minor.yy158->right_) {
-			yymsp[-4].minor.yy158->unionAllList_->push_back(yymsp[-4].minor.yy158->right_);
-			yymsp[-4].minor.yy158->right_ = NULL;
+		if (yymsp[-4].minor.yy72->right_) {
+			yymsp[-4].minor.yy72->unionAllList_->push_back(yymsp[-4].minor.yy72->right_);
+			yymsp[-4].minor.yy72->right_ = NULL;
 		}
-		yymsp[-4].minor.yy158->type_ = SyntaxTree::SET_OP_UNION_ALL;
-		yygotominor.yy158 = yymsp[-4].minor.yy158;
-		yygotominor.yy158->unionAllList_->push_back(select);
+		yymsp[-4].minor.yy72->type_ = SyntaxTree::SET_OP_UNION_ALL;
+		yygotominor.yy72 = yymsp[-4].minor.yy72;
+		yygotominor.yy72->unionAllList_->push_back(select);
 	}
 	else {
-		assert(yymsp[-4].minor.yy158->type_ == SyntaxTree::SET_OP_UNION_ALL);
-		yygotominor.yy158 = yymsp[-4].minor.yy158;
-		yygotominor.yy158->unionAllList_->push_back(select);
+		assert(yymsp[-4].minor.yy72->type_ == SyntaxTree::SET_OP_UNION_ALL);
+		yygotominor.yy72 = yymsp[-4].minor.yy72;
+		yygotominor.yy72->unionAllList_->push_back(select);
 	}
 	parser->currentSelect_ = select;
 	if (parser->childrenList_.size() > 0) {
@@ -2158,36 +2351,36 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	parser->childrenList_.push_back(select);
 }
         break;
-      case 115: /* hint_opt ::= HINT_START hintlist HINT_END */
-      case 136: /* sclp ::= selcollist COMMA */ yytestcase(yyruleno==136);
+      case 124: /* hint_opt ::= HINT_START hintlist HINT_END */
+      case 145: /* sclp ::= selcollist COMMA */ yytestcase(yyruleno==145);
 {
-	yygotominor.yy294 = yymsp[-1].minor.yy294;
+	yygotominor.yy304 = yymsp[-1].minor.yy304;
 }
         break;
-      case 119: /* hintlist1 ::= hintlist1 onehint */
+      case 128: /* hintlist1 ::= hintlist1 onehint */
 {
-	if (!yymsp[-1].minor.yy294) {
-		yymsp[-1].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-1].minor.yy304) {
+		yymsp[-1].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	assert(yymsp[0].minor.yy60);
-	yymsp[-1].minor.yy294->push_back(yymsp[0].minor.yy60);
-	yygotominor.yy294 = yymsp[-1].minor.yy294;
+	assert(yymsp[0].minor.yy512);
+	yymsp[-1].minor.yy304->push_back(yymsp[0].minor.yy512);
+	yygotominor.yy304 = yymsp[-1].minor.yy304;
 }
         break;
-      case 120: /* hintlist1 ::= onehint */
+      case 129: /* hintlist1 ::= onehint */
 {
-	assert(yymsp[0].minor.yy60);
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	assert(yymsp[0].minor.yy512);
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
-	assert(yymsp[0].minor.yy60);
-	yygotominor.yy294->push_back(yymsp[0].minor.yy60);
+	assert(yymsp[0].minor.yy512);
+	yygotominor.yy304->push_back(yymsp[0].minor.yy512);
 }
         break;
-      case 121: /* onehint ::= ID LP hintexprlist RP */
+      case 130: /* onehint ::= ID LP hintexprlist RP */
 {
-	if (!yymsp[-1].minor.yy294) {
-		yymsp[-1].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-1].minor.yy304) {
+		yymsp[-1].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
 	SyntaxTree::Expr* hintExpr = SyntaxTree::Expr::makeExpr(
@@ -2196,44 +2389,44 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	hintExpr->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[-3].minor.yy0);
 
-	hintExpr->next_ = yymsp[-1].minor.yy294;
+	hintExpr->next_ = yymsp[-1].minor.yy304;
 	hintExpr->startToken_ = yymsp[-2].minor.yy0;
 	hintExpr->endToken_ = yymsp[0].minor.yy0;
 
-	yygotominor.yy60 = hintExpr;
+	yygotominor.yy512 = hintExpr;
 }
         break;
-      case 124: /* hintexprlist1 ::= hintexprlist1 hintexpr */
+      case 133: /* hintexprlist1 ::= hintexprlist1 hintexpr */
 {
-	if (!yymsp[-1].minor.yy294) {
-		yymsp[-1].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-1].minor.yy304) {
+		yymsp[-1].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	yymsp[-1].minor.yy294->push_back(yymsp[0].minor.yy60);
-	yygotominor.yy294 = yymsp[-1].minor.yy294;
+	yymsp[-1].minor.yy304->push_back(yymsp[0].minor.yy512);
+	yygotominor.yy304 = yymsp[-1].minor.yy304;
 }
         break;
-      case 125: /* hintexprlist1 ::= hintexpr */
-      case 184: /* limit_opt ::= LIMIT expr */ yytestcase(yyruleno==184);
-      case 275: /* nexprlist ::= expr */ yytestcase(yyruleno==275);
+      case 134: /* hintexprlist1 ::= hintexpr */
+      case 203: /* limit_opt ::= LIMIT expr */ yytestcase(yyruleno==203);
+      case 307: /* nexprlist ::= expr */ yytestcase(yyruleno==307);
 {
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yygotominor.yy294->push_back(yymsp[0].minor.yy60);
+	yygotominor.yy304->push_back(yymsp[0].minor.yy512);
 }
         break;
-      case 126: /* hintexpr ::= term */
-      case 145: /* from ::= FROM seltabtree */ yytestcase(yyruleno==145);
-      case 200: /* expr ::= term */ yytestcase(yyruleno==200);
+      case 135: /* hintexpr ::= term */
+      case 154: /* from ::= FROM seltabtree */ yytestcase(yyruleno==154);
+      case 219: /* expr ::= term */ yytestcase(yyruleno==219);
 {
-	yygotominor.yy60 = yymsp[0].minor.yy60;
+	yygotominor.yy512 = yymsp[0].minor.yy512;
 }
         break;
-      case 127: /* hintexpr ::= MINUS INTEGER */
+      case 136: /* hintexpr ::= MINUS INTEGER */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
-	yygotominor.yy60->startToken_ = yymsp[-1].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512->startToken_ = yymsp[-1].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 
 	util::String str(yymsp[-1].minor.yy0.value_, yymsp[-1].minor.yy0.value_ + yymsp[-1].minor.yy0.size_, parser->getSQLAllocator());
 	str.append(yymsp[0].minor.yy0.value_, yymsp[0].minor.yy0.size_);
@@ -2241,14 +2434,14 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	bool succeeded = SQLProcessor::ValueUtils::toLong(
 			str.c_str(), str.size(), int64Value);
 	if (succeeded) {
-		yygotominor.yy60->value_ = TupleValue(int64Value);
+		yygotominor.yy512->value_ = TupleValue(int64Value);
 	}
 	else {
 		double doubleValue;
 		bool succeeded = SQLProcessor::ValueUtils::toDouble(
 				str.c_str(), str.size(), doubleValue);
 		if (succeeded) {
-			yygotominor.yy60->value_ = TupleValue(doubleValue);
+			yygotominor.yy512->value_ = TupleValue(doubleValue);
 		}
 		else {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -2257,11 +2450,11 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 }
         break;
-      case 128: /* hintexpr ::= MINUS FLOAT */
+      case 137: /* hintexpr ::= MINUS FLOAT */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
-	yygotominor.yy60->startToken_ = yymsp[-1].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512->startToken_ = yymsp[-1].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 
 	util::String str(yymsp[-1].minor.yy0.value_, yymsp[-1].minor.yy0.value_ + yymsp[-1].minor.yy0.size_, parser->getSQLAllocator());
 	str.append(yymsp[0].minor.yy0.value_, yymsp[0].minor.yy0.size_);
@@ -2269,7 +2462,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	bool succeeded = SQLProcessor::ValueUtils::toDouble(
 			str.c_str(), str.size(), doubleValue);
 	if (succeeded) {
-		yygotominor.yy60->value_ = TupleValue(doubleValue);
+		yygotominor.yy512->value_ = TupleValue(doubleValue);
 	}
 	else {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -2277,99 +2470,99 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 }
         break;
-      case 129: /* hintexpr ::= LP hintexprlist1 RP */
+      case 138: /* hintexpr ::= LP hintexprlist1 RP */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0: Token */
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(
 			parser->getSQLAllocator(), SQLType::EXPR_LIST);
-	yygotominor.yy60->next_ = yymsp[-1].minor.yy294;
-	yygotominor.yy60->startToken_ = yymsp[-2].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->next_ = yymsp[-1].minor.yy304;
+	yygotominor.yy512->startToken_ = yymsp[-2].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 130: /* hintexpr ::= ID */
-      case 203: /* expr ::= ID */ yytestcase(yyruleno==203);
+      case 139: /* hintexpr ::= ID */
+      case 222: /* expr ::= ID */ yytestcase(yyruleno==222);
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, NULL, &yymsp[0].minor.yy0);
-	if (!yygotominor.yy60->qName_->name_) {
+	if (!yygotominor.yy512->qName_->name_) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"Zero-length delimited identifier");
 	}
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 131: /* hintexpr ::= nm DOT nm */
-      case 204: /* expr ::= nm DOT nm */ yytestcase(yyruleno==204);
+      case 140: /* hintexpr ::= nm DOT nm */
+      case 223: /* expr ::= nm DOT nm */ yytestcase(yyruleno==223);
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, &yymsp[-2].minor.yy0, &yymsp[0].minor.yy0);
-	if (!yygotominor.yy60->qName_->name_) {
+	if (!yygotominor.yy512->qName_->name_) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"Zero-length delimited identifier");
 	}
-	yygotominor.yy60->startToken_ = yymsp[-2].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[-2].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 132: /* hintexpr ::= nm DOT nm DOT nm */
-      case 205: /* expr ::= nm DOT nm DOT nm */ yytestcase(yyruleno==205);
+      case 141: /* hintexpr ::= nm DOT nm DOT nm */
+      case 224: /* expr ::= nm DOT nm DOT nm */ yytestcase(yyruleno==224);
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_COLUMN);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, &yymsp[-4].minor.yy0, &yymsp[-2].minor.yy0, &yymsp[0].minor.yy0);
-	if (!yygotominor.yy60->qName_->name_) {
+	if (!yygotominor.yy512->qName_->name_) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"Zero-length delimited identifier");
 	}
-	yygotominor.yy60->startToken_ = yymsp[-4].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[-4].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 133: /* distinct ::= DISTINCT */
-{yygotominor.yy168 = SyntaxTree::AGGR_OPT_DISTINCT;}
+      case 142: /* distinct ::= DISTINCT */
+{yygotominor.yy536 = SyntaxTree::AGGR_OPT_DISTINCT;}
         break;
-      case 134: /* distinct ::= ALL */
-      case 135: /* distinct ::= */ yytestcase(yyruleno==135);
-{yygotominor.yy168 = SyntaxTree::AGGR_OPT_ALL;}
+      case 143: /* distinct ::= ALL */
+      case 144: /* distinct ::= */ yytestcase(yyruleno==144);
+{yygotominor.yy536 = SyntaxTree::AGGR_OPT_ALL;}
         break;
-      case 137: /* sclp ::= */
-      case 183: /* limit_opt ::= */ yytestcase(yyruleno==183);
+      case 146: /* sclp ::= */
+      case 202: /* limit_opt ::= */ yytestcase(yyruleno==202);
 {
-	yygotominor.yy294 = 0;
+	yygotominor.yy304 = 0;
 }
         break;
-      case 138: /* selcollist ::= sclp expr as */
+      case 147: /* selcollist ::= sclp expr as */
 {
-	if (!yymsp[-2].minor.yy294) {
-		yymsp[-2].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-2].minor.yy304) {
+		yymsp[-2].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
 	if (yymsp[0].minor.yy0.size_ > 0) {
-		assert(yymsp[-1].minor.yy60);
-		yymsp[-1].minor.yy60->aliasName_ = SyntaxTree::tokenToString(
+		assert(yymsp[-1].minor.yy512);
+		yymsp[-1].minor.yy512->aliasName_ = SyntaxTree::tokenToString(
 				parser->getSQLAllocator(), yymsp[0].minor.yy0, true);
 	}
-	yygotominor.yy294 = yymsp[-2].minor.yy294;
-	yygotominor.yy294->push_back(yymsp[-1].minor.yy60);
+	yygotominor.yy304 = yymsp[-2].minor.yy304;
+	yygotominor.yy304->push_back(yymsp[-1].minor.yy512);
 }
         break;
-      case 139: /* selcollist ::= sclp STAR */
+      case 148: /* selcollist ::= sclp STAR */
 {
 	SyntaxTree::Expr* expr = SyntaxTree::Expr::makeExpr(
 			parser->getSQLAllocator(), SQLType::EXPR_ALL_COLUMN);
 
-	if (!yymsp[-1].minor.yy294) {
-		yymsp[-1].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-1].minor.yy304) {
+		yymsp[-1].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	yygotominor.yy294 = yymsp[-1].minor.yy294;
-	yygotominor.yy294->push_back(expr);
+	yygotominor.yy304 = yymsp[-1].minor.yy304;
+	yygotominor.yy304->push_back(expr);
 }
         break;
-      case 140: /* selcollist ::= sclp nm DOT STAR */
+      case 149: /* selcollist ::= sclp nm DOT STAR */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0:Token */
 	SyntaxTree::Expr* expr = SyntaxTree::Expr::makeExpr(
@@ -2377,41 +2570,41 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 
 	expr->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), parser->viewNsId_, NULL, &yymsp[-2].minor.yy0, NULL);
-	if (!yymsp[-3].minor.yy294) {
-		yymsp[-3].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-3].minor.yy304) {
+		yymsp[-3].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	yygotominor.yy294 = yymsp[-3].minor.yy294;
-	yygotominor.yy294->push_back(expr);
+	yygotominor.yy304 = yymsp[-3].minor.yy304;
+	yygotominor.yy304->push_back(expr);
 }
         break;
-      case 143: /* as ::= */
+      case 152: /* as ::= */
 {yygotominor.yy0.size_ = 0;}
         break;
-      case 144: /* from ::= */
+      case 153: /* from ::= */
 {
-	yygotominor.yy60 = 0;
+	yygotominor.yy512 = 0;
 }
         break;
-      case 146: /* stl_prefix ::= seltabtree joinop */
+      case 155: /* stl_prefix ::= seltabtree joinop */
 {
-	assert(yymsp[-1].minor.yy60);
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_JOIN);
-	yygotominor.yy60->joinOp_ = yymsp[0].minor.yy173;
-	yygotominor.yy60->left_ = yymsp[-1].minor.yy60;
-	yygotominor.yy60->right_ = NULL;
+	assert(yymsp[-1].minor.yy512);
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_JOIN);
+	yygotominor.yy512->joinOp_ = yymsp[0].minor.yy533;
+	yygotominor.yy512->left_ = yymsp[-1].minor.yy512;
+	yygotominor.yy512->right_ = NULL;
 }
         break;
-      case 147: /* stl_prefix ::= */
-{ yygotominor.yy60 = 0; }
+      case 156: /* stl_prefix ::= */
+{ yygotominor.yy512 = 0; }
         break;
-      case 148: /* seltabtree ::= stl_prefix nm dbnm as on_opt using_opt */
+      case 157: /* seltabtree ::= stl_prefix nm dbnm as on_opt using_opt */
 {
 	SyntaxTree::QualifiedName* qName = NULL;
-	if (!yymsp[-5].minor.yy60 && (yymsp[-1].minor.yy60 || yymsp[0].minor.yy294)) {
-		if (yymsp[-1].minor.yy60) {
+	if (!yymsp[-5].minor.yy512 && (yymsp[-1].minor.yy512 || yymsp[0].minor.yy304)) {
+		if (yymsp[-1].minor.yy512) {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
-					yymsp[-1].minor.yy60->startToken_, "JOIN clause is required before ON");
+					yymsp[-1].minor.yy512->startToken_, "JOIN clause is required before ON");
 		}
 		else {
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -2444,36 +2637,36 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		}
 		table->qName_->nsId_ = nsId;
 	}
-	if (!yymsp[-5].minor.yy60) {
-		yymsp[-5].minor.yy60 = table;
+	if (!yymsp[-5].minor.yy512) {
+		yymsp[-5].minor.yy512 = table;
 	}
 	else {
-		assert(yymsp[-5].minor.yy60->op_ == SQLType::EXPR_JOIN);
-		assert(yymsp[-5].minor.yy60->right_ == NULL);
-		yymsp[-5].minor.yy60->right_ = table;
+		assert(yymsp[-5].minor.yy512->op_ == SQLType::EXPR_JOIN);
+		assert(yymsp[-5].minor.yy512->right_ == NULL);
+		yymsp[-5].minor.yy512->right_ = table;
 
-		yymsp[-5].minor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
+		yymsp[-5].minor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
-		yymsp[-5].minor.yy60->next_->push_back(yymsp[-1].minor.yy60);  
-		if (yymsp[0].minor.yy294) {
-			yymsp[-5].minor.yy60->next_->reserve(1 + yymsp[0].minor.yy294->size());
-			yymsp[-5].minor.yy60->next_->insert(yymsp[-5].minor.yy60->next_->end(), yymsp[0].minor.yy294->begin(), yymsp[0].minor.yy294->end());
+		yymsp[-5].minor.yy512->next_->push_back(yymsp[-1].minor.yy512);  
+		if (yymsp[0].minor.yy304) {
+			yymsp[-5].minor.yy512->next_->reserve(1 + yymsp[0].minor.yy304->size());
+			yymsp[-5].minor.yy512->next_->insert(yymsp[-5].minor.yy512->next_->end(), yymsp[0].minor.yy304->begin(), yymsp[0].minor.yy304->end());
 		}
 		else {
-			yymsp[-5].minor.yy60->next_->push_back(NULL);
+			yymsp[-5].minor.yy512->next_->push_back(NULL);
 		}
 	}
-	yygotominor.yy60 = yymsp[-5].minor.yy60;
+	yygotominor.yy512 = yymsp[-5].minor.yy512;
 	parser->tableList_.push_back(table);
 }
         break;
-      case 149: /* seltabtree ::= stl_prefix nm dbnm LP exprlist RP as on_opt using_opt */
+      case 158: /* seltabtree ::= stl_prefix nm dbnm LP exprlist RP as on_opt using_opt */
 {
 	SyntaxTree::QualifiedName* qName = NULL;
-	if (!yymsp[-8].minor.yy60 && (yymsp[-1].minor.yy60 || yymsp[0].minor.yy294)) {
-		if (yymsp[-1].minor.yy60) {
+	if (!yymsp[-8].minor.yy512 && (yymsp[-1].minor.yy512 || yymsp[0].minor.yy304)) {
+		if (yymsp[-1].minor.yy512) {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
-					yymsp[-1].minor.yy60->startToken_, "JOIN clause is required before ON");
+					yymsp[-1].minor.yy512->startToken_, "JOIN clause is required before ON");
 		}
 		else {
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -2507,40 +2700,40 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		}
 		table->qName_->nsId_ = nsId;
 	}
-	if (yymsp[-4].minor.yy294) {
-		table->next_ = yymsp[-4].minor.yy294;
+	if (yymsp[-4].minor.yy304) {
+		table->next_ = yymsp[-4].minor.yy304;
 	}
-	if (!yymsp[-8].minor.yy60) {
-		yymsp[-8].minor.yy60 = table;
+	if (!yymsp[-8].minor.yy512) {
+		yymsp[-8].minor.yy512 = table;
 	}
 	else {
-		assert(yymsp[-8].minor.yy60->op_ == SQLType::EXPR_JOIN);
-		assert(yymsp[-8].minor.yy60->right_ == NULL);
-		yymsp[-8].minor.yy60->right_ = table;
+		assert(yymsp[-8].minor.yy512->op_ == SQLType::EXPR_JOIN);
+		assert(yymsp[-8].minor.yy512->right_ == NULL);
+		yymsp[-8].minor.yy512->right_ = table;
 
-		yymsp[-8].minor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
+		yymsp[-8].minor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
-		yymsp[-8].minor.yy60->next_->push_back(yymsp[-1].minor.yy60);  
-		if (yymsp[0].minor.yy294) {
-			yymsp[-8].minor.yy60->next_->reserve(1 + yymsp[0].minor.yy294->size());
-			yymsp[-8].minor.yy60->next_->insert(yymsp[-8].minor.yy60->next_->end(), yymsp[0].minor.yy294->begin(), yymsp[0].minor.yy294->end());
+		yymsp[-8].minor.yy512->next_->push_back(yymsp[-1].minor.yy512);  
+		if (yymsp[0].minor.yy304) {
+			yymsp[-8].minor.yy512->next_->reserve(1 + yymsp[0].minor.yy304->size());
+			yymsp[-8].minor.yy512->next_->insert(yymsp[-8].minor.yy512->next_->end(), yymsp[0].minor.yy304->begin(), yymsp[0].minor.yy304->end());
 		}
 		else {
-			yymsp[-8].minor.yy60->next_->push_back(NULL);
+			yymsp[-8].minor.yy512->next_->push_back(NULL);
 		}
 	}
-	yygotominor.yy60 = yymsp[-8].minor.yy60;
+	yygotominor.yy512 = yymsp[-8].minor.yy512;
 	parser->tableList_.push_back(table);
 }
         break;
-      case 150: /* seltabtree ::= stl_prefix LP select RP as on_opt using_opt */
+      case 159: /* seltabtree ::= stl_prefix LP select RP as on_opt using_opt */
 {
 
 	SyntaxTree::QualifiedName* qName = NULL;
-	if (!yymsp[-6].minor.yy60 && (yymsp[-1].minor.yy60 || yymsp[0].minor.yy294)) {
-		if (yymsp[-1].minor.yy60) {
+	if (!yymsp[-6].minor.yy512 && (yymsp[-1].minor.yy512 || yymsp[0].minor.yy304)) {
+		if (yymsp[-1].minor.yy512) {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
-					yymsp[-1].minor.yy60->startToken_, "JOIN clause is required before ON");
+					yymsp[-1].minor.yy512->startToken_, "JOIN clause is required before ON");
 		}
 		else {
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -2548,7 +2741,7 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		}
 	}
 	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
-		parser->getSQLAllocator(), NULL, yymsp[-4].minor.yy158);
+		parser->getSQLAllocator(), NULL, yymsp[-4].minor.yy72);
 	if (yymsp[-2].minor.yy0.size_ > 0) {
 		table->aliasName_ = SyntaxTree::tokenToString(
 				parser->getSQLAllocator(), yymsp[-2].minor.yy0, true);
@@ -2557,88 +2750,88 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-3].minor.yy0,
 				"Subquery in FROM must have an alias");
 	}
-	if (!yymsp[-6].minor.yy60) {
-		yymsp[-6].minor.yy60 = table;
+	if (!yymsp[-6].minor.yy512) {
+		yymsp[-6].minor.yy512 = table;
 	}
 	else {
-		assert(yymsp[-6].minor.yy60->op_ == SQLType::EXPR_JOIN);
-		assert(yymsp[-6].minor.yy60->right_ == NULL);
-		yymsp[-6].minor.yy60->right_ = table;
+		assert(yymsp[-6].minor.yy512->op_ == SQLType::EXPR_JOIN);
+		assert(yymsp[-6].minor.yy512->right_ == NULL);
+		yymsp[-6].minor.yy512->right_ = table;
 
-		yymsp[-6].minor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
+		yymsp[-6].minor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
-		yymsp[-6].minor.yy60->next_->push_back(yymsp[-1].minor.yy60);  
-		if (yymsp[0].minor.yy294) {
-			yymsp[-6].minor.yy60->next_->reserve(1 + yymsp[0].minor.yy294->size());
-			yymsp[-6].minor.yy60->next_->insert(yymsp[-6].minor.yy60->next_->end(), yymsp[0].minor.yy294->begin(), yymsp[0].minor.yy294->end());
+		yymsp[-6].minor.yy512->next_->push_back(yymsp[-1].minor.yy512);  
+		if (yymsp[0].minor.yy304) {
+			yymsp[-6].minor.yy512->next_->reserve(1 + yymsp[0].minor.yy304->size());
+			yymsp[-6].minor.yy512->next_->insert(yymsp[-6].minor.yy512->next_->end(), yymsp[0].minor.yy304->begin(), yymsp[0].minor.yy304->end());
 		}
 		else {
-			yymsp[-6].minor.yy60->next_->push_back(NULL);
+			yymsp[-6].minor.yy512->next_->push_back(NULL);
 		}
 	}
-	yygotominor.yy60 = yymsp[-6].minor.yy60;
+	yygotominor.yy512 = yymsp[-6].minor.yy512;
 	parser->tableList_.push_back(table);
 
-	if (yymsp[-4].minor.yy158 && yymsp[-4].minor.yy158->right_ && yymsp[-4].minor.yy158->right_->hintList_) {
+	if (yymsp[-4].minor.yy72 && yymsp[-4].minor.yy72->right_ && yymsp[-4].minor.yy72->right_->hintList_) {
 		SQLToken token;
-		if (yymsp[-4].minor.yy158->right_->hintList_->size() > 0) {
-			token = yymsp[-4].minor.yy158->right_->hintList_->at(0)->startToken_;
+		if (yymsp[-4].minor.yy72->right_->hintList_->size() > 0) {
+			token = yymsp[-4].minor.yy72->right_->hintList_->at(0)->startToken_;
 		}
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 				token, "Invalid hint found");
 	}
 }
         break;
-      case 151: /* seltabtree ::= stl_prefix LP seltabtree RP as on_opt using_opt */
+      case 160: /* seltabtree ::= stl_prefix LP seltabtree RP as on_opt using_opt */
 {
 
 	SyntaxTree::QualifiedName* qName = NULL;
-	if (!yymsp[-6].minor.yy60 && (yymsp[-1].minor.yy60 || yymsp[0].minor.yy294)) {
-		if (yymsp[-1].minor.yy60) {
+	if (!yymsp[-6].minor.yy512 && (yymsp[-1].minor.yy512 || yymsp[0].minor.yy304)) {
+		if (yymsp[-1].minor.yy512) {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
-					yymsp[-1].minor.yy60->startToken_, "JOIN clause is required before ON");
+					yymsp[-1].minor.yy512->startToken_, "JOIN clause is required before ON");
 		}
 		else {
 			GS_THROW_USER_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 					"JOIN clause is required before USING");
 		}
 	}
-	if (yymsp[-6].minor.yy60 == 0 && (yymsp[-2].minor.yy0.size_ == 0) && yymsp[-1].minor.yy60==0 && yymsp[0].minor.yy294==0) {
-		yygotominor.yy60 = yymsp[-4].minor.yy60;
+	if (yymsp[-6].minor.yy512 == 0 && (yymsp[-2].minor.yy0.size_ == 0) && yymsp[-1].minor.yy512==0 && yymsp[0].minor.yy304==0) {
+		yygotominor.yy512 = yymsp[-4].minor.yy512;
 	}
 	else {
 		if (yymsp[-2].minor.yy0.size_ > 0) {
-			yymsp[-4].minor.yy60->aliasName_ = SyntaxTree::tokenToString(
+			yymsp[-4].minor.yy512->aliasName_ = SyntaxTree::tokenToString(
 					parser->getSQLAllocator(), yymsp[-2].minor.yy0, true);
 		}
 
-		if (!yymsp[-6].minor.yy60) {
-			yymsp[-6].minor.yy60 = yymsp[-4].minor.yy60;
+		if (!yymsp[-6].minor.yy512) {
+			yymsp[-6].minor.yy512 = yymsp[-4].minor.yy512;
 		}
 		else {
-			assert(yymsp[-6].minor.yy60->op_ == SQLType::EXPR_JOIN);
-			assert(yymsp[-6].minor.yy60->right_ == NULL);
-			yymsp[-6].minor.yy60->right_ = yymsp[-4].minor.yy60;
+			assert(yymsp[-6].minor.yy512->op_ == SQLType::EXPR_JOIN);
+			assert(yymsp[-6].minor.yy512->right_ == NULL);
+			yymsp[-6].minor.yy512->right_ = yymsp[-4].minor.yy512;
 
-			yymsp[-6].minor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
+			yymsp[-6].minor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
 					SyntaxTree::ExprList(parser->getSQLAllocator());
-			yymsp[-6].minor.yy60->next_->push_back(yymsp[-1].minor.yy60);  
-			if (yymsp[0].minor.yy294) {
-				yymsp[-6].minor.yy60->next_->reserve(1 + yymsp[0].minor.yy294->size());
-				yymsp[-6].minor.yy60->next_->insert(yymsp[-6].minor.yy60->next_->end(), yymsp[0].minor.yy294->begin(), yymsp[0].minor.yy294->end());
+			yymsp[-6].minor.yy512->next_->push_back(yymsp[-1].minor.yy512);  
+			if (yymsp[0].minor.yy304) {
+				yymsp[-6].minor.yy512->next_->reserve(1 + yymsp[0].minor.yy304->size());
+				yymsp[-6].minor.yy512->next_->insert(yymsp[-6].minor.yy512->next_->end(), yymsp[0].minor.yy304->begin(), yymsp[0].minor.yy304->end());
 			}
 			else {
-				yymsp[-6].minor.yy60->next_->push_back(NULL);
+				yymsp[-6].minor.yy512->next_->push_back(NULL);
 			}
 		}
-		yygotominor.yy60 = yymsp[-6].minor.yy60;
+		yygotominor.yy512 = yymsp[-6].minor.yy512;
 	}
 }
         break;
-      case 152: /* dbnm ::= */
+      case 161: /* dbnm ::= */
 {yygotominor.yy0.value_ = 0; yygotominor.yy0.size_ = 0;}
         break;
-      case 154: /* fullname ::= nm dbnm */
+      case 163: /* fullname ::= nm dbnm */
 {
 	SyntaxTree::QualifiedName* qName = NULL;
 	if (yymsp[0].minor.yy0.size_ > 0) {
@@ -2649,120 +2842,164 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		qName = SyntaxTree::QualifiedName::makeQualifiedName(
 				parser->getSQLAllocator(), parser->viewNsId_, NULL, &yymsp[-1].minor.yy0, NULL);
 	}
-	yygotominor.yy295 = qName;
+	yygotominor.yy82 = qName;
 }
         break;
-      case 155: /* joinop ::= COMMA|JOIN */
-      case 156: /* joinop ::= INNER JOIN */ yytestcase(yyruleno==156);
-      case 157: /* joinop ::= CROSS JOIN */ yytestcase(yyruleno==157);
+      case 164: /* joinop ::= COMMA|JOIN */
+      case 165: /* joinop ::= INNER JOIN */ yytestcase(yyruleno==165);
+      case 166: /* joinop ::= CROSS JOIN */ yytestcase(yyruleno==166);
 {
-	yygotominor.yy173 = SQLType::JOIN_INNER;
+	yygotominor.yy533 = SQLType::JOIN_INNER;
 }
         break;
-      case 158: /* joinop ::= LEFT JOIN */
-      case 159: /* joinop ::= LEFT OUTER JOIN */ yytestcase(yyruleno==159);
+      case 167: /* joinop ::= LEFT JOIN */
+      case 168: /* joinop ::= LEFT OUTER JOIN */ yytestcase(yyruleno==168);
 {
-	yygotominor.yy173 = SQLType::JOIN_LEFT_OUTER;
+	yygotominor.yy533 = SQLType::JOIN_LEFT_OUTER;
 }
         break;
-      case 160: /* joinop ::= RIGHT JOIN */
-      case 161: /* joinop ::= RIGHT OUTER JOIN */ yytestcase(yyruleno==161);
+      case 169: /* joinop ::= RIGHT JOIN */
+      case 170: /* joinop ::= RIGHT OUTER JOIN */ yytestcase(yyruleno==170);
 {
-	yygotominor.yy173 = SQLType::JOIN_RIGHT_OUTER;
+	yygotominor.yy533 = SQLType::JOIN_RIGHT_OUTER;
 }
         break;
-      case 162: /* joinop ::= FULL JOIN */
+      case 171: /* joinop ::= FULL JOIN */
+      case 172: /* joinop ::= FULL OUTER JOIN */ yytestcase(yyruleno==172);
 {
-	SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
-			"FULL JOIN is not supported");
-	yygotominor.yy173 = SQLType::JOIN_FULL_OUTER;
+	yygotominor.yy533 = SQLType::JOIN_FULL_OUTER;
 }
         break;
-      case 163: /* joinop ::= FULL OUTER JOIN */
+      case 173: /* joinop ::= NATURAL JOIN */
+      case 174: /* joinop ::= NATURAL INNER JOIN */ yytestcase(yyruleno==174);
+      case 175: /* joinop ::= NATURAL CROSS JOIN */ yytestcase(yyruleno==175);
 {
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-2].minor.yy0,
-				"FULL OUTER JOIN is not supported");
-	yygotominor.yy173 = SQLType::JOIN_FULL_OUTER;
+	yygotominor.yy533 = SQLType::JOIN_NATURAL_INNER;
 }
         break;
-      case 164: /* joinop ::= NATURAL JOIN */
-      case 165: /* joinop ::= NATURAL INNER JOIN */ yytestcase(yyruleno==165);
-      case 166: /* joinop ::= NATURAL CROSS JOIN */ yytestcase(yyruleno==166);
+      case 176: /* joinop ::= NATURAL LEFT JOIN */
+      case 177: /* joinop ::= NATURAL LEFT OUTER JOIN */ yytestcase(yyruleno==177);
 {
-	yygotominor.yy173 = SQLType::JOIN_NATURAL_INNER;
+	yygotominor.yy533 = SQLType::JOIN_NATURAL_LEFT_OUTER;
 }
         break;
-      case 167: /* joinop ::= NATURAL LEFT JOIN */
-      case 168: /* joinop ::= NATURAL LEFT OUTER JOIN */ yytestcase(yyruleno==168);
+      case 178: /* joinop ::= NATURAL RIGHT JOIN */
+      case 179: /* joinop ::= NATURAL RIGHT OUTER JOIN */ yytestcase(yyruleno==179);
 {
-	yygotominor.yy173 = SQLType::JOIN_NATURAL_LEFT_OUTER;
+	yygotominor.yy533 = SQLType::JOIN_NATURAL_RIGHT_OUTER;
 }
         break;
-      case 169: /* joinop ::= NATURAL RIGHT JOIN */
-      case 170: /* joinop ::= NATURAL RIGHT OUTER JOIN */ yytestcase(yyruleno==170);
+      case 180: /* joinop ::= NATURAL FULL JOIN */
+      case 181: /* joinop ::= NATURAL FULL OUTER JOIN */ yytestcase(yyruleno==181);
 {
-	yygotominor.yy173 = SQLType::JOIN_NATURAL_RIGHT_OUTER;
+	yygotominor.yy533 = SQLType::JOIN_NATURAL_FULL_OUTER;
 }
         break;
-      case 171: /* on_opt ::= ON expr */
-      case 182: /* having_opt ::= HAVING expr */ yytestcase(yyruleno==182);
-      case 188: /* where_opt ::= WHERE expr */ yytestcase(yyruleno==188);
-{yygotominor.yy60 = yymsp[0].minor.yy60;}
+      case 182: /* on_opt ::= ON expr */
+      case 201: /* having_opt ::= HAVING expr */ yytestcase(yyruleno==201);
+      case 207: /* where_opt ::= WHERE expr */ yytestcase(yyruleno==207);
+{yygotominor.yy512 = yymsp[0].minor.yy512;}
         break;
-      case 172: /* on_opt ::= */
-      case 181: /* having_opt ::= */ yytestcase(yyruleno==181);
-      case 187: /* where_opt ::= */ yytestcase(yyruleno==187);
-      case 269: /* case_else ::= */ yytestcase(yyruleno==269);
-      case 271: /* case_operand ::= */ yytestcase(yyruleno==271);
-{yygotominor.yy60 = 0;}
+      case 183: /* on_opt ::= */
+      case 200: /* having_opt ::= */ yytestcase(yyruleno==200);
+      case 206: /* where_opt ::= */ yytestcase(yyruleno==206);
+      case 301: /* case_else ::= */ yytestcase(yyruleno==301);
+      case 303: /* case_operand ::= */ yytestcase(yyruleno==303);
+{yygotominor.yy512 = 0;}
         break;
-      case 173: /* using_opt ::= USING LP idlist RP */
-      case 197: /* inscollist_opt ::= LP idlist RP */ yytestcase(yyruleno==197);
-{yygotominor.yy294 = yymsp[-1].minor.yy294;}
+      case 184: /* using_opt ::= USING LP idlist RP */
+      case 216: /* inscollist_opt ::= LP idlist RP */ yytestcase(yyruleno==216);
+{yygotominor.yy304 = yymsp[-1].minor.yy304;}
         break;
-      case 177: /* sortlist ::= sortlist COMMA expr sortascending */
+      case 188: /* sortlist ::= sortlist COMMA expr sortascending */
 {
-	if (!yymsp[-3].minor.yy294) {
-		yymsp[-3].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-3].minor.yy304) {
+		yymsp[-3].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	yymsp[-1].minor.yy60->sortAscending_ = yymsp[0].minor.yy371;
-	yymsp[-3].minor.yy294->push_back(yymsp[-1].minor.yy60);
-	yygotominor.yy294 = yymsp[-3].minor.yy294;
+	yymsp[-1].minor.yy512->sortAscending_ = yymsp[0].minor.yy209;
+	yymsp[-3].minor.yy304->push_back(yymsp[-1].minor.yy512);
+	yygotominor.yy304 = yymsp[-3].minor.yy304;
 }
         break;
-      case 178: /* sortlist ::= expr sortascending */
+      case 189: /* sortlist ::= expr sortascending */
 {
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yymsp[-1].minor.yy60->sortAscending_ = yymsp[0].minor.yy371;
-	yygotominor.yy294->push_back(yymsp[-1].minor.yy60);
+	yymsp[-1].minor.yy512->sortAscending_ = yymsp[0].minor.yy209;
+	yygotominor.yy304->push_back(yymsp[-1].minor.yy512);
 }
         break;
-      case 185: /* limit_opt ::= LIMIT expr OFFSET expr */
+      case 192: /* groupby_opt ::= GROUP BY RANGE LP expr RP groupIntervalOption groupFillOption */
 {
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
-			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yygotominor.yy294->push_back(yymsp[-2].minor.yy60);
-	yygotominor.yy294->push_back(yymsp[0].minor.yy60);
+	yygotominor.yy304 = SyntaxTree::makeRangeGroupOption(
+			parser->getSQLAllocator(), yymsp[-3].minor.yy512, yymsp[0].minor.yy512, yymsp[-1].minor.yy319.base_.value_,
+			yymsp[-1].minor.yy319.base_.unit_, yymsp[-1].minor.yy319.detail_.offset_, yymsp[-1].minor.yy319.detail_.timeZone_,
+			yymsp[-1].minor.yy319.detail_.withTimeZone_);
 }
         break;
-      case 186: /* limit_opt ::= LIMIT expr COMMA expr */
+      case 193: /* groupFillOption ::= */
 {
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
-			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yygotominor.yy294->push_back(yymsp[0].minor.yy60);  
-	yygotominor.yy294->push_back(yymsp[-2].minor.yy60);  
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(
+			parser->getSQLAllocator(), SQLType::EXPR_RANGE_FILL_NULL);
 }
         break;
-      case 189: /* cmd ::= hint_opt DELETE hint_opt FROM fullname as where_opt */
+      case 194: /* groupFillOption ::= FILL LP groupFillOptionBase RP */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), yymsp[-1].minor.yy284);
+}
+        break;
+      case 195: /* groupFillOptionBase ::= NULL */
+{
+	yygotominor.yy284 = SQLType::EXPR_RANGE_FILL_NULL;
+}
+        break;
+      case 196: /* groupFillOptionBase ::= NONE */
+{
+	yygotominor.yy284 = SQLType::EXPR_RANGE_FILL_NONE;
+}
+        break;
+      case 197: /* groupFillOptionBase ::= LINEAR */
+{
+	yygotominor.yy284 = SQLType::EXPR_RANGE_FILL_LINEAR;
+}
+        break;
+      case 198: /* groupFillOptionBase ::= PREVIOUS */
+{
+	yygotominor.yy284 = SQLType::EXPR_RANGE_FILL_PREV;
+}
+        break;
+      case 199: /* groupFillOptionBase ::= ID */
+{
+	SQL_PARSER_THROW_ERROR(
+			GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
+			"Unknown group fill option");
+}
+        break;
+      case 204: /* limit_opt ::= LIMIT expr OFFSET expr */
+{
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
+			SyntaxTree::ExprList(parser->getSQLAllocator());
+	yygotominor.yy304->push_back(yymsp[-2].minor.yy512);
+	yygotominor.yy304->push_back(yymsp[0].minor.yy512);
+}
+        break;
+      case 205: /* limit_opt ::= LIMIT expr COMMA expr */
+{
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
+			SyntaxTree::ExprList(parser->getSQLAllocator());
+	yygotominor.yy304->push_back(yymsp[0].minor.yy512);  
+	yygotominor.yy304->push_back(yymsp[-2].minor.yy512);  
+}
+        break;
+      case 208: /* cmd ::= hint_opt DELETE hint_opt FROM fullname as where_opt */
 {
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
 		parser->getSQLAllocator(), SyntaxTree::CMD_DELETE);
-	select->targetName_ = yymsp[-2].minor.yy295;
-	select->where_ = yymsp[0].minor.yy60;
-	if (yymsp[-6].minor.yy294 || yymsp[-4].minor.yy294) {
-		select->hintList_ = yymsp[-6].minor.yy294 ? yymsp[-6].minor.yy294 : yymsp[-4].minor.yy294;
+	select->targetName_ = yymsp[-2].minor.yy82;
+	select->where_ = yymsp[0].minor.yy512;
+	if (yymsp[-6].minor.yy304 || yymsp[-4].minor.yy304) {
+		select->hintList_ = yymsp[-6].minor.yy304 ? yymsp[-6].minor.yy304 : yymsp[-4].minor.yy304;
 	}
 	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
 			parser->getSQLAllocator(), select->targetName_, NULL);
@@ -2785,16 +3022,16 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 }
         break;
-      case 190: /* cmd ::= hint_opt UPDATE hint_opt orconf fullname as SET setlist where_opt */
+      case 209: /* cmd ::= hint_opt UPDATE hint_opt orconf fullname as SET setlist where_opt */
 {
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
 		parser->getSQLAllocator(), SyntaxTree::CMD_UPDATE);
-	select->targetName_ = yymsp[-4].minor.yy295;
-	select->updateSetList_ = yymsp[-1].minor.yy294;
-	select->where_ = yymsp[0].minor.yy60;
-	select->cmdOptionValue_ = yymsp[-5].minor.yy428;
-	if (yymsp[-8].minor.yy294 || yymsp[-6].minor.yy294) {
-		select->hintList_ = yymsp[-8].minor.yy294 ? yymsp[-8].minor.yy294 : yymsp[-6].minor.yy294;
+	select->targetName_ = yymsp[-4].minor.yy82;
+	select->updateSetList_ = yymsp[-1].minor.yy304;
+	select->where_ = yymsp[0].minor.yy512;
+	select->cmdOptionValue_ = yymsp[-5].minor.yy262;
+	if (yymsp[-8].minor.yy304 || yymsp[-6].minor.yy304) {
+		select->hintList_ = yymsp[-8].minor.yy304 ? yymsp[-8].minor.yy304 : yymsp[-6].minor.yy304;
 	}
 	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
 			parser->getSQLAllocator(), select->targetName_, NULL);
@@ -2817,10 +3054,10 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 }
         break;
-      case 191: /* setlist ::= setlist COMMA nm EQ expr */
+      case 210: /* setlist ::= setlist COMMA nm EQ expr */
 {
-	if (!yymsp[-4].minor.yy294) {
-		yymsp[-4].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-4].minor.yy304) {
+		yymsp[-4].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
 	SyntaxTree::Expr* opExpr = SyntaxTree::Expr::makeExpr(
@@ -2837,14 +3074,14 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 				"Column name must not be empty");
 	}
 	opExpr->left_ = nameExpr;
-	opExpr->right_ = yymsp[0].minor.yy60;
-	yygotominor.yy294 = yymsp[-4].minor.yy294;
-	yygotominor.yy294->push_back(opExpr);
+	opExpr->right_ = yymsp[0].minor.yy512;
+	yygotominor.yy304 = yymsp[-4].minor.yy304;
+	yygotominor.yy304->push_back(opExpr);
 }
         break;
-      case 192: /* setlist ::= nm EQ expr */
+      case 211: /* setlist ::= nm EQ expr */
 {
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
 	SyntaxTree::Expr* opExpr = SyntaxTree::Expr::makeExpr(
 			parser->getSQLAllocator(), SQLType::OP_EQ);
@@ -2860,20 +3097,20 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 				"Column name must not be empty");
 	}
 	opExpr->left_ = nameExpr;
-	opExpr->right_ = yymsp[0].minor.yy60;
-	yygotominor.yy294->push_back(opExpr);
+	opExpr->right_ = yymsp[0].minor.yy512;
+	yygotominor.yy304->push_back(opExpr);
 }
         break;
-      case 193: /* cmd ::= hint_opt insert_cmd hint_opt INTO fullname inscollist_opt select */
+      case 212: /* cmd ::= hint_opt insert_cmd hint_opt INTO fullname inscollist_opt select */
 {
 	SyntaxTree::Select* select = SyntaxTree::Select::makeSelect(
 			parser->getSQLAllocator(), SyntaxTree::CMD_INSERT);
-	select->targetName_ = yymsp[-2].minor.yy295;
-	select->insertSet_ = yymsp[0].minor.yy158;
-	select->insertList_ = yymsp[-1].minor.yy294;
-	select->cmdOptionValue_ = yymsp[-5].minor.yy78;
-	if (yymsp[-6].minor.yy294 || yymsp[-4].minor.yy294) {
-		select->hintList_ = yymsp[-6].minor.yy294 ? yymsp[-6].minor.yy294 : yymsp[-4].minor.yy294;
+	select->targetName_ = yymsp[-2].minor.yy82;
+	select->insertSet_ = yymsp[0].minor.yy72;
+	select->insertList_ = yymsp[-1].minor.yy304;
+	select->cmdOptionValue_ = yymsp[-5].minor.yy401;
+	if (yymsp[-6].minor.yy304 || yymsp[-4].minor.yy304) {
+		select->hintList_ = yymsp[-6].minor.yy304 ? yymsp[-6].minor.yy304 : yymsp[-4].minor.yy304;
 	}
 
 	SyntaxTree::Expr* table = SyntaxTree::Expr::makeTable(
@@ -2890,26 +3127,26 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		parser->childrenList_.clear();
 	}
 
-	if (yymsp[0].minor.yy158 && yymsp[0].minor.yy158->right_ && yymsp[0].minor.yy158->right_->hintList_) {
+	if (yymsp[0].minor.yy72 && yymsp[0].minor.yy72->right_ && yymsp[0].minor.yy72->right_->hintList_) {
 		SQLToken token;
-		if (yymsp[0].minor.yy158->right_->hintList_->size() > 0) {
-			token = yymsp[0].minor.yy158->right_->hintList_->at(0)->startToken_;
+		if (yymsp[0].minor.yy72->right_->hintList_->size() > 0) {
+			token = yymsp[0].minor.yy72->right_->hintList_->at(0)->startToken_;
 		}
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 				token, "Invalid hint found");
 	}
 }
         break;
-      case 194: /* insert_cmd ::= INSERT orconf */
-{yygotominor.yy78 = yymsp[0].minor.yy428;}
+      case 213: /* insert_cmd ::= INSERT orconf */
+{yygotominor.yy401 = yymsp[0].minor.yy262;}
         break;
-      case 195: /* insert_cmd ::= REPLACE */
-{yygotominor.yy78 = SyntaxTree::RESOLVETYPE_REPLACE;}
+      case 214: /* insert_cmd ::= REPLACE */
+{yygotominor.yy401 = SyntaxTree::RESOLVETYPE_REPLACE;}
         break;
-      case 198: /* idlist ::= idlist COMMA nm */
+      case 217: /* idlist ::= idlist COMMA nm */
 {
-	if (!yymsp[-2].minor.yy294) {
-		yymsp[-2].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-2].minor.yy304) {
+		yymsp[-2].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
 	SyntaxTree::Expr* nameExpr = SyntaxTree::Expr::makeExpr(
@@ -2922,13 +3159,13 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"Column name must not be empty");
 	}
-	yygotominor.yy294 = yymsp[-2].minor.yy294;
-	yygotominor.yy294->push_back(nameExpr);
+	yygotominor.yy304 = yymsp[-2].minor.yy304;
+	yygotominor.yy304->push_back(nameExpr);
 }
         break;
-      case 199: /* idlist ::= nm */
+      case 218: /* idlist ::= nm */
 {
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
 
 	SyntaxTree::Expr* nameExpr = SyntaxTree::Expr::makeExpr(
@@ -2941,40 +3178,40 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
 				"Column name must not be empty");
 	}
-	yygotominor.yy294->push_back(nameExpr);
+	yygotominor.yy304->push_back(nameExpr);
 }
         break;
-      case 201: /* expr ::= LP expr RP */
+      case 220: /* expr ::= LP expr RP */
 {
 	/* yymsp[-2].minor.yy0, yymsp[0].minor.yy0: Token */
-	yygotominor.yy60 = yymsp[-1].minor.yy60;
-	yygotominor.yy60->startToken_ = yymsp[-2].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = yymsp[-1].minor.yy512;
+	yygotominor.yy512->startToken_ = yymsp[-2].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 202: /* term ::= NULL */
+      case 221: /* term ::= NULL */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
-	yygotominor.yy60->value_ = TupleValue(&SyntaxTree::NULL_VALUE_RAW_DATA, TupleList::TYPE_ANY);
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512->value_ = TupleValue(&SyntaxTree::NULL_VALUE_RAW_DATA, TupleList::TYPE_ANY);
 }
         break;
-      case 206: /* term ::= INTEGER */
+      case 225: /* term ::= INTEGER */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 
 	int64_t int64Value;
 	bool succeeded = SQLProcessor::ValueUtils::toLong(
 		yymsp[0].minor.yy0.value_, yymsp[0].minor.yy0.size_, int64Value);
 	if (succeeded) {
-		yygotominor.yy60->value_ = TupleValue(int64Value);
+		yygotominor.yy512->value_ = TupleValue(int64Value);
 	}
 	else {
 		double doubleValue;
 		bool succeeded = SQLProcessor::ValueUtils::toDouble(
 				yymsp[0].minor.yy0.value_, yymsp[0].minor.yy0.size_, doubleValue);
 		if (succeeded) {
-			yygotominor.yy60->value_ = TupleValue(doubleValue);
+			yygotominor.yy512->value_ = TupleValue(doubleValue);
 		}
 		else {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -2983,16 +3220,16 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 }
         break;
-      case 207: /* term ::= FLOAT */
+      case 226: /* term ::= FLOAT */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
 
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 	double doubleValue;
 	bool succeeded = SQLProcessor::ValueUtils::toDouble(
 			yymsp[0].minor.yy0.value_, yymsp[0].minor.yy0.size_, doubleValue);
 	if (succeeded) {
-		yygotominor.yy60->value_ = TupleValue(doubleValue);
+		yygotominor.yy512->value_ = TupleValue(doubleValue);
 	}
 	else {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -3000,439 +3237,486 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 	}
 }
         break;
-      case 208: /* term ::= TRUE */
+      case 227: /* term ::= TRUE */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
-	yygotominor.yy60->value_ = TupleValue(true);
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512->value_ = TupleValue(true);
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 209: /* term ::= FALSE */
+      case 228: /* term ::= FALSE */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
-	yygotominor.yy60->value_ = TupleValue(false);
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512->value_ = TupleValue(false);
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 210: /* term ::= BLOB */
+      case 229: /* term ::= BLOB */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
 	assert(yymsp[0].minor.yy0.size_ >= 3); 
 	util::String hexStr(yymsp[0].minor.yy0.value_ + 2, yymsp[0].minor.yy0.value_ + yymsp[0].minor.yy0.size_ - 1, parser->getSQLAllocator());
 	util::XArray<char> buffer(parser->getSQLAllocator());
 	char temp = 0;
 	buffer.assign(hexStr.size() / 2 + 1, temp);
 	size_t byteSize = util::HexConverter::decode(buffer.data(), hexStr.c_str(), hexStr.size());
-	yygotominor.yy60->value_ = SyntaxTree::makeBlobValue(
+	yygotominor.yy512->value_ = SyntaxTree::makeBlobValue(
 		parser->getVarContext(), buffer.data(), byteSize);
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 211: /* term ::= STRING */
+      case 230: /* term ::= STRING */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
 	util::String* str = SyntaxTree::tokenToString(
 			parser->getSQLAllocator(), yymsp[0].minor.yy0, true);
 	if (!str) {
 		str = ALLOC_NEW(parser->getSQLAllocator())
 				util::String("", parser->getSQLAllocator());
 	}
-	yygotominor.yy60->value_ = SyntaxTree::makeStringValue(
+	yygotominor.yy512->value_ = SyntaxTree::makeStringValue(
 			parser->getSQLAllocator(), str->c_str(), str->size());
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 212: /* expr ::= VARIABLE */
+      case 231: /* expr ::= VARIABLE */
 {
 	/* yymsp[0].minor.yy0: Token */
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_PLACEHOLDER);
-	yygotominor.yy60->placeHolderCount_ = ++parser->placeHolderCount_;
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_PLACEHOLDER);
+	yygotominor.yy512->placeHolderCount_ = ++parser->placeHolderCount_;
+	yygotominor.yy512->startToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 213: /* expr ::= CAST LP expr AS typetoken RP */
+      case 232: /* expr ::= CAST LP expr AS typetoken RP */
 {
 	/* yymsp[-5].minor.yy0, yymsp[0].minor.yy0: Token */
 
-	util::String* typeStr = SyntaxTree::tokenToString(
-			parser->getSQLAllocator(), yymsp[-1].minor.yy0, false);
-	if (!typeStr) {
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
-				"Type name must not be empty");
-	}
-	TupleList::TupleColumnType colType = SyntaxTree::toColumnType(typeStr->c_str());
+	TupleList::TupleColumnType colType = yymsp[-1].minor.yy359;
 	if (colType == TupleList::TYPE_NULL) {
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
-				"Syntax error at or near \"" << typeStr->c_str() << "\"");
+		SQL_PARSER_THROW_ERROR(
+				GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-5].minor.yy0,
+				"NULL type must not be specified on CAST expression");
 	}
 	SyntaxTree::Expr *typeExpr = SyntaxTree::Expr::makeExpr(
 			parser->getSQLAllocator(), SQLType::EXPR_TYPE);
 	typeExpr->columnType_ = colType;
 
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(*parser, 
-			SQLType::OP_CAST, yymsp[-3].minor.yy60, typeExpr);
-	yygotominor.yy60->startToken_ = yymsp[-5].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(*parser, 
+			SQLType::OP_CAST, yymsp[-3].minor.yy512, typeExpr);
+	yygotominor.yy512->startToken_ = yymsp[-5].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 214: /* expr ::= EXTRACT LP field COMMA exprlist RP */
-      case 215: /* expr ::= TIMESTAMPADD LP field COMMA exprlist RP */ yytestcase(yyruleno==215);
-      case 216: /* expr ::= TIMESTAMPDIFF LP field COMMA exprlist RP */ yytestcase(yyruleno==216);
-      case 217: /* expr ::= TIMESTAMP_TRUNC LP field COMMA exprlist RP */ yytestcase(yyruleno==217);
+      case 233: /* expr ::= EXTRACT LP field COMMA exprlist RP */
+      case 234: /* expr ::= TIMESTAMPADD LP field COMMA exprlist RP */ yytestcase(yyruleno==234);
+      case 235: /* expr ::= TIMESTAMPDIFF LP field COMMA exprlist RP */ yytestcase(yyruleno==235);
+      case 236: /* expr ::= TIMESTAMP_TRUNC LP field COMMA exprlist RP */ yytestcase(yyruleno==236);
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-5].minor.yy0);
 
-	assert(yymsp[-3].minor.yy60);
-	yygotominor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
+	assert(yymsp[-3].minor.yy512);
+	yygotominor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yygotominor.yy60->next_->push_back(yymsp[-3].minor.yy60);
-	yygotominor.yy60->next_->reserve(yygotominor.yy60->next_->size() + yymsp[-1].minor.yy294->size());
-	std::copy(yymsp[-1].minor.yy294->begin(), yymsp[-1].minor.yy294->end(), std::back_inserter(*yygotominor.yy60->next_));
-	yygotominor.yy60->startToken_ = yymsp[-5].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->next_->push_back(yymsp[-3].minor.yy512);
+	yygotominor.yy512->next_->reserve(yygotominor.yy512->next_->size() + yymsp[-1].minor.yy304->size());
+	std::copy(yymsp[-1].minor.yy304->begin(), yymsp[-1].minor.yy304->end(), std::back_inserter(*yygotominor.yy512->next_));
+	yygotominor.yy512->startToken_ = yymsp[-5].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 218: /* field ::= YEAR|MONTH|DAY|HOUR|MINUTE|SECOND|MILLISECOND|DAY_OF_WEEK|DAY_OF_YEAR */
+      case 237: /* field ::= fieldType */
 {
-	util::DateTime::FieldType fieldType;
-	switch (yymsp[0].minor.yy0.id_) {
-	case TK_YEAR:
-		fieldType = util::DateTime::FIELD_YEAR;
-		break;
-	case TK_MONTH:
-		fieldType = util::DateTime::FIELD_MONTH;
-		break;
-	case TK_DAY:
-		fieldType  = util::DateTime::FIELD_DAY_OF_MONTH;
-		break;
-	case TK_HOUR:
-		fieldType  = util::DateTime::FIELD_HOUR;
-		break;
-	case TK_MINUTE:
-		fieldType  = util::DateTime::FIELD_MINUTE;
-		break;
-	case TK_SECOND:
-		fieldType  = util::DateTime::FIELD_SECOND;
-		break;
-	case TK_MILLISECOND:
-		fieldType  = util::DateTime::FIELD_MILLISECOND;
-		break;
-	case TK_DAY_OF_WEEK:
-		fieldType  = util::DateTime::FIELD_DAY_OF_WEEK;
-		break;
-	case TK_DAY_OF_YEAR:
-		fieldType  = util::DateTime::FIELD_DAY_OF_YEAR;
-		break;
-	default:
-		yygotominor.yy60 = NULL;
-		util::String* fieldStr = SyntaxTree::tokenToString(
-				parser->getSQLAllocator(), yymsp[0].minor.yy0, false);
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
-				"Unknwon field: " << fieldStr->c_str());
-		break;
-	}
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
-	yygotominor.yy60->value_ = TupleValue(static_cast<int64_t>(fieldType));
-	yygotominor.yy60->startToken_ = yymsp[0].minor.yy0;
+	const util::DateTime::FieldType unit = yymsp[0].minor.yy122.unit_;
+	const SQLToken &unitToken = yymsp[0].minor.yy122.token_;
+
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(
+			parser->getSQLAllocator(), SQLType::EXPR_CONSTANT);
+	yygotominor.yy512->value_ = TupleValue(static_cast<int64_t>(unit));
+	yygotominor.yy512->startToken_ = unitToken;
 }
         break;
-      case 219: /* expr ::= ID LP distinct exprlist RP window_opt */
+      case 238: /* fieldType ::= YEAR */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_YEAR, yymsp[0].minor.yy0);
+}
+        break;
+      case 239: /* fieldType ::= MONTH */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_MONTH, yymsp[0].minor.yy0);
+}
+        break;
+      case 240: /* fieldType ::= DAY */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_DAY_OF_MONTH, yymsp[0].minor.yy0);
+}
+        break;
+      case 241: /* fieldType ::= HOUR */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_HOUR, yymsp[0].minor.yy0);
+}
+        break;
+      case 242: /* fieldType ::= MINUTE */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_MINUTE, yymsp[0].minor.yy0);
+}
+        break;
+      case 243: /* fieldType ::= SECOND */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_SECOND, yymsp[0].minor.yy0);
+}
+        break;
+      case 244: /* fieldType ::= MILLISECOND */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_MILLISECOND, yymsp[0].minor.yy0);
+}
+        break;
+      case 245: /* fieldType ::= MICROSECOND */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_MICROSECOND, yymsp[0].minor.yy0);
+}
+        break;
+      case 246: /* fieldType ::= NANOSECOND */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_NANOSECOND, yymsp[0].minor.yy0);
+}
+        break;
+      case 247: /* fieldType ::= DAY_OF_WEEK */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_DAY_OF_WEEK, yymsp[0].minor.yy0);
+}
+        break;
+      case 248: /* fieldType ::= DAY_OF_YEAR */
+{
+	yygotominor.yy122 = DateTimeField::of(util::DateTime::FIELD_DAY_OF_YEAR, yymsp[0].minor.yy0);
+}
+        break;
+      case 249: /* fieldType ::= ID */
+{
+	util::String* fieldStr = SyntaxTree::tokenToString(
+			parser->getSQLAllocator(), yymsp[0].minor.yy0, false);
+	SQL_PARSER_THROW_ERROR(
+			GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[0].minor.yy0,
+			"Unknown field: " << *fieldStr);
+}
+        break;
+      case 250: /* expr ::= ID LP distinct exprlist RP window_opt */
 {
 	/* yymsp[-4].minor.yy0,yymsp[-1].minor.yy0: Token */
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-5].minor.yy0);
-	if (!yygotominor.yy60->qName_->name_) {
+	if (!yygotominor.yy512->qName_->name_) {
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-5].minor.yy0,
 				"Zero-length delimited identifier");
 	}
-	yygotominor.yy60->next_ = yymsp[-2].minor.yy294;
-	if (yymsp[-3].minor.yy168) {
-#if SQL_PARSER_ENABLE_DISTINCT_WITHIN_AGGREGATE_FUNCTION
-		yygotominor.yy60->aggrOpts_ = SyntaxTree::AGGR_OPT_DISTINCT;
-#else
-		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-4].minor.yy0,
-				"Not supported");
-#endif
+	yygotominor.yy512->next_ = yymsp[-2].minor.yy304;
+	if (yymsp[-3].minor.yy536) {
+		yygotominor.yy512->aggrOpts_ = SyntaxTree::AGGR_OPT_DISTINCT;
 	}
-	if (yymsp[0].minor.yy115) {
+	if (yymsp[0].minor.yy139) {
 #if SQL_PARSER_ENABLE_WINDOW_FUNCTION
-		if (yymsp[-3].minor.yy168) {
+		if (yymsp[-3].minor.yy536) {
 			SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-4].minor.yy0,
 					"Use of DISTINCT is not allowed with the OVER clause");
 		}
-		yygotominor.yy60->windowOpt_ = yymsp[0].minor.yy115;
+		yygotominor.yy512->windowOpt_ = yymsp[0].minor.yy139;
 #else
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"Not supported");
 #endif
 	}
-	yygotominor.yy60->startToken_ = yymsp[-5].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[-1].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[-5].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[-1].minor.yy0;
 }
         break;
-      case 220: /* expr ::= ID LP STAR RP window_opt */
+      case 251: /* expr ::= ID LP STAR RP window_opt */
 { 
 	/* yymsp[-1].minor.yy0: Token */
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
 			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-4].minor.yy0);
 
-	yygotominor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
 			ExprList(parser->getSQLAllocator());
 	SyntaxTree::Expr* star = SyntaxTree::Expr::makeExpr(
 			parser->getSQLAllocator(), SQLType::EXPR_ALL_COLUMN);
-	yygotominor.yy60->next_->push_back(star);
-	if (yymsp[0].minor.yy115) {
+	yygotominor.yy512->next_->push_back(star);
+	if (yymsp[0].minor.yy139) {
 #if SQL_PARSER_ENABLE_WINDOW_FUNCTION
-		yygotominor.yy60->windowOpt_ = yymsp[0].minor.yy115;
+		yygotominor.yy512->windowOpt_ = yymsp[0].minor.yy139;
 #else
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-1].minor.yy0,
 				"Not supported");
 #endif
 	}
-	yygotominor.yy60->startToken_ = yymsp[-4].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[-1].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[-4].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[-1].minor.yy0;
 }
         break;
-      case 221: /* window_opt ::= */
-{yygotominor.yy115 = 0;}
+      case 252: /* window_opt ::= */
+{yygotominor.yy139 = 0;}
         break;
-      case 222: /* window_opt ::= OVER LP partitionby_opt orderby_opt RP */
+      case 253: /* window_opt ::= OVER LP partitionby_opt orderby_opt RP */
 {
-	yygotominor.yy115 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy139 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::WindowOption(parser->getSQLAllocator());
 
-	yygotominor.yy115->partitionByList_ = yymsp[-2].minor.yy294;
-	yygotominor.yy115->orderByList_ = yymsp[-1].minor.yy294;
+	yygotominor.yy139->partitionByList_ = yymsp[-2].minor.yy304;
+	yygotominor.yy139->orderByList_ = yymsp[-1].minor.yy304;
 }
         break;
-      case 225: /* expr ::= expr AND expr */
+      case 256: /* expr ::= ID LP distinct exprlist RP WITHIN GROUP LP ORDER BY sortlist RP */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::EXPR_AND, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 226: /* expr ::= expr OR expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::EXPR_OR, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 227: /* expr ::= expr LT expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_LT, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 228: /* expr ::= expr GT expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_GT, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 229: /* expr ::= expr GE expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_GE, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 230: /* expr ::= expr LE expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_LE, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 231: /* expr ::= expr EQ expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_EQ, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 232: /* expr ::= expr NE expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_NE, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 233: /* expr ::= expr BITAND expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_BIT_AND, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 234: /* expr ::= expr BITOR expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_BIT_OR, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 235: /* expr ::= expr LSHIFT expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_SHIFT_LEFT, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 236: /* expr ::= expr RSHIFT expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_SHIFT_RIGHT, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 237: /* expr ::= expr PLUS expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_ADD, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 238: /* expr ::= expr MINUS expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_SUBTRACT, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 239: /* expr ::= expr STAR expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_MULTIPLY, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 240: /* expr ::= expr SLASH expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_DIVIDE, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 241: /* expr ::= expr REM expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_REMAINDER, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 242: /* expr ::= expr CONCAT expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_CONCAT, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
-}
-        break;
-      case 243: /* likeop ::= LIKE_KW|MATCH */
-{
-	yygotominor.yy472.operator_ = yymsp[0].minor.yy0;
-	yygotominor.yy472.existNot_ = false;
-}
-        break;
-      case 244: /* likeop ::= NOT LIKE_KW|MATCH */
-{
-	yygotominor.yy472.operator_ = yymsp[0].minor.yy0;
-	yygotominor.yy472.existNot_ = true;
-}
-        break;
-      case 245: /* expr ::= expr likeop expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
-			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-1].minor.yy472.operator_);
-	yygotominor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
-			ExprList(parser->getSQLAllocator());
-	yygotominor.yy60->next_->push_back(yymsp[0].minor.yy60); 
-	yygotominor.yy60->next_->push_back(yymsp[-2].minor.yy60);
-	if ( yymsp[-1].minor.yy472.existNot_ ) {
-		SyntaxTree::Expr* likeBody = yygotominor.yy60;
-		yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::OP_NOT);
-		yygotominor.yy60->left_ = likeBody;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-11].minor.yy0);
+	if (!yygotominor.yy512->qName_->name_) {
+		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-11].minor.yy0,
+				"Zero-length delimited identifier");
 	}
-	if (yymsp[-2].minor.yy60) { yygotominor.yy60->startToken_ = yymsp[-2].minor.yy60->startToken_; }
-	if (yymsp[0].minor.yy60) { yygotominor.yy60->endToken_ = yymsp[0].minor.yy60->endToken_; }
-}
-        break;
-      case 246: /* expr ::= expr likeop expr ESCAPE expr */
-{
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
-	yygotominor.yy60->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
-			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-3].minor.yy472.operator_);
+	yygotominor.yy512->next_ = yymsp[-8].minor.yy304;
 
-	yygotominor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
-			ExprList(parser->getSQLAllocator());
-	yygotominor.yy60->next_->push_back(yymsp[-2].minor.yy60); 
-	yygotominor.yy60->next_->push_back(yymsp[-4].minor.yy60);
-	yygotominor.yy60->next_->push_back(yymsp[0].minor.yy60);
-	if ( yymsp[-3].minor.yy472.existNot_ ) {
-		SyntaxTree::Expr* likeBody = yygotominor.yy60;
-		yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::OP_NOT);
-		yygotominor.yy60->left_ = likeBody;
+	if (yymsp[-9].minor.yy536) {
+		SQL_PARSER_THROW_ERROR(
+				GS_ERROR_SQL_COMPILE_SYNTAX_ERROR, yymsp[-10].minor.yy0,
+				"Use of DISTINCT is not allowed with the WITHIN GROUP clause");
 	}
-	if (yymsp[-4].minor.yy60) { yygotominor.yy60->startToken_ = yymsp[-4].minor.yy60->startToken_; }
-	if (yymsp[0].minor.yy60) { yygotominor.yy60->endToken_ = yymsp[0].minor.yy60->endToken_; }
+
+	SyntaxTree::Expr *orderingExpr = SyntaxTree::Expr::makeExpr(
+			parser->getSQLAllocator(), SQLType::EXPR_AGG_ORDERING);
+	orderingExpr->next_ = yymsp[-1].minor.yy304;
+
+	yygotominor.yy512->next_->insert(yygotominor.yy512->next_->begin(), orderingExpr);
+	yygotominor.yy512->startToken_ = yymsp[-11].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 247: /* expr ::= expr ISNULL */
+      case 257: /* expr ::= expr AND expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-			*parser, SQLType::OP_IS_NULL, yymsp[-1].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::EXPR_AND, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
 }
         break;
-      case 248: /* expr ::= expr NOTNULL */
+      case 258: /* expr ::= expr OR expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-			*parser, SQLType::OP_IS_NOT_NULL, yymsp[-1].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::EXPR_OR, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
 }
         break;
-      case 249: /* expr ::= expr NOT NULL */
+      case 259: /* expr ::= expr LT expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-			*parser, SQLType::OP_IS_NOT_NULL, yymsp[-2].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_LT, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
 }
         break;
-      case 250: /* expr ::= expr IS expr */
+      case 260: /* expr ::= expr GT expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_IS, yymsp[-2].minor.yy60, yymsp[0].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_GT, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
 }
         break;
-      case 251: /* expr ::= expr IS NOT expr */
+      case 261: /* expr ::= expr GE expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::OP_IS_NOT, yymsp[-3].minor.yy60, yymsp[0].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_GE, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
 }
         break;
-      case 252: /* expr ::= NOT expr */
+      case 262: /* expr ::= expr LE expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-			*parser, SQLType::OP_NOT, yymsp[0].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_LE, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
 }
         break;
-      case 253: /* expr ::= BITNOT expr */
+      case 263: /* expr ::= expr EQ expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-			*parser, SQLType::OP_BIT_NOT, yymsp[0].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_EQ, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
 }
         break;
-      case 254: /* expr ::= MINUS expr */
+      case 264: /* expr ::= expr NE expr */
 {
-	if (yymsp[0].minor.yy60 && yymsp[0].minor.yy60->op_ == SQLType::EXPR_CONSTANT) {
-		SQLToken T = yymsp[0].minor.yy60->startToken_;
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_NE, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 265: /* expr ::= expr BITAND expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_BIT_AND, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 266: /* expr ::= expr BITOR expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_BIT_OR, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 267: /* expr ::= expr LSHIFT expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_SHIFT_LEFT, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 268: /* expr ::= expr RSHIFT expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_SHIFT_RIGHT, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 269: /* expr ::= expr PLUS expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_ADD, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 270: /* expr ::= expr MINUS expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_SUBTRACT, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 271: /* expr ::= expr STAR expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_MULTIPLY, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 272: /* expr ::= expr SLASH expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_DIVIDE, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 273: /* expr ::= expr REM expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_REMAINDER, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 274: /* expr ::= expr CONCAT expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_CONCAT, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 275: /* likeop ::= LIKE_KW|MATCH */
+{
+	yygotominor.yy396.operator_ = yymsp[0].minor.yy0;
+	yygotominor.yy396.existNot_ = false;
+}
+        break;
+      case 276: /* likeop ::= NOT LIKE_KW|MATCH */
+{
+	yygotominor.yy396.operator_ = yymsp[0].minor.yy0;
+	yygotominor.yy396.existNot_ = true;
+}
+        break;
+      case 277: /* expr ::= expr likeop expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-1].minor.yy396.operator_);
+	yygotominor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
+			ExprList(parser->getSQLAllocator());
+	yygotominor.yy512->next_->push_back(yymsp[0].minor.yy512); 
+	yygotominor.yy512->next_->push_back(yymsp[-2].minor.yy512);
+	if ( yymsp[-1].minor.yy396.existNot_ ) {
+		SyntaxTree::Expr* likeBody = yygotominor.yy512;
+		yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::OP_NOT);
+		yygotominor.yy512->left_ = likeBody;
+	}
+	if (yymsp[-2].minor.yy512) { yygotominor.yy512->startToken_ = yymsp[-2].minor.yy512->startToken_; }
+	if (yymsp[0].minor.yy512) { yygotominor.yy512->endToken_ = yymsp[0].minor.yy512->endToken_; }
+}
+        break;
+      case 278: /* expr ::= expr likeop expr ESCAPE expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_FUNCTION);
+	yygotominor.yy512->qName_ = SyntaxTree::QualifiedName::makeQualifiedName(
+			parser->getSQLAllocator(), 0, NULL, NULL, &yymsp[-3].minor.yy396.operator_);
+
+	yygotominor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
+			ExprList(parser->getSQLAllocator());
+	yygotominor.yy512->next_->push_back(yymsp[-2].minor.yy512); 
+	yygotominor.yy512->next_->push_back(yymsp[-4].minor.yy512);
+	yygotominor.yy512->next_->push_back(yymsp[0].minor.yy512);
+	if ( yymsp[-3].minor.yy396.existNot_ ) {
+		SyntaxTree::Expr* likeBody = yygotominor.yy512;
+		yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::OP_NOT);
+		yygotominor.yy512->left_ = likeBody;
+	}
+	if (yymsp[-4].minor.yy512) { yygotominor.yy512->startToken_ = yymsp[-4].minor.yy512->startToken_; }
+	if (yymsp[0].minor.yy512) { yygotominor.yy512->endToken_ = yymsp[0].minor.yy512->endToken_; }
+}
+        break;
+      case 279: /* expr ::= expr ISNULL */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+			*parser, SQLType::OP_IS_NULL, yymsp[-1].minor.yy512);
+}
+        break;
+      case 280: /* expr ::= expr NOTNULL */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+			*parser, SQLType::OP_IS_NOT_NULL, yymsp[-1].minor.yy512);
+}
+        break;
+      case 281: /* expr ::= expr NOT NULL */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+			*parser, SQLType::OP_IS_NOT_NULL, yymsp[-2].minor.yy512);
+}
+        break;
+      case 282: /* expr ::= expr IS expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_IS, yymsp[-2].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 283: /* expr ::= expr IS NOT expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::OP_IS_NOT, yymsp[-3].minor.yy512, yymsp[0].minor.yy512);
+}
+        break;
+      case 284: /* expr ::= NOT expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+			*parser, SQLType::OP_NOT, yymsp[0].minor.yy512);
+}
+        break;
+      case 285: /* expr ::= BITNOT expr */
+{
+	yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+			*parser, SQLType::OP_BIT_NOT, yymsp[0].minor.yy512);
+}
+        break;
+      case 286: /* expr ::= MINUS expr */
+{
+	if (yymsp[0].minor.yy512 && yymsp[0].minor.yy512->op_ == SQLType::EXPR_CONSTANT) {
+		SQLToken T = yymsp[0].minor.yy512->startToken_;
 		if (T.id_ == TK_INTEGER 
-			&& (((yymsp[0].minor.yy60->value_.getType() == TupleList::TYPE_LONG)
-					&& (yymsp[0].minor.yy60->value_.get<int64_t>() > 0))
-				|| ((yymsp[0].minor.yy60->value_.getType() == TupleList::TYPE_DOUBLE)
-					&& (yymsp[0].minor.yy60->value_.get<double>() > 0)))) {
-			yygotominor.yy60 = yymsp[0].minor.yy60;
+			&& (((yymsp[0].minor.yy512->value_.getType() == TupleList::TYPE_LONG)
+					&& (yymsp[0].minor.yy512->value_.get<int64_t>() > 0))
+				|| ((yymsp[0].minor.yy512->value_.getType() == TupleList::TYPE_DOUBLE)
+					&& (yymsp[0].minor.yy512->value_.get<double>() > 0)))) {
+			yygotominor.yy512 = yymsp[0].minor.yy512;
 			util::String str(yymsp[-1].minor.yy0.value_, yymsp[-1].minor.yy0.value_ + yymsp[-1].minor.yy0.size_, parser->getSQLAllocator());
 			str.append(T.value_, T.size_);
 			int64_t int64Value;
 			bool succeeded = SQLProcessor::ValueUtils::toLong(
 				str.c_str(), str.size(), int64Value);
 			if (succeeded) {
-				yygotominor.yy60->value_ = TupleValue(int64Value);
+				yygotominor.yy512->value_ = TupleValue(int64Value);
 			}
 			else {
 				double doubleValue;
 				bool succeeded = SQLProcessor::ValueUtils::toDouble(
 					str.c_str(), str.size(), doubleValue);
 				if (succeeded) {
-					yygotominor.yy60->value_ = TupleValue(doubleValue);
+					yygotominor.yy512->value_ = TupleValue(doubleValue);
 				}
 				else {
 					SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -3441,16 +3725,16 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 			}
 		}
 		else if (T.id_ == TK_FLOAT
-				&& yymsp[0].minor.yy60->value_.getType() == TupleList::TYPE_DOUBLE
-				&& yymsp[0].minor.yy60->value_.get<double>() > 0) {
-			yygotominor.yy60 = yymsp[0].minor.yy60;
+				&& yymsp[0].minor.yy512->value_.getType() == TupleList::TYPE_DOUBLE
+				&& yymsp[0].minor.yy512->value_.get<double>() > 0) {
+			yygotominor.yy512 = yymsp[0].minor.yy512;
 			util::String str(yymsp[-1].minor.yy0.value_, yymsp[-1].minor.yy0.value_ + yymsp[-1].minor.yy0.size_, parser->getSQLAllocator());
 			str.append(T.value_, T.size_);
 			double doubleValue;
 			bool succeeded = SQLProcessor::ValueUtils::toDouble(
 				str.c_str(), str.size(), doubleValue);
 			if (succeeded) {
-				yygotominor.yy60->value_ = TupleValue(doubleValue);
+				yygotominor.yy512->value_ = TupleValue(doubleValue);
 			}
 			else {
 				SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
@@ -3458,188 +3742,188 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
 			}
 		}
 		else {
-			yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-					*parser, SQLType::OP_MINUS, yymsp[0].minor.yy60);
+			yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+					*parser, SQLType::OP_MINUS, yymsp[0].minor.yy512);
 		}
 	}
 	else {
-		yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-				*parser, SQLType::OP_MINUS, yymsp[0].minor.yy60);
+		yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+				*parser, SQLType::OP_MINUS, yymsp[0].minor.yy512);
 	}
 }
         break;
-      case 255: /* expr ::= PLUS expr */
+      case 287: /* expr ::= PLUS expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
-			*parser, SQLType::OP_PLUS, yymsp[0].minor.yy60);
+	yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
+			*parser, SQLType::OP_PLUS, yymsp[0].minor.yy512);
 }
         break;
-      case 258: /* expr ::= expr between_op expr AND expr */
+      case 290: /* expr ::= expr between_op expr AND expr */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_BETWEEN);
-	yygotominor.yy60->next_ = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_BETWEEN);
+	yygotominor.yy512->next_ = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yygotominor.yy60->next_->reserve(3);
-	yygotominor.yy60->next_->push_back(yymsp[-4].minor.yy60);
-	yygotominor.yy60->next_->push_back(yymsp[-2].minor.yy60);
-	yygotominor.yy60->next_->push_back(yymsp[0].minor.yy60);
-	if (yymsp[-3].minor.yy428) {
-		SyntaxTree::Expr* body = yygotominor.yy60;
-		yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
+	yygotominor.yy512->next_->reserve(3);
+	yygotominor.yy512->next_->push_back(yymsp[-4].minor.yy512);
+	yygotominor.yy512->next_->push_back(yymsp[-2].minor.yy512);
+	yygotominor.yy512->next_->push_back(yymsp[0].minor.yy512);
+	if (yymsp[-3].minor.yy262) {
+		SyntaxTree::Expr* body = yygotominor.yy512;
+		yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
 				*parser, SQLType::OP_NOT, body);
 	}
-	if (yymsp[-4].minor.yy60) { yygotominor.yy60->startToken_ = yymsp[-4].minor.yy60->startToken_; }
-	if (yymsp[0].minor.yy60) { yygotominor.yy60->endToken_ = yymsp[0].minor.yy60->startToken_; }
+	if (yymsp[-4].minor.yy512) { yygotominor.yy512->startToken_ = yymsp[-4].minor.yy512->startToken_; }
+	if (yymsp[0].minor.yy512) { yygotominor.yy512->endToken_ = yymsp[0].minor.yy512->startToken_; }
 }
         break;
-      case 261: /* expr ::= expr in_op LP exprlist RP */
+      case 293: /* expr ::= expr in_op LP exprlist RP */
 {
 	SyntaxTree::Expr* listExpr = SyntaxTree::Expr::makeExpr(
 		parser->getSQLAllocator(), SQLType::EXPR_LIST);
-	listExpr->next_ = yymsp[-1].minor.yy294;
+	listExpr->next_ = yymsp[-1].minor.yy304;
 
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::EXPR_IN, yymsp[-4].minor.yy60, listExpr);
-	if (yymsp[-3].minor.yy428) {
-		SyntaxTree::Expr* body = yygotominor.yy60;
-		yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::EXPR_IN, yymsp[-4].minor.yy512, listExpr);
+	if (yymsp[-3].minor.yy262) {
+		SyntaxTree::Expr* body = yygotominor.yy512;
+		yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
 				*parser, SQLType::OP_NOT, body);
 	}
-	if (yymsp[-4].minor.yy60) { yygotominor.yy60->startToken_ = yymsp[-4].minor.yy60->startToken_; }
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	if (yymsp[-4].minor.yy512) { yygotominor.yy512->startToken_ = yymsp[-4].minor.yy512->startToken_; }
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 262: /* expr ::= LP select RP */
+      case 294: /* expr ::= LP select RP */
 {
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_SELECTION);
-	yygotominor.yy60->subQuery_ = yymsp[-1].minor.yy158;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_SELECTION);
+	yygotominor.yy512->subQuery_ = yymsp[-1].minor.yy72;
 
-	yygotominor.yy60->startToken_ = yymsp[-2].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[-2].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 
-	if (yymsp[-1].minor.yy158 && yymsp[-1].minor.yy158->right_ && yymsp[-1].minor.yy158->right_->hintList_) {
+	if (yymsp[-1].minor.yy72 && yymsp[-1].minor.yy72->right_ && yymsp[-1].minor.yy72->right_->hintList_) {
 		SQLToken token;
-		if (yymsp[-1].minor.yy158->right_->hintList_->size() > 0) {
-			token = yymsp[-1].minor.yy158->right_->hintList_->at(0)->startToken_;
+		if (yymsp[-1].minor.yy72->right_->hintList_->size() > 0) {
+			token = yymsp[-1].minor.yy72->right_->hintList_->at(0)->startToken_;
 		}
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 				token, "Invalid hint found");
 	}
 }
         break;
-      case 263: /* expr ::= expr in_op LP select RP */
+      case 295: /* expr ::= expr in_op LP select RP */
 {
 	SyntaxTree::Expr* selectExpr = SyntaxTree::Expr::makeExpr(
 		parser->getSQLAllocator(), SQLType::EXPR_SELECTION);
-	selectExpr->subQuery_ = yymsp[-1].minor.yy158;
+	selectExpr->subQuery_ = yymsp[-1].minor.yy72;
 
-	yygotominor.yy60 = SyntaxTree::Expr::makeBinaryExpr(
-			*parser, SQLType::EXPR_IN, yymsp[-4].minor.yy60, selectExpr);
-	if (yymsp[-3].minor.yy428) {
-		SyntaxTree::Expr* body = yygotominor.yy60;
-		yygotominor.yy60 = SyntaxTree::Expr::makeUnaryExpr(
+	yygotominor.yy512 = SyntaxTree::Expr::makeBinaryExpr(
+			*parser, SQLType::EXPR_IN, yymsp[-4].minor.yy512, selectExpr);
+	if (yymsp[-3].minor.yy262) {
+		SyntaxTree::Expr* body = yygotominor.yy512;
+		yygotominor.yy512 = SyntaxTree::Expr::makeUnaryExpr(
 				*parser, SQLType::OP_NOT, body);
 	}
-	if (yymsp[-4].minor.yy60) { yygotominor.yy60->startToken_ = yymsp[-4].minor.yy60->startToken_; }
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	if (yymsp[-4].minor.yy512) { yygotominor.yy512->startToken_ = yymsp[-4].minor.yy512->startToken_; }
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 
-	if (yymsp[-1].minor.yy158 && yymsp[-1].minor.yy158->right_ && yymsp[-1].minor.yy158->right_->hintList_) {
+	if (yymsp[-1].minor.yy72 && yymsp[-1].minor.yy72->right_ && yymsp[-1].minor.yy72->right_->hintList_) {
 		SQLToken token;
-		if (yymsp[-1].minor.yy158->right_->hintList_->size() > 0) {
-			token = yymsp[-1].minor.yy158->right_->hintList_->at(0)->startToken_;
+		if (yymsp[-1].minor.yy72->right_->hintList_->size() > 0) {
+			token = yymsp[-1].minor.yy72->right_->hintList_->at(0)->startToken_;
 		}
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 				token, "Invalid hint found");
 	}
 }
         break;
-      case 264: /* expr ::= EXISTS LP select RP */
+      case 296: /* expr ::= EXISTS LP select RP */
 {
 	/* yymsp[-3].minor.yy0, yymsp[0].minor.yy0: Token */
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_EXISTS);
-	yygotominor.yy60->subQuery_ = yymsp[-1].minor.yy158;
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_EXISTS);
+	yygotominor.yy512->subQuery_ = yymsp[-1].minor.yy72;
 
-	yygotominor.yy60->startToken_ = yymsp[-3].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[-3].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 
-	if (yymsp[-1].minor.yy158 && yymsp[-1].minor.yy158->right_ && yymsp[-1].minor.yy158->right_->hintList_) {
+	if (yymsp[-1].minor.yy72 && yymsp[-1].minor.yy72->right_ && yymsp[-1].minor.yy72->right_->hintList_) {
 		SQLToken token;
-		if (yymsp[-1].minor.yy158->right_->hintList_->size() > 0) {
-			token = yymsp[-1].minor.yy158->right_->hintList_->at(0)->startToken_;
+		if (yymsp[-1].minor.yy72->right_->hintList_->size() > 0) {
+			token = yymsp[-1].minor.yy72->right_->hintList_->at(0)->startToken_;
 		}
 		SQL_PARSER_THROW_ERROR(GS_ERROR_SQL_COMPILE_SYNTAX_ERROR,
 				token, "Invalid hint found");
 	}
 }
         break;
-      case 265: /* expr ::= CASE case_operand case_exprlist case_else END */
+      case 297: /* expr ::= CASE case_operand case_exprlist case_else END */
 {
 
 
 	/* yymsp[-4].minor.yy0, yymsp[0].minor.yy0: Token */
-	yygotominor.yy60 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CASE);
-	yygotominor.yy60->next_ = yymsp[-2].minor.yy294;
-	if (yymsp[-3].minor.yy60 && yygotominor.yy60->next_) {
-		SyntaxTree::ExprList::iterator itr = yygotominor.yy60->next_->begin();
+	yygotominor.yy512 = SyntaxTree::Expr::makeExpr(parser->getSQLAllocator(), SQLType::EXPR_CASE);
+	yygotominor.yy512->next_ = yymsp[-2].minor.yy304;
+	if (yymsp[-3].minor.yy512 && yygotominor.yy512->next_) {
+		SyntaxTree::ExprList::iterator itr = yygotominor.yy512->next_->begin();
 		size_t count = 0;
-		for (; itr != yygotominor.yy60->next_->end(); ++itr, ++count) {
+		for (; itr != yygotominor.yy512->next_->end(); ++itr, ++count) {
 			if (((count % 2) == 0) && *itr) { 
 				SyntaxTree::Expr* newExpr = SyntaxTree::Expr::makeExpr(
 					parser->getSQLAllocator(), SQLType::OP_EQ);
-				newExpr->left_ = yymsp[-3].minor.yy60;
+				newExpr->left_ = yymsp[-3].minor.yy512;
 				newExpr->right_ = (*itr);
 				(*itr) = newExpr;
 			}
 		}
 	}
-	if (yymsp[-1].minor.yy60) {
-		yygotominor.yy60->next_->push_back(yymsp[-1].minor.yy60);
+	if (yymsp[-1].minor.yy512) {
+		yygotominor.yy512->next_->push_back(yymsp[-1].minor.yy512);
 	}
-	yygotominor.yy60->startToken_ = yymsp[-4].minor.yy0;
-	yygotominor.yy60->endToken_ = yymsp[0].minor.yy0;
+	yygotominor.yy512->startToken_ = yymsp[-4].minor.yy0;
+	yygotominor.yy512->endToken_ = yymsp[0].minor.yy0;
 }
         break;
-      case 266: /* case_exprlist ::= case_exprlist WHEN expr THEN expr */
+      case 298: /* case_exprlist ::= case_exprlist WHEN expr THEN expr */
 {
-	if (!yymsp[-4].minor.yy294) {
-		yymsp[-4].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-4].minor.yy304) {
+		yymsp[-4].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	yymsp[-4].minor.yy294->push_back(yymsp[-2].minor.yy60);
-	if (yymsp[0].minor.yy60) {
-		yymsp[-4].minor.yy294->push_back(yymsp[0].minor.yy60);
+	yymsp[-4].minor.yy304->push_back(yymsp[-2].minor.yy512);
+	if (yymsp[0].minor.yy512) {
+		yymsp[-4].minor.yy304->push_back(yymsp[0].minor.yy512);
 	}
-	yygotominor.yy294 = yymsp[-4].minor.yy294;
+	yygotominor.yy304 = yymsp[-4].minor.yy304;
 }
         break;
-      case 267: /* case_exprlist ::= WHEN expr THEN expr */
+      case 299: /* case_exprlist ::= WHEN expr THEN expr */
 {
-	yygotominor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	yygotominor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 			SyntaxTree::ExprList(parser->getSQLAllocator());
-	yygotominor.yy294->push_back(yymsp[-2].minor.yy60);
-	if (yymsp[0].minor.yy60) {
-		yygotominor.yy294->push_back(yymsp[0].minor.yy60);
+	yygotominor.yy304->push_back(yymsp[-2].minor.yy512);
+	if (yymsp[0].minor.yy512) {
+		yygotominor.yy304->push_back(yymsp[0].minor.yy512);
 	}
 }
         break;
-      case 268: /* case_else ::= ELSE expr */
-      case 270: /* case_operand ::= expr */ yytestcase(yyruleno==270);
+      case 300: /* case_else ::= ELSE expr */
+      case 302: /* case_operand ::= expr */ yytestcase(yyruleno==302);
 {
-	yygotominor.yy60 = yymsp[0].minor.yy60;
-	if (yymsp[0].minor.yy60) {
-		yygotominor.yy60->startToken_ = yymsp[0].minor.yy60->startToken_;
-		yygotominor.yy60->endToken_ = yymsp[0].minor.yy60->endToken_;
+	yygotominor.yy512 = yymsp[0].minor.yy512;
+	if (yymsp[0].minor.yy512) {
+		yygotominor.yy512->startToken_ = yymsp[0].minor.yy512->startToken_;
+		yygotominor.yy512->endToken_ = yymsp[0].minor.yy512->endToken_;
 	}
 }
         break;
-      case 274: /* nexprlist ::= nexprlist COMMA expr */
+      case 306: /* nexprlist ::= nexprlist COMMA expr */
 {
-	if (!yymsp[-2].minor.yy294) {
-		yymsp[-2].minor.yy294 = ALLOC_NEW(parser->getSQLAllocator())
+	if (!yymsp[-2].minor.yy304) {
+		yymsp[-2].minor.yy304 = ALLOC_NEW(parser->getSQLAllocator())
 				SyntaxTree::ExprList(parser->getSQLAllocator());
 	}
-	yymsp[-2].minor.yy294->push_back(yymsp[0].minor.yy60);
-	yygotominor.yy294 = yymsp[-2].minor.yy294;
+	yymsp[-2].minor.yy304->push_back(yymsp[0].minor.yy512);
+	yygotominor.yy304 = yymsp[-2].minor.yy304;
 }
         break;
       default:
@@ -3652,10 +3936,8 @@ SQLPARSER_SAFE_DELETE((yypminor->yy115));
       /* (11) trans_opt ::= TRANSACTION */ yytestcase(yyruleno==11);
       /* (15) cmd ::= create_table */ yytestcase(yyruleno==15);
       /* (17) createkw ::= CREATE */ yytestcase(yyruleno==17);
-      /* (42) cmd ::= create_virtual_table */ yytestcase(yyruleno==42);
-      /* (55) signed ::= plus_num */ yytestcase(yyruleno==55);
-      /* (56) signed ::= minus_num */ yytestcase(yyruleno==56);
-      /* (68) cmd ::= create_view */ yytestcase(yyruleno==68);
+      /* (47) cmd ::= create_virtual_table */ yytestcase(yyruleno==47);
+      /* (73) cmd ::= create_view */ yytestcase(yyruleno==73);
         break;
 			};
 			yygoto = yyRuleInfo[yyruleno].lhs;

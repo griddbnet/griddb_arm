@@ -60,8 +60,18 @@
 #endif
 #endif 
 
+#if UTIL_BUILD_FLETCHER32_SIMD
+#define fletcher32_avx2 inline fletcher32_avx2
+#include "fletcher32_simd/avx2.cpp"
+#undef fletcher32_avx2
+#endif
+
 namespace util {
 
+
+u8string TinyLexicalIntConverter::toString(uint32_t value) {
+	return TinyLexicalIntConverter().toString<u8string>(value);
+}
 
 TinyLexicalIntConverter::TinyLexicalIntConverter() :
 		minWidth_(1),
@@ -112,13 +122,26 @@ bool TinyLexicalIntConverter::format(
 
 bool TinyLexicalIntConverter::parse(
 		const char8_t *&it, const char8_t *end, uint32_t &value) const {
+	const char8_t *outIt;
+	const bool ret = parseDetail(it, end, &outIt, value);
+	it = outIt;
+	return ret;
+}
+
+bool TinyLexicalIntConverter::parseDetail(
+		const char8_t *begin, const char8_t *end, const char8_t **outIt,
+		uint32_t &value) const {
+	if (outIt != NULL) {
+		*outIt = begin;
+	}
 	value = 0;
+
+	const char8_t *it = begin;
 
 	if (it > end) {
 		assert(false);
 		return false;
 	}
-	const char8_t *const begin = it;
 
 	size_t limitSize = static_cast<size_t>(end - it);
 	if (maxWidth_ > 0 && maxWidth_ < limitSize) {
@@ -175,6 +198,9 @@ bool TinyLexicalIntConverter::parse(
 		return false;
 	}
 
+	if (outIt != NULL) {
+		*outIt = it;
+	}
 	value = static_cast<uint32_t>(ret);
 	return true;
 }
@@ -467,6 +493,44 @@ const uint16_t* CRC16::getTable() {
 	static Table table;
 	return table.get();
 }
+
+namespace detail {
+
+
+#if UTIL_BUILD_FLETCHER32_SIMD
+uint32_t fletcher32Avx2(const void *buf, size_t len) {
+	assert(len % 2 == 0);
+	len /= 2; 
+	const uint16_t *data = static_cast<const uint16_t *>(buf);
+	uint32_t sum1 = 0xffff, sum2 = 0xffff;
+
+	return fletcher32_avx2(const_cast<uint16_t *>(data), len, sum1, sum2);
+}
+#endif 
+
+uint32_t fletcher32Reference(const void *buf, size_t len) {
+	assert(len % 2 == 0);
+	len /= 2; 
+	const uint16_t *data = static_cast<const uint16_t *>(buf);
+	uint32_t sum1 = 0xffff, sum2 = 0xffff;
+
+
+	while (len) {
+		size_t tlen = len > 360 ? 360 : len;
+		len -= tlen;
+		do {
+			sum1 += *data++;
+			sum2 += sum1;
+		} while (--tlen);
+		sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+		sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+	}
+	/* Second reduction step to reduce sums to 16 bits */
+	sum1 = (sum1 & 0xffff) + (sum1 >> 16);
+	sum2 = (sum2 & 0xffff) + (sum2 >> 16);
+	return sum2 << 16 | sum1;
+}
+} 
 
 
 
@@ -1130,6 +1194,8 @@ void StreamErrors::throwUnexpectedRemaining() {
 
 
 namespace detail {
+
+
 void NameCoderImpl::initialize(
 		const char8_t **nameList, Entry *entryList, size_t count) {
 
@@ -1140,7 +1206,8 @@ void NameCoderImpl::initialize(
 		assert(it->second == it - entryList);
 	}
 
-	std::sort(entryList, entryEnd, EntryPred());
+	const NameCoderOptions options;
+	std::sort(entryList, entryEnd, EntryPred(&options));
 }
 
 const char8_t* NameCoderImpl::findName(
@@ -1164,14 +1231,15 @@ const char8_t* NameCoderImpl::findName(
 }
 
 const NameCoderImpl::Entry* NameCoderImpl::findEntry(
-		const Entry *entryList, size_t count, const char8_t *name) {
+		const Entry *entryList, size_t count, const char8_t *name,
+		const NameCoderOptions &options) {
 	assert(name != NULL);
 
 	const Entry *entryEnd = entryList + count;
 	const Entry key(name, Entry::second_type());
 	const std::pair<const Entry*, const Entry*> &range =
 			std::equal_range<const Entry*>(
-					entryList, entryEnd, key, EntryPred());
+					entryList, entryEnd, key, EntryPred(&options));
 
 	if (range.first == range.second) {
 		return NULL;
@@ -1187,6 +1255,14 @@ const char8_t* NameCoderImpl::removePrefix(
 	}
 
 	const char8_t *ret = name;
+	for (;;) {
+		const char8_t *found = strchr(ret, ':');
+		if (found == NULL) {
+			break;
+		}
+		ret = found + 1;
+	}
+
 	for (size_t i = prefixWordCount; i > 0; i--) {
 		const char8_t *found = strchr(ret, '_');
 		if (found == NULL) {
@@ -1199,12 +1275,21 @@ const char8_t* NameCoderImpl::removePrefix(
 	return ret;
 }
 
+
+NameCoderImpl::EntryPred::EntryPred(const NameCoderOptions *options) :
+		options_(options) {
+}
+
 bool NameCoderImpl::EntryPred::operator()(
 		const Entry &entry1, const Entry &entry2) const {
 	if (entry1.first == NULL || entry2.first == NULL) {
 		return (entry1.first == NULL ? 0 : 1)  < (entry2.first == NULL ? 0 : 1);
 	}
 
+	const int32_t baseCmp = util::stricmp(entry1.first, entry2.first);
+	if (baseCmp != 0 || !options_->isCaseSensitive()) {
+		return baseCmp < 0;
+	}
 	return strcmp(entry1.first, entry2.first) < 0;
 }
 } 

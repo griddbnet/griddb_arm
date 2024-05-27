@@ -21,12 +21,11 @@
 
 #include "query.h"
 #include "base_container.h"
-#include "data_store.h"
+#include "data_store_v4.h"
 #include "data_store_common.h"
 #include "query_processor.h"
 #include "result_set.h"
 #include "value_operator.h"
-#include "transaction_manager.h"
 #include "btree_map.h"
 #include "gis_quadraticsurface.h"
 #include "rtree_map.h"
@@ -36,7 +35,6 @@
 #include <sstream>
 
 const char8_t *const QueryProcessor::ANALYZE_QUERY = "#analyze";
-
 
 
 /*!
@@ -58,7 +56,7 @@ void QueryProcessor::executeTQL(TransactionContext &txn,
 		}
 
 		if (strcmp(query, ANALYZE_QUERY) == 0) {
-			Query analyzeQuery(txn, *(container.getObjectManager()), tqlInfo);
+			Query analyzeQuery(txn, *(container.getObjectManager()), container.getRowAllocateStrategy(), tqlInfo);
 			analyzeQuery.enableExplain(true);
 			assignDistributedTarget(txn, container, analyzeQuery, resultSet);
 			if (container.isInvalid()) {
@@ -155,7 +153,7 @@ void QueryProcessor::searchGeometryRelated(TransactionContext &txn,
 	uint32_t geometrySize, uint8_t *geometry, GeometryOperator geometryOp,
 	ResultSet &resultSet) {
 	try {
-		ObjectManager &objectManager = *(collection.getObjectManager());
+		ObjectManagerV4 &objectManager = *(collection.getObjectManager());
 		util::XArray<OId> &oIdList = *resultSet.getOIdList();
 		Geometry *geom = Geometry::deserialize(txn, geometry, geometrySize);
 
@@ -177,10 +175,10 @@ void QueryProcessor::searchGeometryRelated(TransactionContext &txn,
 			collection.searchRowIdIndex(txn, sc, tmpOIdList, ORDER_UNDEFINED);
 			util::XArray<OId>::iterator itr;
 			BaseContainer::RowArray rowArray(txn, &collection);
+			ContainerValue value(objectManager, collection.getRowAllocateStrategy());
 			for (itr = tmpOIdList.begin(); itr != tmpOIdList.end(); itr++) {
 				rowArray.load(txn, *itr, &collection, OBJECT_READ_ONLY);
 				BaseContainer::RowArray::Row row(rowArray.getRow(), &rowArray);
-				ContainerValue value(txn.getPartitionId(), objectManager);
 				row.getField(txn, *columnInfo, value);
 				Geometry *geom2 = Geometry::deserialize(
 					txn, value.getValue().data(), value.getValue().size());
@@ -203,7 +201,7 @@ void QueryProcessor::searchGeometryRelated(TransactionContext &txn,
 			}
 		}
 		else {
-			RtreeMap::SearchContext::GeomeryCondition geomCond;
+			RtreeMap::SearchContext::GeometryCondition geomCond;
 			geomCond.valid_ = true;
 			if (geom->getType() == Geometry::QUADRATICSURFACE) {
 				if (geometryOp == GEOMETRY_INTERSECT ||
@@ -231,9 +229,9 @@ void QueryProcessor::searchGeometryRelated(TransactionContext &txn,
 			TermCondition cond(columnInfo->getColumnType(), 
 				columnInfo->getColumnType(), DSExpression::GEOM_OP, 
 				columnInfo->getColumnId(),
-				&geomCond, sizeof(RtreeMap::SearchContext::GeomeryCondition));
+				&geomCond, sizeof(RtreeMap::SearchContext::GeometryCondition));
 			RtreeMap::SearchContext sc (txn.getDefaultAllocator(), columnInfo->getColumnId());
-			sc.addCondition(cond, true);
+			sc.addCondition(txn, cond, true);
 			sc.setLimit(limit);
 			collection.searchColumnIdIndex(txn, sc, oIdList);
 		}
@@ -254,7 +252,7 @@ void QueryProcessor::searchGeometry(TransactionContext &txn,
 	uint32_t geometrySize1, uint8_t *geometry1, uint32_t geometrySize2,
 	uint8_t *geometry2, ResultSet &resultSet) {
 	try {
-		ObjectManager &objectManager = *(collection.getObjectManager());
+		ObjectManagerV4 &objectManager = *(collection.getObjectManager());
 		util::XArray<OId> &oIdList = *resultSet.getOIdList();
 
 		Geometry *geom1 = Geometry::deserialize(txn, geometry1, geometrySize1);
@@ -279,10 +277,10 @@ void QueryProcessor::searchGeometry(TransactionContext &txn,
 			collection.searchRowIdIndex(txn, sc, tmpOIdList, ORDER_UNDEFINED);
 			util::XArray<OId>::iterator itr;
 			BaseContainer::RowArray rowArray(txn, &collection);
+			ContainerValue value(objectManager, collection.getRowAllocateStrategy());
 			for (itr = tmpOIdList.begin(); itr != tmpOIdList.end(); itr++) {
 				rowArray.load(txn, *itr, &collection, OBJECT_READ_ONLY);
 				BaseContainer::RowArray::Row row(rowArray.getRow(), &rowArray);
-				ContainerValue value(txn.getPartitionId(), objectManager);
 				row.getField(txn, *columnInfo, value);
 				Geometry *geom = Geometry::deserialize(
 					txn, value.getValue().data(), value.getValue().size());
@@ -295,7 +293,7 @@ void QueryProcessor::searchGeometry(TransactionContext &txn,
 			}
 		}
 		else {
-			RtreeMap::SearchContext::GeomeryCondition geomCond;
+			RtreeMap::SearchContext::GeometryCondition geomCond;
 			geomCond.valid_ = true;
 			geomCond.rect_[0] = geom1->getBoundingRect();
 			geomCond.rect_[1] = geom2->getBoundingRect();
@@ -304,9 +302,9 @@ void QueryProcessor::searchGeometry(TransactionContext &txn,
 			TermCondition cond(columnInfo->getColumnType(), 
 				columnInfo->getColumnType(), DSExpression::GEOM_OP, 
 				columnInfo->getColumnId(),
-				&geomCond, sizeof(RtreeMap::SearchContext::GeomeryCondition));
+				&geomCond, sizeof(RtreeMap::SearchContext::GeometryCondition));
 			RtreeMap::SearchContext sc (txn.getDefaultAllocator(), columnInfo->getColumnId());
-			sc.addCondition(cond, true);
+			sc.addCondition(txn, cond, true);
 			sc.setLimit(limit);
 
 			collection.searchColumnIdIndex(txn, sc, oIdList);
@@ -317,5 +315,4 @@ void QueryProcessor::searchGeometry(TransactionContext &txn,
 		collection.handleSearchError(txn, e, GS_ERROR_QP_SEARCH_GEOM_FAILED);
 	}
 }
-
 

@@ -21,6 +21,10 @@
 #include "sql_utils_vdbe.h" 
 #include "sql_utils_container.h" 
 
+#include "sql_execution.h"
+#include "transaction_manager.h"
+
+
 const DQLProcessor::ProcRegistrar DQLProcessor::REGISTRAR_LIST[] = {
 	ProcRegistrar::of<DQLProcs::GroupOption>(SQLType::EXEC_GROUP),
 	ProcRegistrar::of<DQLProcs::JoinOption>(SQLType::EXEC_JOIN),
@@ -36,20 +40,20 @@ const DQLProcessor::ProcRegistrarTable DQLProcessor::REGISTRAR_TABLE(
 
 DQLProcessor::DQLProcessor(Context &cxt, const TypeInfo &typeInfo) :
 		SQLProcessor(cxt, typeInfo),
-		alloc_(cxt.getVarAllocator()),
-		store_(alloc_),
 		inputIdOffset_(0),
-		profiler_(alloc_) {
-	store_.setStackAllocatorBase(&cxt.getAllocator().base());
+		profiler_(cxt.getVarAllocator()) {
 }
 
 DQLProcessor::~DQLProcessor() {
+	if (store_.get() != NULL) {
+		store_->closeAllLatchResources();
+	}
 }
 
 bool DQLProcessor::pipe(Context &cxt, InputId inputId, const Block &block) {
-	OpStore::Entry *entry = findInputEntry(inputId);
+	OpStore::Entry *entry = findInputEntry(cxt, inputId);
 	if (entry != NULL) {
-		appendBlock(*entry, block);
+		entry->appendBlock(0, block);
 	}
 
 	OpCursor c(getCursorSource(cxt));
@@ -60,7 +64,7 @@ bool DQLProcessor::pipe(Context &cxt, InputId inputId, const Block &block) {
 }
 
 bool DQLProcessor::finish(Context &cxt, InputId inputId) {
-	getInputEntry(inputId).setCompleted();
+	getInputEntry(cxt, inputId).setCompleted();
 
 	OpCursor c(getCursorSource(cxt));
 	for (; c.exists(); c.next()) {
@@ -70,7 +74,7 @@ bool DQLProcessor::finish(Context &cxt, InputId inputId) {
 }
 
 bool DQLProcessor::next(Context &cxt) {
-	OpCursor c(getCursorSource(cxt));
+	OpCursor c(getCursorSourceForNext(cxt));
 	for (; c.exists(); c.next()) {
 		c.get().execute(c.getContext());
 	}
@@ -80,62 +84,155 @@ bool DQLProcessor::next(Context &cxt) {
 bool DQLProcessor::applyInfo(
 		Context &cxt, const Option &option,
 		const TupleInfoList &inputInfo, TupleInfo &outputInfo) {
-	if (option_.get() == NULL) {
-		if (!storeRootId_.isEmpty()) {
-			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL_INVALID_INPUT, "");
+	if (infoEntry_.get() == NULL) {
+		SQLValues::VarAllocator &varAlloc = cxt.getVarAllocator();
+
+		util::AllocUniquePtr<InfoEntry> infoEntry;
+		infoEntry = ALLOC_UNIQUE(varAlloc, InfoEntry, varAlloc);
+
+		infoEntry->storeGroup_ = UTIL_MAKE_LOCAL_UNIQUE(
+				infoEntry->storeGroup_, TupleList::Group, cxt.getStore());
+
+		util::LocalUniquePtr<SQLValues::VarContext> varCxt;
+		SQLValues::ValueContext valueCxt(getValueContextSource(
+				cxt.getAllocator(), varAlloc, *infoEntry->storeGroup_, varCxt));
+
+		DQLProcs::Option opOption;
+		{
+			DQLProcs::OptionInput in(
+					valueCxt, getRegistrarTable(), getType(), &option);
+			opOption.importFrom(in);
+
+			typedef util::XArrayOutStream<
+					util::StdAllocator<uint8_t, void> > ByteOutStream;
+			typedef util::ObjectOutStream<ByteOutStream> OutStream;
+
+			ByteOutStream byteOutStream(infoEntry->optionImage_);
+			OutStream outStream(byteOutStream);
+			util::AbstractObjectOutStream::Wrapper<
+					OutStream> wrappedStream(outStream);
+
+			DQLProcs::ProcOutOption procOutOption;
+			procOutOption.outStream_ = &wrappedStream;
+			DQLProcs::OptionOutput out(&procOutOption, getType());
+			opOption.exportTo(out);
 		}
 
-		const OpStoreId &id = store_.allocateEntry();
-		OpStore::Entry &entry = store_.getEntry(id);
+		{
+			AllocTupleInfoList &dest = infoEntry->inputInfo_;
+			for (TupleInfoList::const_iterator it = inputInfo.begin();
+					it != inputInfo.end(); ++it) {
+				dest.push_back(AllocTupleInfo(varAlloc));
+				dest.back().assign(it->begin(), it->end());
+			}
+		}
 
-		storeGroup_ = UTIL_MAKE_LOCAL_UNIQUE(
-				storeGroup_, TupleList::Group, cxt.getStore());
-		store_.setTempStoreGroup(*storeGroup_);
-		store_.setVarAllocator(&cxt.getVarAllocator());
+		{
+			const SQLOps::OpCode &code = createOpCode(
+					cxt.getAllocator(), opOption, infoEntry->inputInfo_);
+			TupleInfo dest(cxt.getAllocator());
+			getOutputInfo(code, dest);
+			infoEntry->outputInfo_.assign(dest.begin(), dest.end());
+		}
 
-		SQLValues::ValueContext valueCxt(entry.getValueContextSource(NULL));
-		DQLProcs::OptionInput in(
-				valueCxt, getRegistrarTable(), getType(), &option);
-		util::AllocUniquePtr<DQLProcs::Option> opOption(
-				ALLOC_UNIQUE(alloc_, DQLProcs::Option));
-		opOption->importFrom(in);
-
-		setUpRoot(store_, entry, *opOption, inputInfo);
-		setUpInput(getRootCode(store_, id), inputInfo.size(), inputIdOffset_);
-
-		option_.swap(opOption);
-		storeRootId_ = id;
+		infoEntry_.swap(infoEntry);
 	}
 
-	getOutputInfo(getRootCode(store_, getStoreRootId()), outputInfo);
+	outputInfo.assign(
+			infoEntry_->outputInfo_.begin(), infoEntry_->outputInfo_.end());
 	return true;
 }
 
 const SQLProcessor::Profiler& DQLProcessor::getProfiler() {
+	if (store_.get() == NULL) {
+		return profiler_;
+	}
+
+	TypeInfo typeInfo;
+	typeInfo.type_ = getType();
+
+	SQLOpUtils::AnalysisInfo mainInfo;
+	SQLOps::OpProfiler *opProfiler = store_->getProfiler();
+	if (opProfiler != NULL) {
+		mainInfo = opProfiler->getAnalysisInfo(NULL);
+	}
+
+	if (simulator_.get() != NULL) {
+		if (mainInfo.op_ != NULL && !mainInfo.op_->empty()) {
+			mainInfo.op_->front().partial_ = simulator_->getPartialProfile();
+		}
+	}
+
+	if (matchProfilerResultType(profiler_, true)) {
+		Profiler::makeStreamData(
+				util::ObjectCoder(), typeInfo, mainInfo.toRoot(),
+				profiler_.prepareStreamData());
+	}
+	else if (matchProfilerResultType(profiler_, false)) {
+		JsonUtils::OutStream stream(profiler_.getResult());
+		util::AbstractObjectOutStream::Wrapper<
+				JsonUtils::OutStream> wrappedStream(stream);
+		util::ObjectCoder().encode(wrappedStream, mainInfo);
+	}
+
 	return profiler_;
 }
 
 void DQLProcessor::setProfiler(const Profiler &profiler) {
-	static_cast<void>(profiler);
+	profiler_.getOption() = profiler.getOption();
+	profiler_.setForAnalysis(profiler.isForAnalysis());
+
+	if (store_.get() == NULL) {
+		return;
+	}
+
+	if (isProfilerRequested(profiler_)) {
+		store_->activateProfiler();
+	}
 }
 
 void DQLProcessor::exportTo(Context &cxt, const OutOption &option) const {
-	static_cast<void>(cxt);
-
-	if (option_.get() == NULL) {
+	if (infoEntry_.get() == NULL) {
 		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL_INVALID_INPUT, "");
 	}
 
+	util::LocalUniquePtr<SQLValues::VarContext> varCxt;
+	SQLValues::ValueContext valueCxt(getValueContextSource(
+			cxt.getAllocator(), cxt.getVarAllocator(),
+			*infoEntry_->storeGroup_, varCxt));
+
+	DQLProcs::Option opOption;
+	loadOption(valueCxt, infoEntry_->optionImage_, opOption);
+
 	DQLProcs::OptionOutput out(&option, getType());
-	option_->exportTo(out);
+	opOption.exportTo(out);
+}
+
+void DQLProcessor::transcodeProfilerSpecific(
+		util::StackAllocator &alloc, const TypeInfo &typeInfo,
+		util::AbstractObjectInStream &in,
+		util::AbstractObjectOutStream &out) {
+	if (!isDQL(typeInfo.type_)) {
+		assert(false);
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL_INVALID_INPUT, "");
+	}
+
+	SQLOpUtils::AnalysisRootInfo value;
+	util::ObjectCoder::withAllocator(alloc).decode(in, value);
+	util::ObjectCoder::withAllocator(alloc).encode(out, value);
+}
+
+bool DQLProcessor::isDQL(SQLType::Id type) {
+	return (getRegistrarTable().find(type) != NULL);
 }
 
 const DQLProcs::ProcRegistrarTable& DQLProcessor::getRegistrarTable() {
 	return REGISTRAR_TABLE;
 }
 
-SQLOps::OpStore::Entry& DQLProcessor::getInputEntry(InputId inputId) {
-	OpStore::Entry *entry = findInputEntry(inputId);
+SQLOps::OpStore::Entry& DQLProcessor::getInputEntry(
+		Context &cxt, InputId inputId) {
+	OpStore::Entry *entry = findInputEntry(cxt, inputId);
 	if (entry == NULL) {
 		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL_INVALID_INPUT,
 				"Ignorable ID specified");
@@ -143,8 +240,10 @@ SQLOps::OpStore::Entry& DQLProcessor::getInputEntry(InputId inputId) {
 	return *entry;
 }
 
-SQLOps::OpStore::Entry* DQLProcessor::findInputEntry(InputId inputId) {
-	OpStore::Entry &rootEntry = store_.getEntry(getStoreRootId());
+SQLOps::OpStore::Entry* DQLProcessor::findInputEntry(
+		Context &cxt, InputId inputId) {
+	OpStore &store = prepareStore(cxt);
+	OpStore::Entry &rootEntry = store.getEntry(getStoreRootId());
 	const uint32_t inCount = rootEntry.getInputCount();
 
 	const bool ignorable = (inputIdOffset_ != 0 && inCount <= 1);
@@ -165,7 +264,7 @@ SQLOps::OpStore::Entry* DQLProcessor::findInputEntry(InputId inputId) {
 
 	const uint32_t inIndex = static_cast<uint32_t>(inputIdOffset_ + inputId);
 	const OpStoreId &storeInId = rootEntry.getLink(inIndex, true);
-	OpStore::Entry &inEntry = store_.getEntry(storeInId);
+	OpStore::Entry &inEntry = store.getEntry(storeInId);
 	if (inEntry.isCompleted()) {
 		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL_INVALID_INPUT,
 				"Input already completed");
@@ -174,20 +273,104 @@ SQLOps::OpStore::Entry* DQLProcessor::findInputEntry(InputId inputId) {
 	return &inEntry;
 }
 
-void DQLProcessor::appendBlock(OpStore::Entry &entry, const Block &block) {
-	entry.getTupleList(0, false, false).append(block);
+SQLOps::OpCursor::Source DQLProcessor::getCursorSource(Context &cxt) {
+	return getCursorSourceDetail(cxt, false);
 }
 
-SQLOps::OpCursor::Source DQLProcessor::getCursorSource(Context &cxt) {
-	OpCursor::Source source(getStoreRootId(), store_, NULL);
+SQLOps::OpCursor::Source DQLProcessor::getCursorSourceForNext(Context &cxt) {
+	return getCursorSourceDetail(cxt, true);
+}
 
-	if (extCxt_.get() == NULL) {
-		extCxt_ = ALLOC_UNIQUE(alloc_, DQLProcs::ExtProcContext);
-		extCxt_->setBase(cxt);
+SQLOps::OpCursor::Source DQLProcessor::getCursorSourceDetail(
+		Context &cxt, bool forNext) {
+	OpStore &store = prepareStore(cxt);
+	OpCursor::Source source(getStoreRootId(), store, NULL);
+	source.setExtContext(&getExtOpContext(cxt));
+
+	if (simulator_.get() != NULL) {
+		source.setFlags(simulator_->checkPartialMonitor(forNext));
 	}
-	source.setExtContext(extCxt_.get());
 
 	return source;
+}
+
+SQLOps::OpStore& DQLProcessor::prepareStore(Context &cxt) {
+	if (store_.get() == NULL) {
+		if (infoEntry_.get() == NULL || !storeRootId_.isEmpty()) {
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL_INVALID_INPUT, "");
+		}
+
+		SQLOps::ExtOpContext &extCxt = getExtOpContext(cxt);
+		allocManager_ = UTIL_MAKE_LOCAL_UNIQUE(
+				allocManager_, OpAllocatorManager,
+				cxt.getVarAllocator(), false,
+				&OpAllocatorManager::getDefault().getSubManager(extCxt),
+				&cxt.getVarAllocator());
+		store_ = UTIL_MAKE_LOCAL_UNIQUE(store_, OpStore, *allocManager_);
+
+		store_->setStackAllocatorBase(&cxt.getAllocator().base());
+
+		const OpStoreId &id = store_->allocateEntry();
+		OpStore::Entry &entry = store_->getEntry(id);
+
+		cxt.setProcessorGroup(infoEntry_->storeGroup_.get());
+		store_->setTempStoreGroup(*infoEntry_->storeGroup_);
+
+		SQLValues::ValueContext valueCxt(entry.getValueContextSource(NULL));
+		DQLProcs::Option option;
+		loadOption(valueCxt, infoEntry_->optionImage_, option);
+
+		const AllocTupleInfoList &inputInfo = infoEntry_->inputInfo_;
+		setUpConfig(*store_, cxt.getConfig(), false);
+		setUpRoot(*store_, entry, option, inputInfo);
+		setUpInput(getRootCode(*store_, id), inputInfo.size(), inputIdOffset_);
+
+		if (isProfilerRequested(profiler_)) {
+			store_->activateProfiler();
+		}
+
+
+		storeRootId_ = id;
+	}
+
+	return *store_;
+}
+
+SQLOps::ExtOpContext& DQLProcessor::getExtOpContext(Context &cxt) {
+	if (extCxt_.get() == NULL) {
+		extCxt_ =
+				ALLOC_UNIQUE(cxt.getVarAllocator(), DQLProcs::ExtProcContext);
+		extCxt_->setBase(cxt);
+	}
+	return *extCxt_;
+}
+
+void DQLProcessor::loadOption(
+		SQLValues::ValueContext &valueCxt, const OptionImage &image,
+		DQLProcs::Option &option) const {
+
+	util::ArrayByteInStream byteInStream(
+			(util::ArrayInStream(image.data(), image.size())));
+	util::ObjectInStream<util::ArrayByteInStream> inStream(byteInStream);
+
+	DQLProcs::ProcInOption procInOption(valueCxt.getAllocator());
+	procInOption.byteInStream_ = &inStream;
+
+	DQLProcs::OptionInput in(
+			valueCxt, getRegistrarTable(), getType(), &procInOption);
+	option.importFrom(in);
+}
+
+SQLValues::ValueContext::Source DQLProcessor::getValueContextSource(
+		util::StackAllocator &alloc, SQLValues::VarAllocator &varAlloc,
+		TupleList::Group &storeGroup,
+		util::LocalUniquePtr<SQLValues::VarContext> &varCxt) {
+	if (varCxt.get()  == NULL) {
+		varCxt = UTIL_MAKE_LOCAL_UNIQUE(varCxt, SQLValues::VarContext);
+		varCxt->setVarAllocator(&varAlloc);
+		varCxt->setGroup(&storeGroup);
+	}
+	return SQLValues::ValueContext::Source(&alloc, varCxt.get(), NULL);
 }
 
 const SQLOps::OpStoreId& DQLProcessor::getStoreRootId() const {
@@ -204,19 +387,54 @@ const SQLOps::OpCode& DQLProcessor::getRootCode(
 	return plan.getParentOutput(0).getInput(0).getCode();
 }
 
+void DQLProcessor::setUpConfig(
+		OpStore &store, const SQLProcessorConfig *config, bool merged) {
+	if (!merged) {
+		SQLProcessorConfig localConfig;
+		localConfig.merge(config, true);
+		setUpConfig(store, &localConfig, true);
+		return;
+	}
+
+	SQLOps::OpConfig dest;
+	{
+		int64_t limitBytes = config->workMemoryLimitBytes_;
+		if (limitBytes < 0) {
+			limitBytes = SQLProcessorConfig().getDefault().workMemoryLimitBytes_;
+		}
+
+		if (limitBytes < 0) {
+			GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL_INVALID_INPUT, "");
+		}
+
+		dest.set(SQLOpTypes::CONF_WORK_MEMORY_LIMIT, limitBytes);
+	}
+
+	dest.set(
+			SQLOpTypes::CONF_INTERRUPTION_PROJECTION_COUNT,
+			config->interruptionProjectionCount_);
+	dest.set(
+			SQLOpTypes::CONF_INTERRUPTION_SCAN_COUNT,
+			config->interruptionScanCount_);
+	store.setConfig(dest);
+}
+
 void DQLProcessor::setUpRoot(
 		OpStore &store, OpStore::Entry &rootEntry,
-		const DQLProcs::Option &option, const TupleInfoList &inputInfo) {
+		const DQLProcs::Option &option, const AllocTupleInfoList &inputInfo) {
 	util::StackAllocator &alloc = rootEntry.getStackAllocator();
 	const SQLOps::OpCode &code = createOpCode(alloc, option, inputInfo);
-	const bool inputIgnorable = (code.findContainerLocation() != NULL);
+	const bool inputIgnorable = DQLProcs::Option::isInputIgnorable(code);
 
-	for (TupleInfoList::const_iterator inIt = inputInfo.begin();
+	for (AllocTupleInfoList::const_iterator inIt = inputInfo.begin();
 			inIt != inputInfo.end(); ++inIt) {
 		const SQLOps::OpStoreId &id = store.allocateEntry();
 
+		const TupleList::TupleColumnType *list =
+				(inIt->empty() ? NULL : &(*inIt)[0]);
+
 		OpStore::Entry &entry = store.getEntry(id);
-		entry.setColumnTypeList(0, *inIt, false, false);
+		entry.setColumnTypeList(0, list, inIt->size(), false, false);
 		entry.createTupleList(0);
 		entry.setPipelined();
 
@@ -225,7 +443,7 @@ void DQLProcessor::setUpRoot(
 		}
 
 		const uint32_t index = static_cast<uint32_t>(inIt - inputInfo.begin());
-		rootEntry.setLink(index, true, id);
+		rootEntry.setLink(index, true, id, 0);
 	}
 
 	{
@@ -239,14 +457,14 @@ void DQLProcessor::setUpRoot(
 		entry.createTupleList(0);
 
 		const uint32_t index = 0;
-		rootEntry.setLink(index, false, id);
+		rootEntry.setLink(index, false, id, 0);
 	}
 
 	SQLOps::OpPlan &plan = rootEntry.getPlan();
 	SQLOps::OpNode &node = plan.createNode(code.getType());
 	node.setCode(code);
 
-	for (TupleInfoList::const_iterator inIt = inputInfo.begin();
+	for (AllocTupleInfoList::const_iterator inIt = inputInfo.begin();
 			inIt != inputInfo.end(); ++inIt) {
 		const uint32_t index = static_cast<uint32_t>(inIt - inputInfo.begin());
 		node.addInput(plan.getParentInput(index));
@@ -263,7 +481,7 @@ void DQLProcessor::setUpRoot(
 void DQLProcessor::setUpInput(
 		const SQLOps::OpCode &code, size_t inputCount,
 		InputId &inputIdOffset) {
-	const bool inputIgnorable = (code.findContainerLocation() != NULL);
+	const bool inputIgnorable = DQLProcs::Option::isInputIgnorable(code);
 	const bool inputEmpty = (inputCount <= 0);
 
 	InputId offset;
@@ -279,15 +497,15 @@ void DQLProcessor::setUpInput(
 
 SQLOps::OpCode DQLProcessor::createOpCode(
 		util::StackAllocator &alloc, const DQLProcs::Option &option,
-		const TupleInfoList &inputInfo) {
+		const AllocTupleInfoList &inputInfo) {
 	SQLOps::OpCodeBuilder builder(SQLOps::OpCodeBuilder::ofAllocator(alloc));
 
 	SQLExprs::ExprFactoryContext &cxt = builder.getExprFactoryContext();
 
-	for (TupleInfoList::const_iterator inIt = inputInfo.begin();
+	for (AllocTupleInfoList::const_iterator inIt = inputInfo.begin();
 			inIt != inputInfo.end(); ++inIt) {
 		const uint32_t index = static_cast<uint32_t>(inIt - inputInfo.begin());
-		for (TupleInfo::const_iterator it = inIt->begin();
+		for (AllocTupleInfo::const_iterator it = inIt->begin();
 				it != inIt->end(); ++it) {
 			const uint32_t pos = static_cast<uint32_t>(it - inIt->begin());
 			cxt.setInputType(index, pos, *it);
@@ -301,7 +519,33 @@ SQLOps::OpCode DQLProcessor::createOpCode(
 void DQLProcessor::getOutputInfo(
 		const SQLOps::OpCode &code, TupleInfo &outputInfo) {
 	outputInfo.clear();
-	SQLOps::OpCodeBuilder::resolveColumnTypeList(code, outputInfo);
+	SQLOps::OpCodeBuilder::resolveColumnTypeList(code, outputInfo, NULL);
+}
+
+bool DQLProcessor::isProfilerRequested(const Profiler &profiler) {
+	return (matchProfilerResultType(profiler, true) ||
+			matchProfilerResultType(profiler, false));
+}
+
+bool DQLProcessor::matchProfilerResultType(
+		const Profiler &profiler, bool asStream) {
+	if (asStream) {
+		return profiler.isForAnalysis();
+	}
+	else {
+		const picojson::value &option = profiler.getOption();
+		const bool *enabled = (option.is<picojson::object>() ?
+				JsonUtils::find<bool>(option, "op") : NULL);
+		return (enabled != NULL && *enabled);
+	}
+}
+
+
+DQLProcessor::InfoEntry::InfoEntry(
+		const util::StdAllocator<void, void> &alloc) :
+		optionImage_(alloc),
+		inputInfo_(alloc),
+		outputInfo_(alloc) {
 }
 
 
@@ -361,12 +605,50 @@ const DQLProcs::ProcRegistrar* DQLProcs::ProcRegistrarTable::find(
 }
 
 
+DQLProcs::ProcResourceSet::ProcResourceSet() :
+		baseCxt_(NULL) {
+}
+
+void DQLProcs::ProcResourceSet::setBase(SQLContext &baseCxt) {
+	baseCxt_ = &baseCxt;
+}
+
+SQLService* DQLProcs::ProcResourceSet::getSQLService() const {
+	return baseCxt_->getExecutionManager()->getSQLService();
+}
+
+TransactionManager* DQLProcs::ProcResourceSet::getTransactionManager() const {
+	return baseCxt_->getTransactionManager();
+}
+
+TransactionService* DQLProcs::ProcResourceSet::getTransactionService() const {
+	return baseCxt_->getTransactionService();
+}
+
+ClusterService* DQLProcs::ProcResourceSet::getClusterService() const {
+	return baseCxt_->getClusterService();
+}
+
+PartitionTable* DQLProcs::ProcResourceSet::getPartitionTable() const {
+	return baseCxt_->getPartitionTable();
+}
+
+PartitionList* DQLProcs::ProcResourceSet::getPartitionList() const {
+	return baseCxt_->getPartitionList();
+}
+
+const DataStoreConfig* DQLProcs::ProcResourceSet::getDataStoreConfig() const {
+	return baseCxt_->getDataStoreConfig();
+}
+
+
 DQLProcs::ExtProcContext::ExtProcContext() :
 		baseCxt_(NULL) {
 }
 
 void DQLProcs::ExtProcContext::setBase(SQLContext &baseCxt) {
 	baseCxt_ = &baseCxt;
+	resourceSet_.setBase(baseCxt);
 }
 
 size_t DQLProcs::ExtProcContext::findMaxStringLength() {
@@ -411,7 +693,7 @@ SQLExecutionManager* DQLProcs::ExtProcContext::getExecutionManager() {
 }
 
 const ResourceSet* DQLProcs::ExtProcContext::getResourceSet() {
-	return getBase().getResourceSet();
+	return &resourceSet_;
 }
 
 bool DQLProcs::ExtProcContext::isOnTransactionService() {
@@ -422,21 +704,245 @@ double DQLProcs::ExtProcContext::getStoreMemoryAgingSwapRate() {
 	return getBase().getStoreMemoryAgingSwapRate();
 }
 
-void DQLProcs::ExtProcContext::getConfig(SQLOps::OpConfig &config) {
-	SQLProcessorConfig procConfig;
-	procConfig.merge(getBase().getConfig(), true);
+bool DQLProcs::ExtProcContext::isAdministrator() {
+	return getBase().isAdministrator();
+}
 
-	config.set(
-			SQLOpTypes::CONF_INTERRUPTION_PROJECTION_COUNT,
-			procConfig.interruptionProjectionCount_);
-	config.set(
-			SQLOpTypes::CONF_INTERRUPTION_SCAN_COUNT,
-			procConfig.interruptionScanCount_);
+uint32_t DQLProcs::ExtProcContext::getTotalWorkerId() {
+	EventContext *ec = getEventContext();
+	if (ec->isOnIOWorker()) {
+		assert(false);
+		GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	}
+
+	const uint32_t workerId = ec->getWorkerId();
+	if (isOnTransactionService()) {
+		return workerId;
+	}
+	else {
+		TransactionManager *txnMgr = getResourceSet()->getTransactionManager();
+		const uint32_t txnWorkerCount =
+				txnMgr->getPartitionGroupConfig().getPartitionGroupCount();
+		return txnWorkerCount + workerId;
+	}
 }
 
 SQLContext& DQLProcs::ExtProcContext::getBase() {
 	assert(baseCxt_ != NULL);
 	return *baseCxt_;
+}
+
+
+DQLProcs::ProcSimulator::ProcSimulator(Manager &manager) :
+		manager_(manager) {
+}
+
+DQLProcs::ProcSimulator::~ProcSimulator() {
+	if (opSimulator_.get() != NULL) {
+		manager_.clearSimulation();
+	}
+	if (partialInfo_.get() != NULL && !partialInfo_->id_.isEmpty()) {
+		manager_.closePartial(partialInfo_->id_);
+	}
+}
+
+SQLOps::OpSimulator* DQLProcs::ProcSimulator::getOpSimulator() {
+	return opSimulator_.get();
+}
+
+SQLOps::OpSimulator* DQLProcs::ProcSimulator::tryCreate(
+		SQLProcessor::Context &cxt, Manager &manager,
+		util::AllocUniquePtr<ProcSimulator> &simulator,
+		SQLType::Id type, const SQLOps::OpPlan &plan) {
+	simulator.reset();
+
+	if (tryCreateOpSimulator(cxt, manager, simulator, type, plan)) {
+		return simulator->getOpSimulator();
+	}
+
+	tryCreatePartialMonitor(cxt, manager, simulator, type, plan);
+	return NULL;
+}
+
+uint32_t DQLProcs::ProcSimulator::checkPartialMonitor(bool forNext) {
+	uint32_t cursorFlags = 0;
+
+	do {
+		if (partialInfo_.get() == NULL) {
+			break;
+		}
+
+		Manager::PartialId &partialId = partialInfo_->id_;
+		if (partialId.isEmpty()) {
+			break;
+		}
+
+		SQLProcessorConfig::PartialStatus status;
+		const bool passed = manager_.checkPartial(partialId, status);
+		partialInfo_->profile_.globalStatus_ = status;
+
+		const bool noExec = passed;
+		const bool pretendSuspend = (passed || forNext);
+
+		if (noExec) {
+			cursorFlags |= SQLOps::OpCursor::FLAG_NO_EXEC;
+		}
+
+		if (pretendSuspend) {
+			cursorFlags |= SQLOps::OpCursor::FLAG_PRETEND_SUSPEND;
+		}
+	}
+	while (false);
+
+	return cursorFlags;
+}
+
+SQLOpUtils::AnalysisPartialInfo* DQLProcs::ProcSimulator::getPartialProfile() {
+	if (partialInfo_.get() == NULL) {
+		return NULL;
+	}
+	return &partialInfo_->profile_;
+}
+
+SQLProcessorConfig::Manager::SimulationEntry
+DQLProcs::ProcSimulator::toBaseEntry(const OpSimulator::Entry &src) {
+	Manager::SimulationEntry dest;
+	dest.point_ = src.point_;
+	dest.action_ = src.action_;
+	dest.param_ = src.param_;
+	return dest;
+}
+
+SQLOps::OpSimulator::Entry DQLProcs::ProcSimulator::toOpEntry(
+		const Manager::SimulationEntry &src) {
+	OpSimulator::Entry dest;
+	dest.point_ = static_cast<OpSimulator::PointType>(src.point_);
+	dest.action_ = static_cast<OpSimulator::ActionType>(src.action_);
+	dest.param_ = src.param_;
+	return dest;
+}
+
+bool DQLProcs::ProcSimulator::tryCreateOpSimulator(
+		SQLProcessor::Context &cxt, Manager &manager,
+		util::AllocUniquePtr<ProcSimulator> &simulator,
+		SQLType::Id type, const SQLOps::OpPlan &plan) {
+	if (!manager.isSimulating()) {
+		return false;
+	}
+
+	const SQLOps::OpNode *node = plan.findNextNode(0);
+	if (node == NULL) {
+		return false;
+	}
+
+	util::StackAllocator &alloc = cxt.getEventContext()->getAllocator();
+
+	typedef util::Vector<Manager::SimulationEntry> BaseEntryList;
+	BaseEntryList entryList(alloc);
+
+	SQLType::Id curType;
+	int64_t inputCount;
+	const bool simulating =
+			manager.getSimulation(entryList, curType, inputCount);
+	if (!simulating || curType != type) {
+		return false;
+	}
+
+	const int64_t modInCount =
+			static_cast<int64_t>(plan.getParentInputCount()) -
+			(Option::isInputIgnorable(node->getCode()) ? 1 : 0);
+	if (inputCount >= 0 && modInCount != inputCount) {
+		return false;
+	}
+
+	SQLValues::VarAllocator &varAlloc = cxt.getVarAllocator();
+	simulator = ALLOC_UNIQUE(varAlloc, ProcSimulator, manager);
+
+	util::LocalUniquePtr<SQLOps::OpSimulator> &opSimulator =
+			simulator->opSimulator_;
+	opSimulator = UTIL_MAKE_LOCAL_UNIQUE(
+			opSimulator, SQLOps::OpSimulator, varAlloc);
+	for (BaseEntryList::const_iterator it = entryList.begin();
+			it != entryList.end(); ++it) {
+		opSimulator->addEntry(toOpEntry(*it));
+	}
+	return true;
+}
+
+bool DQLProcs::ProcSimulator::tryCreatePartialMonitor(
+		SQLProcessor::Context &cxt, Manager &manager,
+		util::AllocUniquePtr<ProcSimulator> &simulator,
+		SQLType::Id type, const SQLOps::OpPlan &plan) {
+	if (!manager.isPartialMonitoring()) {
+		return false;
+	}
+
+	int32_t index;
+	int64_t submissionCode;
+	if (type == SQLType::EXEC_SCAN) {
+		index = 0;
+		submissionCode = 0;
+	}
+	else if (type == SQLType::EXEC_SELECT) {
+		const SQLOps::OpNode *node = plan.findNextNode(0);
+		if (node == NULL) {
+			return false;
+		}
+
+		const SQLOps::Projection *proj = node->getCode().getPipeProjection();
+		if (proj->getProjectionCode().getType() != SQLOpTypes::PROJ_OUTPUT) {
+			return false;
+		}
+
+		const size_t valueCount = 2;
+		int64_t valueList[valueCount];
+		{
+			SQLExprs::Expression::Iterator it(*proj);
+			for (size_t i = 0; i < valueCount; i++) {
+				if (!it.exists()) {
+					return false;
+				}
+				const SQLExprs::Expression &expr = it.get();
+				if (expr.getCode().getType() != SQLType::EXPR_CONSTANT) {
+					return false;
+				}
+				const TupleValue &value = expr.getCode().getValue();
+				if (value.getType() != TupleList::TYPE_LONG) {
+					return false;
+				}
+				valueList[i] = value.get<int64_t>();
+				it.next();
+			}
+		}
+
+		index = static_cast<int32_t>(valueList[0]) + 1;
+		submissionCode = valueList[1];
+
+		if (index <= 0) {
+			return false;
+		}
+	}
+	else {
+		return false;
+	}
+
+	Manager::PartialId partialId(cxt, index);
+	if (!manager.initPartial(partialId, submissionCode)) {
+		partialId = Manager::PartialId();
+	}
+
+	SQLValues::VarAllocator &varAlloc = cxt.getVarAllocator();
+	simulator = ALLOC_UNIQUE(varAlloc, ProcSimulator, manager);
+
+	util::LocalUniquePtr<PartialInfo> &info = simulator->partialInfo_;
+	info = UTIL_MAKE_LOCAL_UNIQUE(info, PartialInfo);
+	info->id_ = partialId;
+
+	return true;
+}
+
+DQLProcs::ProcSimulator::PartialInfo::PartialInfo() :
+		pretendSuspendLast_(false) {
 }
 
 
@@ -666,6 +1172,10 @@ SQLOps::OpCode DQLProcs::Option::toCode(
 	return code;
 }
 
+bool DQLProcs::Option::isInputIgnorable(const SQLOps::OpCode &code) {
+	return (code.findContainerLocation() != NULL);
+}
+
 
 template<typename T>
 DQLProcs::BasicSubOption<T>::BasicSubOption(util::StackAllocator &alloc) :
@@ -732,6 +1242,7 @@ void DQLProcs::CommonOption::toPlanNode(OptionOutput &out) const {
 
 void DQLProcs::CommonOption::toCode(
 		SQLOps::OpCodeBuilder &builder, SQLOps::OpCode &code) const {
+	static_cast<void>(builder);
 	code.setLimit(limit_);
 	code.setAggregationPhase(phase_);
 }
@@ -740,7 +1251,8 @@ void DQLProcs::CommonOption::toCode(
 DQLProcs::GroupOption::GroupOption(util::StackAllocator &alloc) :
 		columnList_(NULL),
 		groupColumns_(alloc),
-		nestLevel_(0) {
+		nestLevel_(0),
+		pred_(NULL) {
 }
 
 void DQLProcs::GroupOption::fromPlanNode(OptionInput &in) {
@@ -753,27 +1265,42 @@ void DQLProcs::GroupOption::fromPlanNode(OptionInput &in) {
 	for (Expression::Iterator it(list); it.exists(); it.next()) {
 		groupColumns_.push_back(it.get().getCode().getColumnPos());
 	}
+
+	if (!node.predList_.empty() && (node.cmdOptionFlag_ &
+			ProcPlan::Node::Config::CMD_OPT_GROUP_RANGE) != 0) {
+		pred_ = rewriter.toExpr(&node.predList_.back());
+	}
 }
 
 void DQLProcs::GroupOption::toPlanNode(OptionOutput &out) const {
 	ProcPlan::Node &node = out.resolvePlanNode();
+	static_cast<void>(node);
 }
 
 void DQLProcs::GroupOption::toCode(
 		SQLOps::OpCodeBuilder &builder, SQLOps::OpCode &code) const {
-	code.setType(SQLOpTypes::OP_GROUP);
+	if (pred_ != NULL &&
+			pred_->getCode().getType() == SQLType::EXPR_RANGE_GROUP) {
+		code.setType(SQLOpTypes::OP_GROUP_RANGE);
+	}
+	else {
+		code.setType(SQLOpTypes::OP_GROUP);
+	}
 
+	bool forWindow = false;
 	code.setPipeProjection(&builder.toGroupingProjectionByExpr(
-			columnList_, code.getAggregationPhase()));
+			columnList_, code.getAggregationPhase(), forWindow));
 
 	SQLValues::CompColumnList &list = builder.createCompColumnList();
 	for (ColumnPosList::const_iterator it = groupColumns_.begin();
 			it != groupColumns_.end(); ++it) {
 		SQLValues::CompColumn column;
 		column.setColumnPos(*it, true);
+		column.setOrdering(false);
 		list.push_back(column);
 	}
 	code.setKeyColumnList(&list);
+	code.setFilterPredicate(pred_);
 }
 
 
@@ -821,6 +1348,7 @@ void DQLProcs::JoinOption::fromPlanNode(OptionInput &in) {
 
 void DQLProcs::JoinOption::toPlanNode(OptionOutput &out) const {
 	ProcPlan::Node &node = out.resolvePlanNode();
+	static_cast<void>(node);
 }
 
 void DQLProcs::JoinOption::toCode(
@@ -874,81 +1402,81 @@ void DQLProcs::LimitOption::toPlanNode(OptionOutput &out) const {
 
 void DQLProcs::LimitOption::toCode(
 		SQLOps::OpCodeBuilder &builder, SQLOps::OpCode &code) const {
+	static_cast<void>(builder);
 	code.setType(SQLOpTypes::OP_LIMIT);
 	code.setOffset(offset_);
 }
 
 
 DQLProcs::ScanOption::ScanOption(util::StackAllocator &alloc) :
-		tableType_(SQLType::TABLE_CONTAINER),
-		databaseVersionId_(-1),
-		containerId_(std::numeric_limits<uint64_t>::max()),
-		schemaVersionId_(std::numeric_limits<uint32_t>::max()),
-		partitioningVersionId_(-1),
 		columnList_(NULL),
-		pred_(NULL),
-		containerExpirable_(false),
-		indexActivated_(false),
-		multiIndexActivated_(false),
-		indexList_(NULL) {
+		pred_(NULL) {
+	static_cast<void>(alloc);
 }
 
 void DQLProcs::ScanOption::fromPlanNode(OptionInput &in) {
 	const ProcPlan::Node &node = in.resolvePlanNode();
 	SQLExprs::SyntaxExprRewriter rewriter = in.createPlanRewriter();
 
-	tableType_ = node.tableIdInfo_.type_;
-	databaseVersionId_ = node.tableIdInfo_.dbId_;
-	containerId_ = node.tableIdInfo_.containerId_;
-	schemaVersionId_ = node.tableIdInfo_.schemaVersionId_;
-	partitioningVersionId_ = node.tableIdInfo_.partitioningVersionId_;
+	location_ = getLocation(in.getAllocator(), node);
 
 	columnList_ = &rewriter.toProjection(node.outputList_);
 
 	if (node.predList_.size() > 0) {
 		pred_ = rewriter.toExpr(&node.predList_[0]);
 	}
-
-	containerExpirable_ = ((node.cmdOptionFlag_ &
-			ProcPlan::Node::Config::CMD_OPT_SCAN_EXPIRABLE) != 0);
-	indexActivated_ = ((node.cmdOptionFlag_ &
-			ProcPlan::Node::Config::CMD_OPT_SCAN_INDEX) != 0);
-	multiIndexActivated_ = ((node.cmdOptionFlag_ &
-			ProcPlan::Node::Config::CMD_OPT_SCAN_MULTI_INDEX) != 0);
-
-	if (node.indexInfoList_ != NULL && !node.indexInfoList_->empty()) {
-		indexList_ = ALLOC_NEW(in.getAllocator()) util::Vector<int32_t>(
-				node.indexInfoList_->begin(),
-				node.indexInfoList_->end(),
-				in.getAllocator());
-	}
 }
 
 void DQLProcs::ScanOption::toPlanNode(OptionOutput &out) const {
 	ProcPlan::Node &node = out.resolvePlanNode();
+	static_cast<void>(node);
 }
 
 void DQLProcs::ScanOption::toCode(
 		SQLOps::OpCodeBuilder &builder, SQLOps::OpCode &code) const {
 	code.setType(SQLOpTypes::OP_SCAN);
 
-	SQLOps::ContainerLocation &location = builder.createContainerLocation();
-
-	location.type_ = tableType_;
-	location.dbVersionId_ = databaseVersionId_;
-	location.id_ = containerId_;
-	location.schemaVersionId_ = schemaVersionId_;
-	location.partitioningVersionId_= partitioningVersionId_;
-	location.schemaVersionSpecified_ = true;
-	location.expirable_ = containerExpirable_;
-	location.indexActivated_ = indexActivated_;
-	location.multiIndexActivated_ = multiIndexActivated_;
-
-	code.setContainerLocation(&location);
-
+	code.setContainerLocation(&builder.createContainerLocation(location_));
 	code.setPipeProjection(&builder.toNormalProjectionByExpr(
 			columnList_, code.getAggregationPhase()));
 	code.setFilterPredicate(pred_);
+}
+
+SQLOps::ContainerLocation DQLProcs::ScanOption::getLocation(
+		util::StackAllocator &alloc, const ProcPlan::Node &node) {
+	SQLOps::ContainerLocation location;
+
+	{
+		const SQLTableInfo::IdInfo &idInfo = node.tableIdInfo_;
+
+		location.type_ = idInfo.type_;
+		location.dbVersionId_ = idInfo.dbId_;
+		location.id_ = idInfo.containerId_;
+		location.schemaVersionId_ = idInfo.schemaVersionId_;
+		location.partitioningVersionId_ = idInfo.partitioningVersionId_;
+		location.approxSize_ = idInfo.approxSize_;
+	}
+
+	if (node.indexInfoList_ != NULL) {
+		const util::Vector<ColumnId> &inColumns =
+				node.indexInfoList_->getFirstColumns();
+
+		location.indexFirstColumns_ = ALLOC_NEW(alloc) util::Vector<uint32_t>(
+				inColumns.begin(), inColumns.end(), alloc);
+	}
+
+	{
+		const ProcPlan::Node::CommandOptionFlag &flags = node.cmdOptionFlag_;
+
+		location.expirable_ = ((flags &
+				ProcPlan::Node::Config::CMD_OPT_SCAN_EXPIRABLE) != 0);
+		location.indexActivated_ = ((flags &
+				ProcPlan::Node::Config::CMD_OPT_SCAN_INDEX) != 0);
+		location.multiIndexActivated_ = ((flags &
+				ProcPlan::Node::Config::CMD_OPT_SCAN_MULTI_INDEX) != 0);
+	}
+
+	return location;
 }
 
 
@@ -958,7 +1486,6 @@ DQLProcs::SelectOption::SelectOption(util::StackAllocator&) :
 
 void DQLProcs::SelectOption::fromPlanNode(OptionInput &in) {
 	const ProcPlan::Node &node = in.resolvePlanNode();
-	util::StackAllocator &alloc = in.getAllocator();
 	SQLExprs::SyntaxExprRewriter rewriter = in.createPlanRewriter();
 
 	output_ = &rewriter.toSelection(
@@ -968,6 +1495,7 @@ void DQLProcs::SelectOption::fromPlanNode(OptionInput &in) {
 
 void DQLProcs::SelectOption::toPlanNode(OptionOutput &out) const {
 	ProcPlan::Node &node = out.resolvePlanNode();
+	static_cast<void>(node);
 }
 
 void DQLProcs::SelectOption::toCode(
@@ -1016,6 +1544,7 @@ void DQLProcs::SortOption::fromPlanNode(OptionInput &in) {
 
 void DQLProcs::SortOption::toPlanNode(OptionOutput &out) const {
 	ProcPlan::Node &node = out.resolvePlanNode();
+	static_cast<void>(node);
 }
 
 void DQLProcs::SortOption::toCode(
@@ -1027,8 +1556,10 @@ void DQLProcs::SortOption::toCode(
 		code.setType(SQLOpTypes::OP_SORT);
 	}
 
-	code.setSubOffset(subOffset_);
-	code.setSubLimit(subLimit_);
+	if (subLimit_ >= 0) {
+		code.setSubOffset((subOffset_ >= 0 ? subOffset_ : 0));
+		code.setSubLimit(subLimit_);
+	}
 
 	SQLValues::CompColumnList &list = builder.createCompColumnList();
 	for (SortColumnList::const_iterator it = orderColumns_.begin();
@@ -1042,7 +1573,7 @@ void DQLProcs::SortOption::toCode(
 
 	if (forWindow_) {
 		code.setPipeProjection(&builder.toGroupingProjectionByExpr(
-				output_, code.getAggregationPhase()));
+				output_, code.getAggregationPhase(), forWindow_));
 	}
 	else {
 		code.setPipeProjection(&builder.toNormalProjectionByExpr(
@@ -1063,6 +1594,7 @@ void DQLProcs::UnionOption::fromPlanNode(OptionInput &in) {
 
 void DQLProcs::UnionOption::toPlanNode(OptionOutput &out) const {
 	ProcPlan::Node &node = out.resolvePlanNode();
+	static_cast<void>(node);
 }
 
 void DQLProcs::UnionOption::toCode(
@@ -1192,10 +1724,9 @@ void SQLProcessor::ValueUtils::toUpper(char8_t *buf, size_t size) {
 
 uint32_t SQLProcessor::ValueUtils::hashValue(
 		const TupleValue &value, const uint32_t *base) {
-	const SQLValues::ValueFnv1aHasher hasher(
-			value.getType(),
-			(base == NULL ? SQLValues::ValueUtils::fnv1aHashInit() : *base));
-	return hasher(value);
+	const int64_t seed =
+			(base == NULL ? SQLValues::ValueUtils::fnv1aHashInit() : *base);
+	return SQLValues::ValueFnv1aHasher::ofValue(value, seed)(value);
 }
 
 uint32_t SQLProcessor::ValueUtils::hashString(
@@ -1207,9 +1738,8 @@ uint32_t SQLProcessor::ValueUtils::hashString(
 
 int32_t SQLProcessor::ValueUtils::orderValue(
 		const TupleValue &value1, const TupleValue &value2, bool strict) {
-	const SQLValues::ValueComparator comp(
-			SQLValues::ValueUtils::toCompType(value1, value2), strict);
-	return comp(value1, value2);
+	return SQLValues::ValueComparator::ofValues(
+			value1, value2, strict, true)(value1, value2);
 }
 
 int32_t SQLProcessor::ValueUtils::orderString(
@@ -1260,16 +1790,21 @@ int64_t SQLProcessor::ValueUtils::intervalToAffinity(
 
 void SQLProcessor::DQLTool::decodeSimulationEntry(
 		const picojson::value &value, SimulationEntry &entry) {
-	static_cast<void>(value);
-	static_cast<void>(entry);
-	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	JsonUtils::InStream in(value);
+
+	SQLOps::OpSimulator::Entry opEntry;
+	util::ObjectCoder().decode(in, opEntry);
+
+	entry = DQLProcs::ProcSimulator::toBaseEntry(opEntry);
 }
 
 void SQLProcessor::DQLTool::encodeSimulationEntry(
 		const SimulationEntry &entry, picojson::value &value) {
-	static_cast<void>(entry);
-	static_cast<void>(value);
-	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+	JsonUtils::OutStream out(value);
+
+	SQLOps::OpSimulator::Entry opEntry =
+			DQLProcs::ProcSimulator::toOpEntry(entry);
+	util::ObjectCoder().encode(out, opEntry);
 }
 
 void SQLProcessor::DQLTool::getInterruptionProfile(picojson::value &value) {
@@ -1278,7 +1813,7 @@ void SQLProcessor::DQLTool::getInterruptionProfile(picojson::value &value) {
 }
 
 bool SQLProcessor::DQLTool::isDQL(SQLType::Id type) {
-	return (DQLProcessor::getRegistrarTable().find(type) != NULL);
+	return DQLProcessor::isDQL(type);
 }
 
 void SQLProcessor::DQLTool::customizeDefaultConfig(SQLProcessorConfig &config) {
@@ -1443,6 +1978,24 @@ void SQLCompiler::ProcessorUtils::getTablePartitionAffinityRevList(
 			partitioning, affinityRevList);
 }
 
+bool SQLCompiler::ProcessorUtils::isRangeGroupSupportedType(ColumnType type) {
+	return SQLExprs::RangeGroupUtils::isRangeGroupSupportedType(type);
+}
+
+TupleValue SQLCompiler::ProcessorUtils::getRangeGroupBoundary(
+		util::StackAllocator &alloc, ColumnType keyType, TupleValue base,
+		bool forLower, bool inclusive) {
+	return SQLExprs::RangeGroupUtils::getRangeGroupBoundary(
+			alloc, keyType, base, forLower, inclusive);
+}
+
+bool SQLCompiler::ProcessorUtils::adjustRangeGroupBoundary(
+		TupleValue &lower, TupleValue &upper, int64_t interval,
+		int64_t offset) {
+	return SQLExprs::RangeGroupUtils::adjustRangeGroupBoundary(
+			lower, upper, interval, offset);
+}
+
 TupleValue SQLCompiler::ProcessorUtils::evalConstExpr(
 		TupleValue::VarContext &varCxt, const Expr &expr,
 		const CompileOption &option) {
@@ -1450,6 +2003,16 @@ TupleValue SQLCompiler::ProcessorUtils::evalConstExpr(
 	DQLProcs::CompilerUtils::applyCompileOption(cxt, option);
 
 	return SQLExprs::SyntaxExprRewriter::evalConstExpr(
+			cxt, SQLExprs::ExprFactory::getDefaultFactory(), expr);
+}
+
+void SQLCompiler::ProcessorUtils::checkExprArgs(
+		TupleValue::VarContext &varCxt, const Expr &expr,
+		const CompileOption &option) {
+	SQLExprs::ExprContext cxt(SQLValues::ValueContext::ofVarContext(varCxt));
+	DQLProcs::CompilerUtils::applyCompileOption(cxt, option);
+
+	SQLExprs::SyntaxExprRewriter::checkExprArgs(
 			cxt, SQLExprs::ExprFactory::getDefaultFactory(), expr);
 }
 
@@ -1506,6 +2069,18 @@ bool SQLCompiler::ProcessorUtils::isWindowExprType(
 	return windowType;
 }
 
+bool SQLCompiler::ProcessorUtils::isExplicitOrderingAggregation(Type exprType) {
+	typedef SQLExprs::ExprSpec ExprSpec;
+	const ExprSpec &spec =
+			SQLExprs::ExprFactory::getDefaultFactory().getSpec(exprType);
+
+	assert(
+			SQLExprs::ExprTypeUtils::isAggregation(exprType) ||
+			SQLExprs::ExprTypeUtils::isFunction(exprType));
+
+	return ((spec.flags_ & ExprSpec::FLAG_AGGR_ORDERING) != 0);
+}
+
 SQLCompiler::ColumnType SQLCompiler::ProcessorUtils::getResultType(
 		Type exprType, size_t index, AggregationPhase phase,
 		const util::Vector<ColumnType> &argTypeList, bool grouping) {
@@ -1548,6 +2123,33 @@ bool SQLCompiler::ProcessorUtils::updateArgType(
 
 	assert(false);
 	GS_THROW_USER_ERROR(GS_ERROR_SQL_PROC_INTERNAL, "");
+}
+
+bool SQLCompiler::ProcessorUtils::findConstantArgType(
+		Type exprType, size_t startIndex, size_t &index, ColumnType &argType) {
+	index = std::numeric_limits<size_t>::max();
+	argType = TupleTypes::TYPE_NULL;
+
+	typedef SQLExprs::ExprSpec ExprSpec;
+	const ExprSpec &spec =
+			SQLExprs::ExprFactory::getDefaultFactory().getSpec(exprType);
+
+	for (size_t i = startIndex; i < ExprSpec::IN_LIST_SIZE; i++) {
+		const ExprSpec::In &in = spec.inList_[i];
+		const ColumnType inType = in.typeList_[0];
+
+		if (SQLValues::TypeUtils::isNull(inType)) {
+			break;
+		}
+
+		if ((in.flags_ & ExprSpec::FLAG_EXACT) != 0) {
+			index = i;
+			argType = inType;
+			return true;
+		}
+	}
+
+	return false;
 }
 
 TupleValue SQLCompiler::ProcessorUtils::convertType(

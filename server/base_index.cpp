@@ -21,6 +21,23 @@
 #include "base_index.h"
 #include "schema.h"
 
+BaseIndex::SearchContextPool::SearchContextPool(
+		util::StackAllocator &alloc, util::StackAllocator &settingAlloc) :
+		condValuePool_(alloc),
+		indexData_(createIndexData(alloc)),
+		settingAlloc_(settingAlloc) {
+}
+
+IndexData& BaseIndex::SearchContextPool::createIndexData(
+		util::StackAllocator &alloc) {
+	IndexData *indexData = ALLOC_NEW(alloc) IndexData(alloc);
+	return *indexData;
+}
+
+void BaseIndex::SearchContextPool::clearIndexData(IndexData &indexData) {
+	indexData.clear();
+}
+
 void BaseIndex::SearchContext::getConditionList(
 	util::Vector<TermCondition> &condList, ConditionType condType) {
 	util::Vector<size_t>::iterator itr;
@@ -44,59 +61,38 @@ void BaseIndex::SearchContext::getConditionList(
 
 bool BaseIndex::SearchContext::updateCondition(TransactionContext &txn, 
 	TermCondition &newCond) {
-	bool isReplaceOrSkip = false;
-	bool isInvalid = false;
+	bool isNoReplacement = true;
+	ConditionStatus status = ConditionStatus::NO_CONTRADICTION;
 	util::Vector<TermCondition>::iterator itr;
 	for (itr = conditionList_.begin(); itr != conditionList_.end(); itr++) {
-		if (itr->columnId_ == newCond.columnId_ && itr->valueType_ == newCond.valueType_ &&
-			itr->isRangeCondition() && newCond.isRangeCondition()) {
-			if (itr->opType_ == DSExpression::EQ) {
-				if (newCond.operator_(txn, static_cast<const uint8_t *>(itr->value_), itr->valueSize_, 
-					static_cast<const uint8_t *>(newCond.value_), newCond.valueSize_)) {
-					isReplaceOrSkip = true;
-				} else {
-					isInvalid = true;
-				}
-			} else if (newCond.opType_ == DSExpression::EQ) {
-				if (itr->operator_(txn, static_cast<const uint8_t *>(newCond.value_), newCond.valueSize_, 
-					static_cast<const uint8_t *>(itr->value_), itr->valueSize_)) {
-					*itr = newCond;
-					isReplaceOrSkip = true;
-				} else {
-					isInvalid = true;
-				}
-			} else if ((newCond.isStartCondition() && itr->isStartCondition()) ||
-				(newCond.isEndCondition() && itr->isEndCondition())) { 
-				if (itr->operator_(txn, static_cast<const uint8_t *>(newCond.value_), newCond.valueSize_, 
-					static_cast<const uint8_t *>(itr->value_), itr->valueSize_)) {
-					*itr = newCond;
-				}
-				isReplaceOrSkip = true;
-			} else {
-				if (!itr->operator_(txn, static_cast<const uint8_t *>(newCond.value_), newCond.valueSize_, 
-					static_cast<const uint8_t *>(itr->value_), itr->valueSize_) ||
-					!newCond.operator_(txn, static_cast<const uint8_t *>(itr->value_), itr->valueSize_, 
-					static_cast<const uint8_t *>(newCond.value_), newCond.valueSize_)) {
-					isInvalid = true;
-				}
-			}
-		}
-		if (isReplaceOrSkip) {
+		TermCondition &current = *itr;
+		status = checkCondition(txn, current, newCond);
+		if (status == ConditionStatus::REPLACEMENT) {
+			current = newCond;
+			isNoReplacement = false;
+			break;
+		} else if (status == ConditionStatus::CONTRADICTION) {
+			conditionList_.push_back(newCond);
+			break;
+		} else if (status == ConditionStatus::IGNORANCE) {
 			break;
 		}
 	}
 
-	if (!isReplaceOrSkip) {
+	if (isNoReplacement && status == NO_CONTRADICTION) {
 		util::Vector<ColumnId>::iterator columnIdItr;
 		columnIdItr = std::find(columnIdList_.begin(), columnIdList_.end(), newCond.columnId_);
-		bool isKey = (columnIdItr != columnIdList_.end()) ? true : false;
-		addCondition(newCond, isKey);
+		if (columnIdItr != columnIdList_.end()) {
+			keyList_.push_back(static_cast<ColumnId>(conditionList_.size()));
+		}
+		conditionList_.push_back(newCond);
 	}
-	return !isInvalid;
+	return status == ConditionStatus::REPLACEMENT;
 }
 
 void BaseIndex::SearchContext::copy(util::StackAllocator &alloc, SearchContext &dest) {
 	util::Vector<TermCondition>::iterator itr;
+	dest.setNullCond(nullCond_); 
 	for (itr = conditionList_.begin(); itr != conditionList_.end(); itr++) {
 		TermCondition destCond;
 		itr->copy(alloc, destCond);
@@ -105,7 +101,6 @@ void BaseIndex::SearchContext::copy(util::StackAllocator &alloc, SearchContext &
 	dest.keyList_.assign(keyList_.begin(), keyList_.end());
 	dest.limit_ = limit_;
 	dest.isResume_ = isResume_;
-	dest.setNullCond(nullCond_);
 	dest.columnIdList_.assign(columnIdList_.begin(), columnIdList_.end());
 
 	dest.setSuspended(isSuspended_);
@@ -130,7 +125,6 @@ void BaseIndex::SearchContext::copy(util::StackAllocator &alloc, SearchContext &
 	dest.setNullSuspended(isNullSuspended_);
 	dest.setSuspendRowId(suspendRowId_);
 }
-
 
 std::string BaseIndex::SearchContext::dump() {
 	util::NormalOStringStream strstrm;
@@ -185,8 +179,8 @@ std::string BaseIndex::SearchContext::dump() {
 }
 
 
-BaseIndex::Setting::Setting(ColumnType keyType, bool isCaseSenstive, TreeFuncInfo *funcInfo)
-	: keyType_(keyType), isCaseSenstive_(isCaseSenstive), 
+BaseIndex::Setting::Setting(ColumnType keyType, bool isCaseSensitive, TreeFuncInfo *funcInfo)
+	: keyType_(keyType), isCaseSensitive_(isCaseSensitive), 
 	isStartIncluded_(true), isEndIncluded_(true), compareNum_(0), 
 	greaterCompareNum_(0), lessCompareNum_(0), funcInfo_(funcInfo),
 	startCondition_(NULL), endCondition_(NULL), filterConds_(NULL) {
@@ -198,9 +192,13 @@ BaseIndex::Setting::Setting(ColumnType keyType, bool isCaseSenstive, TreeFuncInf
 	}
 }
 
-void BaseIndex::Setting::initialize(util::StackAllocator &alloc, SearchContext &sc,
-	OutputOrder outputOrder)
-{
+void BaseIndex::Setting::initialize(
+		util::StackAllocator &alloc, SearchContext &sc,
+		OutputOrder outputOrder, bool *initializedForNext) {
+	if (initializedForNext != NULL) {
+		*initializedForNext = false;
+	}
+
 	const size_t UNDEF_POS = SIZE_MAX;
 	ColumnSchema *columnSchema = funcInfo_ != NULL ? funcInfo_->getColumnSchema() : NULL;
 	if (columnSchema == NULL || columnSchema->getColumnNum() == 1) {
@@ -217,8 +215,10 @@ void BaseIndex::Setting::initialize(util::StackAllocator &alloc, SearchContext &
 				isEndIncluded_ = DSExpression::isIncluded(endCondition_->opType_);
 			} else
 			{
+				assert(false);
 			}
 		}
+		bool arranged = false;
 		if (sc.getSuspendKey() != NULL) {
 			if (startCondition_ != NULL && startCondition_->opType_ == DSExpression::EQ) {
 			} else {
@@ -233,7 +233,11 @@ void BaseIndex::Setting::initialize(util::StackAllocator &alloc, SearchContext &
 						DSExpression::LE, sc.getScColumnId(),
 						sc.getSuspendKey(), sc.getSuspendKeySize());
 				}
+				arranged = true;
 			}
+		}
+		if (!arranged && initializedForNext != NULL) {
+			*initializedForNext = true;
 		}
 	} else {
 		TermCondition *restartCond = NULL;
@@ -422,7 +426,7 @@ void BaseIndex::Setting::initialize(util::StackAllocator &alloc, SearchContext &
 
 CompositeInfoObject *TreeFuncInfo::createCompositeInfo(util::StackAllocator &alloc,
 	util::XArray<KeyData> &valueList) {
-	CompositeInfoObject *compositeInfo = allocateCompoiteInfo(alloc);
+	CompositeInfoObject *compositeInfo = allocateCompositeInfo(alloc);
 	ColumnSchema *columnSchema = getColumnSchema();
 	assert(valueList.size() <= columnSchema->getColumnNum());
 
@@ -493,7 +497,7 @@ CompositeInfoObject *TreeFuncInfo::createCompositeInfo(util::StackAllocator &all
 }
 
 
-void TreeFuncInfo::initialize(const util::Vector<ColumnId> &columnIds, ColumnSchema *srcSchema, bool force) {
+void TreeFuncInfo::initialize(const util::Vector<ColumnId> &columnIds, const ColumnSchema *srcSchema, bool force) {
 	assert(!columnIds.empty());
 	orgColumnIds_ = ALLOC_NEW(alloc_) util::Vector<ColumnId>(alloc_);
 	orgColumnIds_->assign(columnIds.begin(), columnIds.end());
@@ -511,7 +515,7 @@ void TreeFuncInfo::initialize(const util::Vector<ColumnId> &columnIds, ColumnSch
 	}
 }
 
-CompositeInfoObject *TreeFuncInfo::allocateCompoiteInfo(util::StackAllocator &alloc) {
+CompositeInfoObject *TreeFuncInfo::allocateCompositeInfo(util::StackAllocator &alloc) {
 	ColumnSchema *columnSchema = getColumnSchema();
 	uint32_t fixedColumnsSize = columnSchema->getRowFixedColumnSize();
 	bool hasVariable = columnSchema->getVariableColumnNum() > 0;
@@ -524,7 +528,7 @@ CompositeInfoObject *TreeFuncInfo::allocateCompoiteInfo(util::StackAllocator &al
 
 CompositeInfoObject *TreeFuncInfo::createCompositeInfo(util::StackAllocator &alloc, void *data, uint32_t size) {
 	UNUSED_VARIABLE(size);
-	CompositeInfoObject *compositeInfo = allocateCompoiteInfo(alloc);
+	CompositeInfoObject *compositeInfo = allocateCompositeInfo(alloc);
 
 	memcpy(compositeInfo, data, getFixedAreaSize());
 	if (compositeInfo->hasVariable()) {
@@ -608,8 +612,8 @@ void CompositeInfoObject::setVariableArray(void *value) {
 	memcpy(addr, value, sizeof(OId));
 }
 
-void CompositeInfoObject::setKey(TransactionContext &txn, ObjectManager &objectManager, 
-								 const AllocateStrategy &allocateStrategy, OId neighborOId,
+void CompositeInfoObject::setKey(TransactionContext &txn, ObjectManagerV4 &objectManager, 
+								 AllocateStrategy &allocateStrategy, OId neighborOId,
 								 TreeFuncInfo *funcInfo, CompositeInfoObject &src) {
 	assert(funcInfo != NULL);
 	memcpy(this, &src, funcInfo->getFixedAreaSize());
@@ -648,10 +652,10 @@ void CompositeInfoObject::setKey(TransactionContext &txn, ObjectManager &objectM
 	setType(KEY_ON_INDEX);
 }
 
-void CompositeInfoObject::freeKey(TransactionContext &txn, ObjectManager &objectManager) {
+void CompositeInfoObject::freeKey(ObjectManagerV4 &objectManager, AllocateStrategy &strategy) {
 	if (hasVariable()) {
 		OId oId = *reinterpret_cast<const OId *>(getVarAddr());
-		VariableArrayCursor cursor(txn, objectManager, oId, OBJECT_READ_ONLY);
+		VariableArrayCursor cursor(objectManager, strategy, oId, OBJECT_READ_ONLY);
 		cursor.finalize();
 	}
 }
@@ -670,12 +674,12 @@ void CompositeInfoObject::setNull(uint32_t pos) {
 	RowNullBits::setNull(addr, pos);
 }
 
-uint8_t *CompositeInfoObject::getField(TransactionContext &txn, ObjectManager &objectManager, ColumnInfo &columnInfo, VariableArrayCursor *&varCursor) const {
+uint8_t *CompositeInfoObject::getField(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy, ColumnInfo &columnInfo, VariableArrayCursor *&varCursor) const {
 	if (columnInfo.isVariable()) {
 		if (varCursor == NULL) {
 			OId variableOId = *reinterpret_cast<const OId *>(getVarAddr());
 			if (getType() == KEY_ON_INDEX) {
-				varCursor = ALLOC_NEW(txn.getDefaultAllocator()) VariableArrayCursor(txn, objectManager, variableOId, OBJECT_READ_ONLY);
+				varCursor = ALLOC_NEW(txn.getDefaultAllocator()) VariableArrayCursor(objectManager, strategy, variableOId, OBJECT_READ_ONLY);
 			} else {
 				uint8_t *memoryAddr = reinterpret_cast<uint8_t *>(variableOId);
 				varCursor = ALLOC_NEW(txn.getDefaultAllocator()) VariableArrayCursor(memoryAddr);
@@ -741,7 +745,7 @@ void CompositeInfoObject::initialize(util::StackAllocator &alloc, TreeFuncInfo &
 	setNullBitSize(columnSchema->getColumnNum());
 }
 
-void CompositeInfoObject::serialize(TransactionContext &txn, ObjectManager &objectManager, 
+void CompositeInfoObject::serialize(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 	TreeFuncInfo &funcInfo, uint8_t *&data, uint32_t &size) const {
 	util::StackAllocator &alloc = txn.getDefaultAllocator();
 	ColumnSchema *columnSchema = funcInfo.getColumnSchema();
@@ -754,7 +758,7 @@ void CompositeInfoObject::serialize(TransactionContext &txn, ObjectManager &obje
 		OId variableOId = *reinterpret_cast<const OId *>(getVarAddr());
 		StackAllocAutoPtr<VariableArrayCursor> cursor(alloc);
 		if (getType() == KEY_ON_INDEX) {
-			cursor.set(ALLOC_NEW(alloc) VariableArrayCursor(txn, objectManager, variableOId, OBJECT_READ_ONLY));
+			cursor.set(ALLOC_NEW(alloc) VariableArrayCursor(objectManager, strategy, variableOId, OBJECT_READ_ONLY));
 		} else {
 			uint8_t *memoryAddr = reinterpret_cast<uint8_t *>(variableOId);
 			cursor.set(ALLOC_NEW(alloc) VariableArrayCursor(memoryAddr));
@@ -790,7 +794,7 @@ void CompositeInfoObject::serialize(TransactionContext &txn, ObjectManager &obje
 	reinterpret_cast<CompositeInfoObject *>(data)->setType(KEY_ON_MEMORY);
 }
 
-void CompositeInfoObject::dump(TransactionContext &txn, ObjectManager &objectManager, TreeFuncInfo &funcInfo, util::NormalOStringStream &output) const {
+void CompositeInfoObject::dump(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy, TreeFuncInfo &funcInfo, util::NormalOStringStream &output) const {
 	output << "(";
 	ColumnSchema *columnSchema = funcInfo.getColumnSchema();
 	VariableArrayCursor *cursor = NULL;
@@ -804,10 +808,10 @@ void CompositeInfoObject::dump(TransactionContext &txn, ObjectManager &objectMan
 		if (isNull(pos)) {
 			val.init(COLUMN_TYPE_NULL);
 		} else {
-			uint8_t *data = getField(txn, objectManager, columnInfo, cursor);
+			uint8_t *data = getField(txn, objectManager, strategy, columnInfo, cursor);
 			val.set(data, columnInfo.getColumnType());
 		}
-		val.dump(txn, objectManager, output);
+		val.dump(txn, objectManager, strategy, output);
 	}
 	output << ")";
 	if (cursor != NULL) {
@@ -824,7 +828,7 @@ void CompositeInfoObject::dump(TreeFuncInfo &funcInfo, util::NormalOStringStream
 		}
 		ColumnInfo &columnInfo = columnSchema->getColumnInfo(pos);
 		if (columnInfo.isVariable() && getType() == KEY_ON_INDEX) {
-			output << "(Thie function can not access DB file, call another function)";
+			output << "(This function can not access DB file, call another function)";
 			continue;
 		}
 
@@ -844,7 +848,7 @@ std::string BaseIndex::Setting::dump()
 {
 	util::NormalOStringStream strstrm;
 	strstrm << "\"BaseIndex_Setting\" : {";
-	strstrm << ", {\"isCaseSenstive_\" : " << (int)isCaseSenstive_ << "}";
+	strstrm << ", {\"isCaseSensitive_\" : " << (int)isCaseSensitive_ << "}";
 	strstrm << ", {\"compareNum_\" : " << compareNum_ << "}";
 	strstrm << ", {\"greaterCompareNum_\" : " << greaterCompareNum_ << "}";
 	strstrm << ", {\"lessCompareNum_\" : " << lessCompareNum_ << "}";

@@ -18,6 +18,7 @@
 #include "util/allocator.h"
 
 #include <algorithm>
+#include <map>
 
 #if UTIL_ALLOCATOR_REPORTER_ENABLED
 #include <iostream>
@@ -25,7 +26,6 @@
 
 #if UTIL_ALLOCATOR_DIFF_REPORTER_ENABLED
 #include <vector>
-#include <map>
 #include <iostream>
 #include <cstring>
 #endif
@@ -42,6 +42,43 @@
 #endif
 
 namespace util {
+
+struct AllocatorManager::AllocatorMap {
+	typedef std::map<void*, AllocatorEntry> BaseMap;
+	typedef BaseMap::iterator Iterator;
+
+	Iterator begin() { return base_.begin(); }
+	Iterator end() { return base_.end(); }
+
+	void add(const AllocatorEntry &entry) {
+		base_.insert(std::make_pair(entry.allocator_, entry));
+	}
+
+	void remove(const AllocatorEntry &entry) {
+		base_.erase(entry.allocator_);
+	}
+
+	AllocatorEntry* find(void *alloc) {
+		Iterator it = base_.find(alloc);
+		if (it == base_.end()) {
+			return NULL;
+		}
+		return &it->second;
+	}
+
+	BaseMap base_;
+};
+
+struct AllocatorManager::GroupEntry {
+	GroupEntry();
+	~GroupEntry();
+
+	GroupId parentId_;
+	const char8_t *nameLiteral_;
+	AllocatorMap allocatorMap_;
+	AllocatorLimitter *totalLimitter_;
+	size_t limitList_[LIMIT_TYPE_END];
+};
 
 #if UTIL_ALLOCATOR_DIFF_REPORTER_ENABLED
 struct AllocatorDiffReporter::Body {
@@ -613,6 +650,404 @@ void AllocatorDiffReporter::ActivationState::compare(
 #endif 
 
 
+void AllocatorCleanUpHandler::bind(
+		AllocatorCleanUpHandler *&another, NoopMutex*) {
+	Mutex *mutex = NULL;
+	bind(another, mutex);
+}
+
+void AllocatorCleanUpHandler::bind(
+		AllocatorCleanUpHandler *&another, Mutex *mutex) {
+	if (prev_ != NULL || next_ != NULL || mutex_ != NULL) {
+		assert(false);
+		return;
+	}
+
+	if (another != NULL) {
+		assert(another->prev_ == &another);
+		another->prev_ = &next_;
+		next_ = another;
+	}
+
+	prev_ = &another;
+	another = this;
+
+	mutex_ = mutex;
+}
+
+void AllocatorCleanUpHandler::unbind() throw() {
+	if (prev_ == NULL) {
+		assert(next_ == NULL);
+		return;
+	}
+
+	try {
+		util::DynamicLockGuard<Mutex> guard(mutex_);
+		if (next_ != NULL) {
+			assert(next_->prev_ == &next_);
+			next_->prev_ = prev_;
+		}
+
+		*prev_ = next_;
+
+		prev_ = NULL;
+		next_ = NULL;
+		mutex_ = NULL;
+	}
+	catch (...) {
+		assert(false);
+	}
+}
+
+void AllocatorCleanUpHandler::cleanUpAll(
+		AllocatorCleanUpHandler *&handler) throw() {
+	for (AllocatorCleanUpHandler *it = handler; it != NULL;) {
+		AllocatorCleanUpHandler *next = it->next_;
+
+		(*it)();
+		it->unbind();
+
+		it = next;
+	}
+}
+
+AllocatorCleanUpHandler::AllocatorCleanUpHandler() :
+		prev_(NULL),
+		next_(NULL),
+		mutex_(NULL) {
+}
+
+AllocatorCleanUpHandler::~AllocatorCleanUpHandler() {
+	unbind();
+}
+
+
+FixedSizeCachedAllocator::FixedSizeCachedAllocator(
+		const AllocatorInfo &localInfo, BaseAllocator *base,
+		Mutex *sharedMutex, bool locked, size_t elementSize) :
+		stats_(localInfo),
+		freeLink_(NULL),
+		freeElementCount_(0),
+		freeElementLimit_(resolveFreeElementLimit(base)),
+		localAlloc_(tryPrepareLocal<NoopMutex>(
+				localInfo, base, locked, elementSize)),
+		localLockedAlloc_(tryPrepareLocal<Mutex>(
+				localInfo, base, locked, elementSize)),
+		base_((base == NULL ? localAlloc_.get() : base)),
+		sharedMutex_(sharedMutex),
+		shared_((base != NULL)) {
+	if (shared_) {
+		util::AllocatorManager::addAllocator(stats_.info_, *this);
+	}
+}
+
+FixedSizeCachedAllocator::~FixedSizeCachedAllocator() {
+	clear(0);
+
+	if (shared_) {
+		util::AllocatorManager::removeAllocator(stats_.info_, *this);
+	}
+}
+
+void FixedSizeCachedAllocator::setErrorHandler(
+		AllocationErrorHandler *errorHandler) {
+	static_cast<void>(errorHandler);
+}
+
+FixedSizeCachedAllocator::BaseAllocator* FixedSizeCachedAllocator::base(
+		const NoopMutex*) {
+	BaseAllocator *alloc = localAlloc_.get();
+	if (alloc == NULL) {
+		return detail::VariableSizeAllocatorUtils::errorBaseAllocator<NoopMutex>();
+	}
+	return alloc;
+}
+
+FixedSizeCachedAllocator::LockedBaseAllocator* FixedSizeCachedAllocator::base(
+		const Mutex*) {
+	LockedBaseAllocator *alloc = localLockedAlloc_.get();
+	if (alloc == NULL) {
+		return detail::VariableSizeAllocatorUtils::errorBaseAllocator<Mutex>();
+	}
+	return alloc;
+}
+
+size_t FixedSizeCachedAllocator::getElementSize() {
+	{
+		LockedBaseAllocator *alloc = localLockedAlloc_.get();
+		if (alloc != NULL) {
+			return alloc->getElementSize();
+		}
+	}
+	assert(base_ != NULL);
+	return base_->getElementSize();
+}
+
+size_t FixedSizeCachedAllocator::getTotalElementCount() {
+	{
+		BaseAllocator *alloc = localAlloc_.get();
+		if (alloc != NULL) {
+			return alloc->getTotalElementCount();
+		}
+	}
+	{
+		LockedBaseAllocator *alloc = localLockedAlloc_.get();
+		if (alloc != NULL) {
+			return alloc->getTotalElementCount();
+		}
+	}
+	return 0;
+}
+
+size_t FixedSizeCachedAllocator::getFreeElementCount() {
+	{
+		BaseAllocator *alloc = localAlloc_.get();
+		if (alloc != NULL) {
+			return alloc->getTotalElementCount();
+		}
+	}
+	{
+		LockedBaseAllocator *alloc = localLockedAlloc_.get();
+		if (alloc != NULL) {
+			return alloc->getTotalElementCount();
+		}
+	}
+	return 0;
+}
+
+void FixedSizeCachedAllocator::applyFreeElementLimit(
+		BaseAllocator &baseAlloc, size_t scale) {
+	const size_t baseLimit = resolveFreeElementLimit(&baseAlloc);
+	const size_t max = std::numeric_limits<size_t>::max();
+	const size_t limit = (baseLimit < max / scale ? baseLimit * scale : max);
+	baseAlloc.setFreeElementLimit(limit);
+}
+
+void FixedSizeCachedAllocator::getStats(AllocatorStats &stats) {
+	stats.merge(stats_);
+	stats.values_[AllocatorStats::STAT_CACHE_SIZE] +=
+			AllocatorStats::asStatValue(getElementSize() * freeElementCount_);
+}
+
+void FixedSizeCachedAllocator::setLimit(
+		AllocatorStats::Type type, size_t value) {
+	static_cast<void>(type);
+	static_cast<void>(value);
+}
+
+void FixedSizeCachedAllocator::setLimit(
+		AllocatorStats::Type type, AllocatorLimitter *limitter) {
+	static_cast<void>(type);
+	static_cast<void>(limitter);
+}
+
+void* FixedSizeCachedAllocator::allocateLocal(const NoopMutex*) {
+	return localAlloc_->allocate();
+}
+
+void* FixedSizeCachedAllocator::allocateLocal(const Mutex*) {
+	return localLockedAlloc_->allocate();
+}
+
+void FixedSizeCachedAllocator::deallocateLocal(const NoopMutex*, void *element) {
+	return localAlloc_->deallocate(element);
+}
+
+void FixedSizeCachedAllocator::deallocateLocal(const Mutex*, void *element) {
+	return localLockedAlloc_->deallocate(element);
+}
+
+void FixedSizeCachedAllocator::setLimitLocal(
+		const NoopMutex*, AllocatorStats::Type type, size_t value) {
+	return localAlloc_->setLimit(type, value);
+}
+
+void FixedSizeCachedAllocator::setLimitLocal(
+		const Mutex*, AllocatorStats::Type type, size_t value) {
+	return localLockedAlloc_->setLimit(type, value);
+}
+
+void FixedSizeCachedAllocator::reserve() {
+	assert(base_ != NULL);
+	const size_t count = std::max<size_t>(getStableElementLimit(), 1);
+	stats_.values_[AllocatorStats::STAT_CACHE_MISS_COUNT]++;
+
+	DynamicLockGuard<Mutex> guard(sharedMutex_);
+	for (size_t i = count; i > 0; i--) {
+		FreeLink *next = freeLink_;
+		freeLink_ = static_cast<FreeLink*>(base_->allocate());
+		freeLink_->next_ = next;
+
+		++freeElementCount_;
+	}
+
+	assert(freeLink_ != NULL);
+}
+
+void FixedSizeCachedAllocator::shrink() {
+	clear(getStableElementLimit());
+}
+
+void FixedSizeCachedAllocator::clear(size_t preservedCount) {
+	if (freeElementCount_ <= preservedCount) {
+		return;
+	}
+
+	assert(base_ != NULL);
+	const size_t count = (freeElementCount_ - preservedCount);
+
+	DynamicLockGuard<Mutex> guard(sharedMutex_);
+	for (size_t i = count; i > 0; i--) {
+		FreeLink *element = freeLink_;
+		freeLink_ = freeLink_->next_;
+
+		assert(freeElementCount_ > 0);
+		--freeElementCount_;
+
+		base_->deallocate(element);
+	}
+}
+
+size_t FixedSizeCachedAllocator::getStableElementLimit() {
+	return freeElementLimit_ / 2;
+}
+
+size_t FixedSizeCachedAllocator::resolveFreeElementLimit(BaseAllocator *base) {
+	if (base == NULL) {
+		return 0;
+	}
+
+	const size_t maxUnitSize = 1024 * 64;
+	const size_t maxUnitCount = 128;
+
+	const size_t elementSize = base->getElementSize();
+	const size_t baseUnitCount = maxUnitSize / elementSize;
+	const size_t unitCount = std::min<size_t>(maxUnitCount, baseUnitCount);
+	const size_t localCount = std::max<size_t>(2, unitCount);
+	return localCount;
+}
+
+template<typename L>
+FixedSizeAllocator<L>* FixedSizeCachedAllocator::tryPrepareLocal(
+		const AllocatorInfo &info, BaseAllocator *base, bool locked,
+		size_t elementSize) {
+	if (base != NULL) {
+		return NULL;
+	}
+
+	if (!((IsSame<L, NoopMutex>::VALUE && !locked) ||
+			(IsSame<L, Mutex>::VALUE && locked))) {
+		return NULL;
+	}
+
+	typedef FixedSizeAllocator<L> Alloc;
+	UTIL_UNIQUE_PTR<Alloc> alloc(UTIL_NEW Alloc(info, elementSize));
+	return alloc.release();
+}
+
+
+VariableSizeAllocatorPool::VariableSizeAllocatorPool(
+		const AllocatorInfo &info) :
+		info_(info),
+		topEntry_(NULL),
+		freeElementLimitScale_(std::numeric_limits<size_t>::max()) {
+}
+
+VariableSizeAllocatorPool::~VariableSizeAllocatorPool() {
+	while (topEntry_ != NULL) {
+		UTIL_UNIQUE_PTR<Entry> ptr(topEntry_);
+		topEntry_ = topEntry_->next_;
+	}
+}
+
+void VariableSizeAllocatorPool::setFreeElementLimitScale(size_t scale) {
+	LockGuard<Mutex> guard(mutex_);
+
+	freeElementLimitScale_ = scale;
+	for (Entry *entry = topEntry_; entry != NULL;) {
+		FixedSizeCachedAllocator::applyFreeElementLimit(
+				entry->alloc_, freeElementLimitScale_);
+		entry = entry->next_;
+	}
+}
+
+void VariableSizeAllocatorPool::initializeSubAllocators(
+		const AllocatorInfo &localInfo, VariableSizeAllocatorPool *pool,
+		UTIL_UNIQUE_PTR<FixedSizeCachedAllocator> *allocList,
+		const size_t *elementSizeList, size_t count, bool locked) {
+	if (pool == NULL) {
+		initializeSubAllocatorsNoPool(
+				localInfo, allocList, elementSizeList, count, locked);
+	}
+	else {
+		pool->initializeSubAllocatorsWithPool(
+				localInfo, allocList, elementSizeList, count);
+	}
+}
+
+void VariableSizeAllocatorPool::initializeSubAllocatorsNoPool(
+		const AllocatorInfo &localInfo,
+		UTIL_UNIQUE_PTR<FixedSizeCachedAllocator> *allocList,
+		const size_t *elementSizeList, size_t count, bool locked) {
+	for (size_t i = 0; i < count; i++) {
+		const size_t elementSize = elementSizeList[i];
+		allocList[i].reset(UTIL_NEW FixedSizeCachedAllocator(
+				localInfo, NULL, NULL, locked, elementSize));
+	}
+}
+
+void VariableSizeAllocatorPool::initializeSubAllocatorsWithPool(
+		const AllocatorInfo &localInfo,
+		UTIL_UNIQUE_PTR<FixedSizeCachedAllocator> *allocList,
+		const size_t *elementSizeList, size_t count) {
+	LockGuard<Mutex> guard(mutex_);
+
+	Entry *entry = prepareEntries(elementSizeList, count);
+	for (size_t i = 0; i < count; i++) {
+		const size_t elementSize = elementSizeList[i];
+
+		if (entry == NULL || elementSize != entry->alloc_.getElementSize()) {
+			UTIL_THROW_UTIL_ERROR(CODE_ILLEGAL_ARGUMENT, "");
+		}
+
+		allocList[i].reset(UTIL_NEW FixedSizeCachedAllocator(
+				localInfo, &entry->alloc_, &entry->allocMutex_, false, 0));
+		entry = entry->next_;
+	}
+}
+
+VariableSizeAllocatorPool::Entry* VariableSizeAllocatorPool::prepareEntries(
+		const size_t *elementSizeList, size_t count) {
+
+	if (topEntry_ == NULL) {
+		for (size_t i = count; i > 0;) {
+			const size_t elementSize = elementSizeList[--i];
+
+			UTIL_UNIQUE_PTR<Entry> ptr(UTIL_NEW Entry(info_, elementSize));
+			FixedSizeCachedAllocator::applyFreeElementLimit(
+					ptr->alloc_, freeElementLimitScale_);
+			ptr->next_ = topEntry_;
+			topEntry_ = ptr.release();
+		}
+	}
+
+	return topEntry_;
+}
+
+VariableSizeAllocatorPool::Entry::Entry(
+		const AllocatorInfo &info, size_t elementSize) :
+		next_(NULL),
+		alloc_(info, elementSize) {
+}
+
+
+namespace detail {
+void* VariableSizeAllocatorUtils::errorBaseAllocatorDetail() {
+	UTIL_THROW_UTIL_ERROR(CODE_ILLEGAL_OPERATION, "");
+}
+} 
+
+
 AllocationErrorHandler *StackAllocator::defaultErrorHandler_ = NULL;
 
 #if !UTIL_ALLOCATOR_FORCE_ALLOCATOR_INFO
@@ -641,7 +1076,8 @@ StackAllocator::StackAllocator(BaseAllocator &base) :
 }
 #endif
 
-StackAllocator::StackAllocator(const AllocatorInfo &info, BaseAllocator *base) :
+StackAllocator::StackAllocator(
+		const AllocatorInfo &info, BaseAllocator *base, const Option *option) :
 		restSize_(0),
 		end_(NULL),
 		base_(*base),
@@ -658,6 +1094,8 @@ StackAllocator::StackAllocator(const AllocatorInfo &info, BaseAllocator *base) :
 		hugeCount_(0),
 		hugeSize_(0),
 		errorHandler_(NULL),
+		option_(resolveOption(base, option)),
+		smallCount_(0),
 		stats_(info),
 		limitter_(NULL) {
 	assert(base != NULL);
@@ -679,11 +1117,18 @@ StackAllocator::~StackAllocator() {
 		for (BlockHead *&block = **cur; block != NULL;) {
 			BlockHead *prev = block->prev_;
 
-			if (block->blockSize_ == base_.getElementSize()) {
+			if (block->blockSize_ == option_.smallBlockSize_) {
+				StdAllocator<uint8_t, void> alloc(*option_.smallAlloc_);
+				void *addr = block;
+				alloc.deallocate(static_cast<uint8_t*>(addr), block->blockSize_);
+				assert(smallCount_ > 0);
+				smallCount_--;
+			}
+			else if (block->blockSize_ == base_.getElementSize()) {
 				base_.deallocate(block);
 			}
 			else {
-				UTIL_FREE(block);
+				UTIL_FREE_MONITORING(block);
 			}
 
 			block = prev;
@@ -715,7 +1160,8 @@ void StackAllocator::trim() {
 			BlockHead *block = *cur;
 
 			if ((!hugeOnly && freeSize_ > freeSizeLimit_) ||
-					block->blockSize_ != base_.getElementSize()) {
+					(block->blockSize_ != option_.smallBlockSize_ &&
+					block->blockSize_ != base_.getElementSize())) {
 				adjusted = true;
 
 				assert(freeSize_ >= block->blockSize_);
@@ -726,7 +1172,14 @@ void StackAllocator::trim() {
 
 				BlockHead *prev = block->prev_;
 
-				if (block->blockSize_ == base_.getElementSize()) {
+				if (block->blockSize_ == option_.smallBlockSize_) {
+					StdAllocator<uint8_t, void> alloc(*option_.smallAlloc_);
+					void *addr = block;
+					alloc.deallocate(static_cast<uint8_t*>(addr), block->blockSize_);
+					assert(smallCount_ > 0);
+					smallCount_--;
+				}
+				else if (block->blockSize_ == base_.getElementSize()) {
 					base_.deallocate(block);
 				}
 				else {
@@ -736,7 +1189,7 @@ void StackAllocator::trim() {
 					stats_.values_[AllocatorStats::STAT_CACHE_SIZE] -=
 							AllocatorStats::asStatValue(block->blockSize_);
 
-					UTIL_FREE(block);
+					UTIL_FREE_MONITORING(block);
 				}
 
 				*cur = prev;
@@ -808,7 +1261,8 @@ void* StackAllocator::allocateOverBlock(size_t size) {
 			assert(freeSize_ >= block->blockSize_);
 			freeSize_ -= block->blockSize_;
 
-			if (block->blockSize_ != base_.getElementSize()) {
+			if (block->blockSize_ != option_.smallBlockSize_ &&
+					block->blockSize_ != base_.getElementSize()) {
 				stats_.values_[AllocatorStats::STAT_CACHE_SIZE] -=
 						AllocatorStats::asStatValue(block->blockSize_);
 			}
@@ -838,13 +1292,31 @@ void* StackAllocator::allocateOverBlock(size_t size) {
 					", freeSize=" << freeSize_ << ")");
 		}
 
-		if (minSize <= baseSize) {
+		const size_t smallSize = option_.smallBlockSize_;
+		if (minSize <= smallSize &&
+				smallCount_ < option_.smallBlockLimit_ &&
+				smallCount_ * smallSize == totalSize_) {
+			StdAllocator<uint8_t, void> alloc(*option_.smallAlloc_);
+			void *addr = alloc.allocate(smallSize);
+
+			newBlock = static_cast<BlockHead*>(addr);
+			newBlock->blockSize_ = smallSize;
+
+			smallCount_++;
+		}
+		else if (minSize <= baseSize) {
 			newBlock = static_cast<BlockHead*>(base_.allocate());
 			newBlock->blockSize_ = baseSize;
 		}
 		else {
+#if UTIL_MEMORY_POOL_AGGRESSIVE
+			const size_t desiredSize =
+					detail::DirectAllocationUtils::adjustAllocationSize(
+							minSize, true, NULL);
+#else
 			const size_t desiredSize = std::max(
 					(minSize + (baseSize - 1)) / baseSize * baseSize, minSize);
+#endif
 
 			size_t blockSize;
 			if (limitter_ == NULL) {
@@ -854,7 +1326,8 @@ void* StackAllocator::allocateOverBlock(size_t size) {
 				blockSize = limitter_->acquire(minSize, desiredSize);
 			}
 
-			newBlock = static_cast<BlockHead*>(UTIL_MALLOC(blockSize));
+			newBlock = static_cast<BlockHead*>(
+					UTIL_MALLOC_MONITORING(blockSize));
 			if (newBlock == NULL) {
 				UTIL_THROW_UTIL_ERROR(CODE_NO_MEMORY,
 						"Memory allocation failed ("
@@ -919,7 +1392,8 @@ void StackAllocator::pop(BlockHead *lastBlock, size_t lastRestSize) {
 		freeSize_ += topBlock_->blockSize_;
 		assert(freeSize_ <= totalSize_);
 
-		if (topBlock_->blockSize_ != base_.getElementSize()) {
+		if (topBlock_->blockSize_ != option_.smallBlockSize_ &&
+				topBlock_->blockSize_ != base_.getElementSize()) {
 			stats_.values_[AllocatorStats::STAT_CACHE_SIZE] +=
 					AllocatorStats::asStatValue(topBlock_->blockSize_);
 		}
@@ -981,6 +1455,38 @@ void StackAllocator::setLimit(AllocatorStats::Type type, AllocatorLimitter *limi
 	default:
 		break;
 	}
+}
+
+StackAllocator::Option StackAllocator::resolveOption(
+		BaseAllocator *base, const Option *option) {
+	do {
+		if (option == NULL ||
+				(option->smallAlloc_ == NULL &&
+				option->smallBlockSize_ == 0 &&
+				option->smallBlockLimit_ == 0)) {
+			break;
+		}
+
+		if (option->smallBlockSize_ < detail::AlignedSizeOf<BlockHead>::VALUE ||
+				option->smallBlockSize_ >= base->getElementSize() ||
+				option->smallBlockLimit_ <= 0 ||
+				option->smallAlloc_ == NULL) {
+			assert(false);
+			break;
+		}
+
+		return *option;
+	}
+	while (false);
+
+	return Option();
+}
+
+
+StackAllocator::Option::Option() :
+		smallAlloc_(NULL),
+		smallBlockSize_(0),
+		smallBlockLimit_(0) {
 }
 
 
@@ -1070,23 +1576,30 @@ const char8_t* AllocatorManager::getName(
 }
 
 void AllocatorManager::getGroupStats(
-		const GroupId *idList, size_t idCount, AllocatorStats *statsList) {
-	util::LockGuard<util::Mutex> guard(mutex_);
-
+		const GroupId *idList, size_t idCount, AllocatorStats *statsList,
+		AllocatorStats *directStats) {
 	for (size_t i = 0; i < idCount; i++) {
 		statsList[i] = AllocatorStats();
 	}
+
+	if (directStats != NULL) {
+		*directStats = AllocatorStats();
+	}
+
+	util::LockGuard<util::Mutex> guard(mutex_);
 
 	for (GroupEntry *groupIt = groupList_.begin_;
 			groupIt != groupList_.end_; ++groupIt) {
 		AllocatorStats groupStats;
 
-		for (AllocatorEntry *it = groupIt->allocatorList_.begin_;
-				it != groupIt->allocatorList_.end_; ++it) {
+		for (AllocatorMap::Iterator it = groupIt->allocatorMap_.begin();
+				it != groupIt->allocatorMap_.end(); ++it) {
 			AllocatorStats stats;
 			AccessorParams params;
 			params.stats_ = &stats;
-			(*it->accessor_)(it->allocator_, COMMAND_GET_STAT, params);
+
+			const AllocatorEntry &entry = it->second;
+			(entry.accessor_)(entry.allocator_, COMMAND_GET_STAT, params);
 
 			groupStats.merge(stats);
 		}
@@ -1111,6 +1624,24 @@ void AllocatorManager::getGroupStats(
 			}
 		}
 	}
+
+	do {
+		const GroupId id = GROUP_ID_ROOT;
+		const GroupId *idListEnd = idList + idCount;
+		const GroupId *it = std::find(idList, idListEnd, id);
+		if (it == idListEnd) {
+			break;
+		}
+
+		AllocatorStats stats;
+		getDirectAllocationStats(stats);
+		statsList[it - idList].merge(stats);
+
+		if (directStats != NULL) {
+			*directStats = stats;
+		}
+	}
+	while (false);
 }
 
 void AllocatorManager::setLimit(
@@ -1148,11 +1679,25 @@ void AllocatorManager::setLimit(
 			continue;
 		}
 
-		TinyList<AllocatorEntry> &list = groupIt->allocatorList_;
-		for (AllocatorEntry *it = list.begin_; it != list.end_; ++it) {
-			applyAllocatorLimit(*it, limitType, *groupIt);
+		for (AllocatorMap::Iterator it = groupIt->allocatorMap_.begin();
+				it != groupIt->allocatorMap_.end(); ++it) {
+			applyAllocatorLimit(it->second, limitType, *groupIt);
 		}
 	}
+}
+
+int64_t AllocatorManager::estimateHeapUsage(
+		const AllocatorStats &rootStats, const AllocatorStats &directStats) {
+	assert(rootStats.info_.getGroupId() == GROUP_ID_ROOT);
+	assert(directStats.info_.getGroupId() == GROUP_ID_ROOT);
+
+	const int64_t approxHeadSize = 16;
+	const int64_t headTotal =
+			approxHeadSize *
+			directStats.values_[util::AllocatorStats::STAT_CACHE_MISS_COUNT];
+	const int64_t bodyTotal =
+			rootStats.values_[util::AllocatorStats::STAT_TOTAL_SIZE];
+	return headTotal + bodyTotal;
 }
 
 #if UTIL_ALLOCATOR_DIFF_REPORTER_TRACE_ENABLED
@@ -1218,6 +1763,132 @@ void AllocatorManager::applyAllocatorLimit(
 	(*entry.accessor_)(entry.allocator_, command, params);
 }
 
+bool AllocatorManager::addAllocatorDetail(
+		GroupId id, const AllocatorEntry &allocEntry) {
+	util::LockGuard<util::Mutex> guard(mutex_);
+
+	while (id >= groupList_.end_ - groupList_.begin_) {
+		groupList_.add(GroupEntry());
+	}
+
+	GroupEntry &groupEntry = groupList_.begin_[id];
+	if (findAllocatorEntry(groupEntry, allocEntry.allocator_) != NULL) {
+		assert(false);
+		return false;
+	}
+
+	addAllocatorEntry(groupEntry, allocEntry);
+	assert(findAllocatorEntry(groupEntry, allocEntry.allocator_) != NULL);
+
+	return true;
+}
+
+bool AllocatorManager::removeAllocatorDetail(GroupId id, void *alloc) throw() {
+	util::LockGuard<util::Mutex> guard(mutex_);
+
+	if (id >= groupList_.end_ - groupList_.begin_) {
+		assert(false);
+		return false;
+	}
+
+	GroupEntry &groupEntry = groupList_.begin_[id];
+	AllocatorEntry *entry = findAllocatorEntry(groupEntry, alloc);
+	if (entry == NULL) {
+		assert(false);
+		return false;
+	}
+
+	removeAllocatorEntry(groupEntry, *entry);
+	return true;
+}
+
+void AllocatorManager::listSubGroupDetail(
+		GroupId id, void *insertIt, GroupIdInsertFunc insertFunc,
+		bool recursive) {
+	util::LockGuard<util::Mutex> guard(mutex_);
+
+	for (GroupEntry *groupIt = groupList_.begin_;
+			groupIt != groupList_.end_; ++groupIt) {
+
+		const GroupId subId =
+				static_cast<GroupId>(groupIt - groupList_.begin_);
+		if (subId == id || !isDescendantOrSelf(id, subId)) {
+			continue;
+		}
+		else if (!recursive && groupList_.begin_[subId].parentId_ != id) {
+			continue;
+		}
+
+		insertFunc(insertIt, subId);
+	}
+}
+
+void AllocatorManager::getAllocatorStatsDetail(
+		const GroupId *idList, size_t idCount, void *insertIt,
+		StatsInsertFunc insertFunc) {
+	util::LockGuard<util::Mutex> guard(mutex_);
+
+	for (size_t i = 0; i < idCount; i++) {
+		const GroupId id = idList[i];
+		GroupEntry &groupEntry = groupList_.begin_[id];
+
+		for (AllocatorMap::Iterator it = groupEntry.allocatorMap_.begin();
+				it != groupEntry.allocatorMap_.end(); ++it) {
+			AllocatorStats stats;
+			AccessorParams params;
+			params.stats_ = &stats;
+
+			const AllocatorEntry &entry = it->second;
+			(entry.accessor_)(entry.allocator_, COMMAND_GET_STAT, params);
+
+			insertFunc(insertIt, stats);
+		}
+
+		if (id == GROUP_ID_ROOT) {
+			getDirectAllocationStats(insertIt, insertFunc);
+		}
+	}
+}
+
+void AllocatorManager::getDirectAllocationStats(AllocatorStats &stats) {
+	getDirectAllocationStats(&stats, mergeStatsAsInserter);
+}
+
+void AllocatorManager::getDirectAllocationStats(
+		void *insertIt, StatsInsertFunc insertFunc) {
+	const size_t count = detail::DirectAllocationUtils::getUnitCount();
+	for (size_t i = 0; i < count; i++) {
+		int64_t totalSize;
+		int64_t cacheSize;
+		int64_t monitoringSize;
+		int64_t totalCount;
+		int64_t cacheCount;
+		int64_t deallocCount;
+		if (!detail::DirectAllocationUtils::getUnitProfile(
+				i, totalSize, cacheSize, monitoringSize, totalCount,
+				cacheCount, deallocCount)) {
+			continue;
+		}
+
+		const size_t unitSize =
+				(i + 1 < count ? (static_cast<size_t>(1) << i) : 0);
+
+		const int64_t nonMonitoringSize =
+				std::max<int64_t>(totalSize - monitoringSize, 0);
+
+		AllocatorStats stats;
+		stats.info_ = AllocatorInfo(GROUP_ID_ROOT, "rootMemoryPool", NULL);
+		stats.info_.setUnitSize(unitSize);
+		stats.values_[AllocatorStats::STAT_PEAK_TOTAL_SIZE] = totalSize;
+		stats.values_[AllocatorStats::STAT_TOTAL_SIZE] = nonMonitoringSize;
+		stats.values_[AllocatorStats::STAT_CACHE_SIZE] = cacheSize;
+		stats.values_[AllocatorStats::STAT_DEALLOCATION_COUNT] = deallocCount;
+		stats.values_[AllocatorStats::STAT_CACHE_MISS_COUNT] = totalCount;
+
+		insertFunc(insertIt, stats);
+	}
+}
+
 AllocatorManager::GroupEntry* AllocatorManager::getParentEntry(GroupId &id) {
 	if (id == GROUP_ID_ROOT) {
 		return NULL;
@@ -1239,15 +1910,23 @@ bool AllocatorManager::isDescendantOrSelf(GroupId id, GroupId subId) {
 }
 
 AllocatorManager::AllocatorEntry* AllocatorManager::findAllocatorEntry(
-		void *alloc, GroupEntry &groupEntry) {
-	for (AllocatorEntry *it = groupEntry.allocatorList_.begin_;
-			it != groupEntry.allocatorList_.end_; ++it) {
-		if (it->allocator_ == alloc) {
-			return it;
-		}
-	}
+		GroupEntry &groupEntry, void *alloc) {
+	return groupEntry.allocatorMap_.find(alloc);
+}
 
-	return NULL;
+void AllocatorManager::addAllocatorEntry(
+		GroupEntry &groupEntry, const AllocatorEntry &allocEntry) {
+	groupEntry.allocatorMap_.add(allocEntry);
+}
+
+void AllocatorManager::removeAllocatorEntry(
+		GroupEntry &groupEntry, const AllocatorEntry &allocEntry) {
+	groupEntry.allocatorMap_.remove(allocEntry);
+}
+
+void AllocatorManager::mergeStatsAsInserter(
+		void *insertIt, const AllocatorStats &stats) {
+	static_cast<AllocatorStats*>(insertIt)->merge(stats);
 }
 
 #if UTIL_ALLOCATOR_DIFF_REPORTER_TRACE_ENABLED
@@ -1259,16 +1938,17 @@ void AllocatorManager::operateReporterSnapshots(
 	util::LockGuard<util::Mutex> guard(mutex_);
 
 	for (size_t i = 0; i < idCount; i++) {
-		const GroupEntry &entry = groupList_.begin_[idList[i]];
+		GroupEntry &groupEntry = groupList_.begin_[idList[i]];
 
-		for (AllocatorEntry *entryIt = entry.allocatorList_.begin_;
-				entryIt != entry.allocatorList_.end_; ++entryIt) {
+		for (AllocatorMap::Iterator it = groupEntry.allocatorMap_.begin();
+				it != groupEntry.allocatorMap_.end(); ++it) {
+			const AllocatorEntry &entry = it->second;
+
 			AllocatorStats stats;
 			{
 				AccessorParams params;
 				params.stats_ = &stats;
-				(*entryIt->accessor_)(
-						entryIt->allocator_, COMMAND_GET_STAT, params);
+				(entry.accessor_)(entry.allocator_, COMMAND_GET_STAT, params);
 			}
 
 			const char8_t *name = stats.info_.getName();
@@ -1281,7 +1961,7 @@ void AllocatorManager::operateReporterSnapshots(
 				params.size_ = snapshotId;
 				params.stats_ = &stats;
 				params.out_ = out;
-				(*entryIt->accessor_)(entryIt->allocator_, command, params);
+				(entry.accessor_)(entry.allocator_, command, params);
 			}
 		}
 	}

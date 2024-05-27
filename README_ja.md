@@ -7,15 +7,17 @@
 
 GridDBは、NoSQLインタフェースとSQLインタフェースを兼ね備えたIoT向けデータベースです。
 
-GridDBが提供する機能は『[GridDB 機能リファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/GridDB_FeaturesReference/toc.md)』を参照ください。
+GridDBが提供する機能は『[GridDB 機能リファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/md_reference_feature/md_reference_feature.md)』を参照ください。
 
 本リポジトリにはサーバとJavaクライアントがあります。JDBCドライバは[jdbcリポジトリ](https://github.com/griddb/jdbc/blob/master/README_ja.md)にあります。
 
 ## クイックスタート (ソースコードの利用)
 
-  CentOS 7.6(gcc 4.8.5)、Ubuntu 18.04(gcc 4.8.5)、openSUSE Leap 15.1(gcc 4.8.5)の環境での動作を確認しています。
+  以下のLinux(x64)環境での動作を確認しています。
+  - CentOS 7.9(gcc 4.8.5)
 
-  ※事前にtclをインストールしてください。例) yum install tcl.x86_64
+  ※事前にtclをインストールしてください。例) yum install tcl.x86_64  
+  ※事前にPython3をインストールしてください。例) yum install python3
 
 ### サーバ、クライアント(java)のビルド
 
@@ -55,13 +57,19 @@ GridDBが提供する機能は『[GridDB 機能リファレンス](https://githu
     $ gs_stopcluster -u admin/your_password
     $ gs_stopnode -u admin/your_password
 
-## クイックスタート (RPM/DEBファイルの利用)
-  CentOS 7.6、Ubuntu 18.04、openSUSE Leap 15.1の環境での動作を確認しています。
+## [クイックスタート (GridDBサービスとCLIの利用)](docs/UsingServiceAndCLI.md)
 
-  ※ このパッケージをインストールすると、OS内にgsadmユーザが作成されます。運用コマンドはgsadmユーザで操作してください。  
-  ※ gsadmユーザでログインすると環境変数 GS_HOMEとGS_LOGが自動的に設定されます。また、運用コマンドの場所が環境変数 PATHに設定されます。
-  ※ Javaクライアントのライブラリ(gridstore.jar)は/usr/share/java上に、サンプルは/usr/griddb-XXX/docs/sample/program上に配置されます。
-  ※ Ubuntu用、openSUSE用のパッケージはトリガ機能を含んでいません。
+## クイックスタート (RPM/DEBファイルの利用)
+
+  以下のLinux(x64)環境での動作を確認しています。
+  - CentOS 7.9、Ubuntu 22.4
+
+  ※事前にPython3をインストールしてください。例) yum install python3
+
+  - このパッケージをインストールすると、OS内にgsadmユーザが作成されます。運用コマンドはgsadmユーザで操作してください。  
+  - gsadmユーザでログインすると環境変数 GS_HOMEとGS_LOGが自動的に設定されます。また、運用コマンドの場所が環境変数 PATHに設定されます。
+  - Javaクライアントのライブラリ(gridstore.jar)は/usr/share/java上に、サンプルは/usr/griddb-XXX/docs/sample/program上に配置されます。
+  - 過去版がインストールされている場合は、アンインストール後、/var/lib/gridstore上のconf/,data/を削除してください。
 
 ### インストール
     (CentOS)
@@ -70,12 +78,12 @@ GridDBが提供する機能は『[GridDB 機能リファレンス](https://githu
     (Ubuntu)
     $ sudo dpkg -i griddb_X.X.X_amd64.deb
 
-    (openSUSE)
-    $ sudo rpm -ivh griddb-X.X.X-opensuse.x86_64.rpm
-
     ※ X.X.Xはバージョンを意味します。
 
 ### サーバの起動
+    [gsadm]$ cp /usr/griddb-X.X.X/conf_multicast/* conf/.
+    ※ デフォルトはローカル接続限定の設定になっていますので、コンフィグを変更してください。
+
     [gsadm]$ gs_passwd admin
       #input your_password
     [gsadm]$ vi conf/gs_cluster.json
@@ -95,44 +103,68 @@ GridDBが提供する機能は『[GridDB 機能リファレンス](https://githu
     [gsadm]$ gs_stopcluster -u admin/your_password
     [gsadm]$ gs_stopnode -u admin/your_password
 
+[インストール時のトラブルシューティング](docs/TroubleShootingTips_ja.md)もご参照ください。
+
 ## ドキュメント
   以下のドキュメントがあります。
-  * [機能リファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/GridDB_FeaturesReference/toc.md)
+  * [機能リファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/md_reference_feature/md_reference_feature.md)
   * [クイックスタートアップガイド](https://github.com/griddb/docs-ja/blob/master/manuals/GridDB_QuickStartGuide/toc.md)
-  * [Java APIリファレンス](http://griddb.github.io/docs-ja/manuals/GridDB_Java_API_Reference.html)
-  * [C APIリファレンス](http://griddb.github.io/docs-ja/manuals/GridDB_C_API_Reference.html)
-  * [TQLリファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/GridDB_TQL_Reference/toc.md)
-  * [JDBCドライバ説明書](https://github.com/griddb/docs-ja/blob/master/manuals/GridDB_JDBC_Driver_UserGuide/toc.md)
-  * [SQLリファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/GridDB_SQL_Reference/toc.md)
+  * [Java APIリファレンス](http://griddb.github.io/docs-ja/manuals/md_reference_java_api/md_reference_java_api.html)
+  * [C APIリファレンス](http://griddb.github.io/docs-ja/manuals/md_reference_c_api/md_reference_c_api.html)
+  * [TQLリファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/md_reference_tql/md_reference_tql.md)
+  * [JDBCドライバ説明書](https://github.com/griddb/docs-ja/blob/master/manuals/md_reference_jdbc/md_reference_jdbc.md)
+  * [SQLリファレンス](https://github.com/griddb/docs-ja/blob/master/manuals/md_reference_sql/md_reference_sql.md)
+  * [SQLチューニングガイド](https://github.com/griddb/docs-ja/blob/master/manuals/md_sql_tuning_guide/md_sql_tuning_guide.md)
+  * [プログラミングガイド](https://github.com/griddb/docs-ja/blob/master/manuals/md_programming_guide/md_programming_guide.md)
   * [V3.0 Release Notes](docs/GridDB-3.0.0-CE-RELEASE_NOTES_ja.md)
   * [V4.0 Release Notes](docs/GridDB-4.0-CE-RELEASE_NOTES_ja.md)
   * [V4.1 Release Notes](docs/GridDB-4.1-CE-RELEASE_NOTES_ja.md)
   * [V4.2 Release Notes](docs/GridDB-4.2-CE-RELEASE_NOTES_ja.md)
   * [V4.3 Release Notes](docs/GridDB-4.3-CE-RELEASE_NOTES_ja.md)
   * [V4.5 Release Notes](docs/GridDB-4.5-CE-RELEASE_NOTES_ja.md)
+  * [V4.6 Release Notes](docs/GridDB-4.6-CE-RELEASE_NOTES_ja.md)
+  * [V5.0 Release Notes](docs/GridDB-5.0-CE-RELEASE_NOTES_ja.md)
+  * [V5.1 Release Notes](docs/GridDB-5.1-CE-RELEASE_NOTES_ja.md)
+  * [V5.3 Release Notes](docs/GridDB-5.3-CE-RELEASE_NOTES_ja.md)
+  * [V5.5 Release Notes](docs/GridDB-5.5-CE-RELEASE_NOTES_ja.md)
 
 ## クライアントとコネクタ
   Java以外のクライアント、APIもあります。
+  
+  (NoSQL Interface)
   * [GridDB C Client](https://github.com/griddb/c_client/blob/master/README_ja.md)
   * [GridDB Python Client](https://github.com/griddb/python_client)
   * [GridDB Ruby Client](https://github.com/griddb/ruby_client)
   * [GridDB Go Client](https://github.com/griddb/go_client)
-  * [GridDB Node.JS Client](https://github.com/griddb/nodejs_client)
+  * [GridDB Node.JS Client (SWIG based)](https://github.com/griddb/nodejs_client)
+  * [GridDB Node API (node-addon-api based)](https://github.com/griddb/node-api)
   * [GridDB PHP Client](https://github.com/griddb/php_client)
   * [GridDB Perl Client](https://github.com/griddb/perl_client)
-  * [GridDB WebAPI](https://github.com/griddb/webapi)
+  * [GridDB Rust Client](https://github.com/griddb/rust_client)
+  
+  (SQL Interface)
   * [GridDB JDBC Driver](https://github.com/griddb/jdbc)
   
+  (NoSQL & SQL Interface)
+  * [GridDB WebAPI](https://github.com/griddb/webapi)
+  * [GridDB CLI](https://github.com/griddb/cli)
+  
+  (その他)
+  * [GridDB Export/Import](https://github.com/griddb/expimp)
+
   他のOSSと接続するためのコネクタもあります。
   * [GridDB connector for Apache Hadoop MapReduce](https://github.com/griddb/griddb_hadoop_mapreduce/blob/master/README_ja.md)
   * [GridDB connector for YCSB (https://github.com/brianfrankcooper/YCSB/tree/master/griddb)](https://github.com/brianfrankcooper/YCSB/tree/master/griddb)
   * [GridDB connector for KairosDB](https://github.com/griddb/griddb_kairosdb)
   * [GridDB connector for Apache Spark](https://github.com/griddb/griddb_spark)
   * [GridDB Foreign Data Wrapper for PostgreSQL (https://github.com/pgspider/griddb_fdw)](https://github.com/pgspider/griddb_fdw)
-  * [GridDB Sample Application for Apache Kafka](https://github.com/griddb/griddb_kafka_sample_app)
   * [GridDB Data Source for Grafana](https://github.com/griddb/griddb-datasource)
   * [GridDB Plugin for Redash](https://github.com/griddb/griddb-redash)
   * [GridDB Plugin for Fluentd](https://github.com/griddb/fluent-plugin-griddb)
+  * [GridDB Plugin for Tableau](https://github.com/griddb/tableau-plugin-griddb)
+  * [GridDB connector for Apache Kafka](https://github.com/griddb/griddb-kafka-connect)
+
+## [パッケージ](docs/Packages.md)
 
 ## コミュニティ
   * Issues  

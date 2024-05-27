@@ -122,7 +122,7 @@ public:
  * TIME_PREV_ONLY)
  *
  */
-template <bool isJustInclude, bool isAccending>
+template <bool isJustInclude, bool isAscending>
 class SelectionTimeFind : public TqlSelection {
 public:
 	using TqlSelection::operator();
@@ -188,7 +188,7 @@ public:
 	virtual ~SelectionTimeSampling() {}
 
 private:
-	bool parseArgument(TransactionContext &txn, ObjectManager &objectManager,
+	bool parseArgument(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		ExprList &args, uint32_t &columnId, ColumnType &columnType,
 		util::DateTime::FieldType &fType, Timestamp &targetTs, Timestamp &endTs,
 		int32_t &duration);
@@ -216,7 +216,7 @@ public:
 	virtual ~SelectionTimeWindowAgg() {}
 
 private:
-	bool parseArgument(TransactionContext &txn, ObjectManager &objectManager,
+	bool parseArgument(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy &strategy,
 		ExprList &args, uint32_t &columnId, ColumnType &columnType,
 		util::DateTime::FieldType &fType, Timestamp &targetTs, Timestamp &endTs,
 		int32_t &duration, AggregationType &aggType);

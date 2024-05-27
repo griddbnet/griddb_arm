@@ -24,13 +24,15 @@
 #include "util/container.h"
 #include "util/trace.h"
 #include "schema.h"
-#include "data_store.h"
+#include "data_store_v4.h"
 #include "btree_map.h"
-#include "hash_map.h"
 #include "rtree_map.h"
+#include "container_message_v4.h"
+#include "result_set.h"
 
 UTIL_TRACER_DECLARE(BASE_CONTAINER);
 
+class InputMessageRowStore;
 class MessageSchema;
 class ResultSet;
 class ContainerRowScanner;
@@ -55,67 +57,66 @@ public:
 		TablePartitioningVersionId tablePartitioningVersionId_;
 		ContainerId containerId_;
 		OId containerNameOId_;  
-		union {
-			OId rowIdMapOId_;		   
-			OId subContainerListOId_;  
-		};
+		OId rowIdMapOId_;		   
 		OId mvccMapOId_;  
 		OId columnSchemaOId_;
 		OId indexSchemaOId_;
 		OId triggerListOId_;
-		OId lastLsn_;  
+		OId baseGroupId_;
 		uint64_t rowNum_;
 		Timestamp startTime_;	
 	};
 
 	class ValueMap {
 	public:
-		ValueMap(TransactionContext &txn, BaseContainer *container, IndexData &indexData)
-			: container_(container), valueMap_(NULL), nullMap_(NULL),
-			alloc_(txn.getDefaultAllocator()), indexData_(indexData) {
+		ValueMap(
+				TransactionContext &txn, BaseContainer *container,
+				IndexData &indexData) :
+				container_(container),
+				alloc_(txn.getDefaultAllocator()),
+				indexData_(indexData) {
 		}
-		~ValueMap() {
-			ALLOC_DELETE((alloc_), valueMap_);
-			ALLOC_DELETE((alloc_), nullMap_);
-		}
+
 		BaseIndex *getValueMap(TransactionContext &txn, bool forNull) {
 			if (forNull) {
-				if (nullMap_ == NULL) {
-					nullMap_ = container_->getIndex(txn, indexData_, forNull);
+				if (nullMap_.get() == NULL) {
+					container_->getIndex(txn, indexData_, forNull, nullMap_);
 				}
-				return nullMap_;
-			} else {
-				if (valueMap_ == NULL) {
-					valueMap_ = container_->getIndex(txn, indexData_, forNull);
+				return nullMap_.get();
+			}
+			else {
+				if (valueMap_.get() == NULL) {
+					container_->getIndex(txn, indexData_, forNull, valueMap_);
 				}
-				assert(valueMap_ != NULL);
-				return valueMap_;
+				assert(valueMap_.get() != NULL);
+				return valueMap_.get();
 			}
 		};
 		BaseIndex *putValueMap(TransactionContext &txn, bool forNull) {
 			if (forNull) {
-				if (nullMap_ == NULL) {
+				if (nullMap_.get() == NULL) {
 					if (indexData_.oIds_.nullOId_ == UNDEF_OID) {
 						container_->createNullIndexData(txn, indexData_);
 					}
-					nullMap_ = container_->getIndex(txn, indexData_, forNull);
+					container_->getIndex(txn, indexData_, forNull, nullMap_);
 				}
-				assert(nullMap_ != NULL);
-				return nullMap_;
-			} else {
-				if (valueMap_ == NULL) {
-					valueMap_ = container_->getIndex(txn, indexData_, forNull);
+				assert(nullMap_.get() != NULL);
+				return nullMap_.get();
+			}
+			else {
+				if (valueMap_.get() == NULL) {
+					container_->getIndex(txn, indexData_, forNull, valueMap_);
 				}
-				assert(valueMap_ != NULL);
-				return valueMap_;
+				assert(valueMap_.get() != NULL);
+				return valueMap_.get();
 			}
 		};
 		void updateIndexData(TransactionContext &txn) {
-			if (valueMap_ != NULL) {
-				indexData_.oIds_.mainOId_ = valueMap_->getBaseOId();
+			if (valueMap_.get() != NULL) {
+				indexData_.oIds_.mainOId_ = valueMap_.get()->getBaseOId();
 			}
-			if (nullMap_ != NULL) {
-				indexData_.oIds_.nullOId_ = nullMap_->getBaseOId();
+			if (nullMap_.get() != NULL) {
+				indexData_.oIds_.nullOId_ = nullMap_.get()->getBaseOId();
 			}
 			container_->updateIndexData(txn, indexData_);
 		}
@@ -130,8 +131,8 @@ public:
 		}
 	private:
 		BaseContainer *container_;
-		BaseIndex *valueMap_;
-		BaseIndex *nullMap_;
+		IndexAutoPtr valueMap_;
+		IndexAutoPtr nullMap_;
 		util::StackAllocator &alloc_;
 		IndexData &indexData_;
 	};
@@ -218,7 +219,7 @@ public:
 
 	class RowArrayStorage : public BaseObject {
 	public:
-		RowArrayStorage(PartitionId pId, ObjectManager &objectManager) : BaseObject(pId, objectManager) {};
+		RowArrayStorage(ObjectManagerV4 &objectManager, AllocateStrategy &strategy) : BaseObject(objectManager, strategy) {};
 	};
 
 	class RowCache {
@@ -239,8 +240,8 @@ public:
 		}
 	public:
 		struct FieldCache {
-			explicit FieldCache(PartitionId partitionId, ObjectManager &objectManager) :
-				baseObject_(partitionId, objectManager),
+			explicit FieldCache(ObjectManagerV4 &objectManager, AllocateStrategy &strategy) :
+				baseObject_(objectManager, strategy),
 				addr_(NULL) {
 			}
 			void reset() {
@@ -269,6 +270,8 @@ public:
 	template<typename Container, RowArrayType rowArrayType>
 	class RowArrayImpl;
 
+	typedef bool IndexMapTable[COLUMN_TYPE_PRIMITIVE_COUNT][MAP_TYPE_NUM];
+
 public:  
 public:  
 	virtual ~BaseContainer() {
@@ -278,75 +281,84 @@ public:
 		ALLOC_DELETE((alloc_), rowArrayCache_);
 	}
 	virtual void initialize(TransactionContext &txn) = 0;
-	virtual bool finalize(TransactionContext &txn) = 0;
-
-	virtual void set(TransactionContext &txn, const FullContainerKey &containerKey,
+	virtual bool finalize(TransactionContext &txn, bool isRemoveGroup = false) = 0;
+	virtual void set(TransactionContext& txn, const FullContainerKey& containerKey,
 		ContainerId containerId, OId columnSchemaOId,
-		MessageSchema *containerSchema) = 0;
+		MessageSchema* containerSchema, DSGroupId groupId) = 0;
 
-	virtual void createIndex(TransactionContext &txn, const IndexInfo &indexInfo,
+	virtual void createIndex(
+		TransactionContext &txn, const IndexInfo &indexInfo,
 		IndexCursor& indexCursor,
-		bool isIndexNameCaseSensitive = false) = 0;
+		bool isIndexNameCaseSensitive = false,
+		CreateDropIndexMode mode = INDEX_MODE_NOSQL,
+		bool *skippedByMode = NULL) = 0;
 	virtual void continueCreateIndex(TransactionContext& txn, 
 		IndexCursor& indexCursor) = 0;
 	IndexCursor getIndexCursor(TransactionContext& txn);
 	ContainerCursor getContainerCursor(TransactionContext& txn);
-	virtual void dropIndex(TransactionContext &txn, IndexInfo &indexInfo,
-		bool isIndexNameCaseSensitive = false) = 0;
+	virtual void dropIndex(
+		TransactionContext &txn, IndexInfo &indexInfo,
+		bool isIndexNameCaseSensitive = false,
+		CreateDropIndexMode mode = INDEX_MODE_NOSQL,
+		bool *skippedByMode = NULL) = 0;
+
+	void changeSchema(TransactionContext &txn,
+		BaseContainer &newContainer, util::XArray<uint32_t> &copyColumnMap);
+	void continueChangeSchema(TransactionContext &txn,
+		ContainerCursor &containerCursor);
+	void changeProperty(TransactionContext& txn, OId columnSchemaOId);
+	void makeCopyColumnMap(TransactionContext &txn,
+		MessageSchema *messageSchema, util::XArray<uint32_t> &copyColumnMap,
+		DataStoreV4::SchemaState &schemaState);
+	void changeNullStats(TransactionContext& txn, uint32_t oldColumnNum);
+	void updateContainer(TransactionContext& txn, BaseContainer* newContainer);
+
 	void getIndexInfoList(
 		TransactionContext &txn, util::Vector<IndexInfo> &indexInfoList);
-	void getIndexInfoList(
-		TransactionContext &txn, MapType mapType, 
-		util::Vector<ColumnId> &columnIds,
-		util::Vector<IndexInfo> &indexInfoList,
-		bool withPartialMatch);
 	void getIndexDataList(
 		TransactionContext &txn, MapType mapType, 
 		util::Vector<ColumnId> &columnIds,
 		util::Vector<IndexData> &indexDataList,
 		bool withPartialMatch);
+	TreeFuncInfo *createTreeFuncInfo(TransactionContext &txn, const util::Vector<ColumnId> &columnIds);
+
 	bool checkRowKeySchema(util::XArray<ColumnType> &columnTypeList);
 	void getContainerInfo(TransactionContext &txn,
-		util::XArray<uint8_t> &containerSchema, bool optionIncluded = true, bool internalOptionIncluded = true);
-	virtual util::String getBibInfo(TransactionContext &txn, const char* dbName) = 0;
-	virtual void getErasableList(TransactionContext &txn, Timestamp erasableTimeLimit, util::XArray<ArchiveInfo> &list) = 0;
-	virtual ExpireType getExpireType() const = 0;
+		util::XArray<uint8_t> &containerSchema, bool optionIncluded = true, bool internalOptionIncluded = true, bool isRenameColumn = false);
+
+	virtual SchemaFeatureLevel getSchemaFeatureLevel() const;
+	static SchemaFeatureLevel resolveColumnSchemaFeatureLevel(
+			const ColumnInfo &info);
+
+	void getErasableList(TransactionContext &txn, Timestamp erasableTimeLimit, util::XArray<ArchiveInfo> &list);
+
 	void putRow(TransactionContext &txn, uint32_t rowSize,
-		const uint8_t *rowData, RowId &rowId, DataStore::PutStatus &status,
+		const uint8_t *rowData, RowId &rowId, PutStatus &status,
 		PutRowOption putRowOption) {
-		bool rowIdSecified = false;
-		putRow(txn, rowSize, rowData, rowId, rowIdSecified, status,
+		bool rowIdSpecified = false;
+		putRow(txn, rowSize, rowData, rowId, rowIdSpecified, status,
 			putRowOption);
 	}
 	void redoPutRow(TransactionContext &txn, uint32_t rowSize,
-		const uint8_t *rowData, RowId &rowId, DataStore::PutStatus &status,
+		const uint8_t *rowData, RowId &rowId, PutStatus &status,
 		PutRowOption putRowOption) {
-		bool rowIdSecified = true;
-		putRow(txn, rowSize, rowData, rowId, rowIdSecified, status,
+		bool rowIdSpecified = true;
+		putRow(txn, rowSize, rowData, rowId, rowIdSpecified, status,
 			putRowOption);
 	}
-	void putRowList(TransactionContext &txn, uint32_t rowSize,
-		const uint8_t *rowData, uint64_t numRow, DataStore::PutStatus &status);
 	virtual void deleteRow(TransactionContext &txn, uint32_t rowSize,
 		const uint8_t *rowKey, RowId &rowId, bool &existing) = 0;
 	virtual void deleteRow(
 		TransactionContext &txn, RowId rowId, bool &existing) = 0;
 	virtual void updateRow(TransactionContext &txn, uint32_t rowSize,
-		const uint8_t *rowData, RowId rowId, DataStore::PutStatus &status) = 0;
+		const uint8_t *rowData, RowId rowId, PutStatus &status) = 0;
 	virtual void redoDeleteRow(
 		TransactionContext &txn, RowId rowId, bool &existing) = 0;
 	virtual void abort(TransactionContext &txn) = 0;
 	virtual void commit(TransactionContext &txn) = 0;
-	void changeSchema(TransactionContext &txn,
-		BaseContainer &newContainer, util::XArray<uint32_t> &copyColumnMap);
-	void changeProperty(TransactionContext& txn, OId columnSchemaOId);
-	void makeCopyColumnMap(TransactionContext &txn,
-		MessageSchema *messageSchema, util::XArray<uint32_t> &copyColumnMap,
-		DataStore::SchemaState &schemaState);
-
-	void changeNullStats(TransactionContext& txn, uint32_t oldColumnNum);
-
-	virtual bool hasUncommitedTransaction(TransactionContext &txn) = 0;
+	void validateForRename(TransactionContext &txn,
+		MessageSchema *messageSchema, DataStoreV4::SchemaState &schemaState);
+	bool hasUncommitedTransaction(TransactionContext &txn);
 
 	virtual void searchRowIdIndex(TransactionContext &txn,
 		BtreeMap::SearchContext &sc, util::XArray<OId> &resultList,
@@ -359,8 +371,6 @@ public:
 		BtreeMap::SearchContext &sc, util::XArray<OId> &oIdList,
 		OutputOrder outputOrder);
 	void searchColumnIdIndex(TransactionContext &txn,
-		HashMap::SearchContext &sc, util::XArray<OId> &resultList);
-	void searchColumnIdIndex(TransactionContext &txn,
 		RtreeMap::SearchContext &sc, util::XArray<OId> &resultList);
 	void searchColumnIdIndex(TransactionContext &txn,
 		BtreeMap::SearchContext &sc, util::XArray<OId> &normalRowList,
@@ -370,14 +380,6 @@ public:
 		ResultSize limit, ResultSize &resultNum,
 		MessageRowStore *messageRowStore, bool isWithRowId,
 		ResultSize startPos);
-
-	void putTrigger(TransactionContext &txn, const TriggerInfo &info);
-	void deleteTrigger(TransactionContext &txn, const char *name);
-	void getTriggerList(
-		TransactionContext &txn, util::XArray<const uint8_t *> &triggerList);
-	void updateTrigger(TransactionContext &txn,  OId oId,
-		const util::XArray<const util::String *> &oldColumnNameList,
-		const util::XArray<const util::String *> &newColumnNameList);
 
 	void getLockRowIdList(TransactionContext &txn, ResultSet &resultSet,
 		util::XArray<RowId> &idList);
@@ -402,29 +404,13 @@ public:
 		UNUSED_VARIABLE(txn);
 		if (containerKeyCursor_ .getBaseOId() == UNDEF_OID) {
 			if (baseContainerImage_->containerNameOId_ != UNDEF_OID) {
-				containerKeyCursor_.load(baseContainerImage_->containerNameOId_);
+				containerKeyCursor_.load(baseContainerImage_->containerNameOId_, false);
 			}
 			else {
 				GS_THROW_USER_ERROR(GS_ERROR_DS_DS_CONTAINER_NAME_INVALID, "container key not exist");
 			}
 		}
 		return containerKeyCursor_.getKey();
-	}
-
-	BaseIndex *getIndex(
-		TransactionContext &txn, const IndexData &indexData, bool forNull = false) {
-		return indexSchema_->getIndex(txn, indexData, forNull, this);
-	}
-	BaseIndex *getIndex(
-		TransactionContext &txn, MapType mapType, util::Vector<ColumnId> &columnIds, bool forNull = false) {
-		bool withUncommitted = true;
-		IndexData indexData(txn.getDefaultAllocator());
-		if (getIndexData(txn, columnIds, mapType, withUncommitted, indexData)) {
-			return getIndex(txn, indexData, forNull);
-		}
-		else {
-			return NULL;
-		}
 	}
 
 	uint32_t getColumnNum() const {
@@ -439,11 +425,11 @@ public:
 	ColumnInfo &getColumnInfo(uint32_t columnId) const {
 		return columnSchema_->getColumnInfo(columnId);
 	}
-	void getColumnInfo(TransactionContext &txn, ObjectManager &objectManager,
+	void getColumnInfo(TransactionContext &txn, ObjectManagerV4 &objectManager, AllocateStrategy& strategy,
 		const char *name, uint32_t &columnId, ColumnInfo *&columnInfo,
 		bool isCaseSensitive) const {
 		return columnSchema_->getColumnInfo(
-			txn, objectManager, name, columnId, columnInfo, isCaseSensitive);
+			txn, objectManager, strategy, name, columnId, columnInfo, isCaseSensitive);
 	}
 	void getKeyColumnIdList(util::Vector<ColumnId> &keyColumnIdList) {
 		columnSchema_->getKeyColumnIdList(keyColumnIdList);
@@ -466,28 +452,6 @@ public:
 		util::Vector<ColumnId> &columnIds, bool withPartialMatch) const {
 		return indexSchema_->getIndexTypes(txn, columnIds, withPartialMatch);
 	}
-	IndexTypes getIndexTypes(TransactionContext &txn, ColumnId columnId) {
-		return indexSchema_->getIndexTypes(txn, columnId);
-	}
-	bool isFirstColumnAdd() {
-		return columnSchema_->isFirstColumnAdd();
-	}
-	ContainerAttribute getAttribute() const {
-		ContainerAttribute *attribute =
-			commonContainerSchema_->get<ContainerAttribute>(
-				META_TYPE_ATTRIBUTES);
-		if (attribute == NULL) {
-			return CONTAINER_ATTR_SINGLE;
-		}
-		else {
-			return *attribute;
-		}
-	}
-
-	DataStore *getDataStore() {
-		return dataStore_;
-	}
-
 	void getNullsStats(util::XArray<uint8_t> &nullsList) const {
 		uint16_t limitSize = sizeof(int64_t);
 		if (!isNullsStatsStatus() && indexSchema_->getNullbitsSize() > limitSize) {
@@ -507,26 +471,14 @@ public:
 		}
 	}
 
-	virtual AllocateStrategy calcMapAllocateStrategy() const = 0;
-	virtual AllocateStrategy calcRowAllocateStrategy() const = 0;
-	AllocateStrategy calcMetaAllocateStrategy() const {
-		return AllocateStrategy(ALLOCATE_META_CHUNK);
-	}
-
-	void handleUpdateError(
-		TransactionContext &txn, std::exception &e, ErrorCode errorCode);
 	void handleSearchError(
 		TransactionContext &txn, std::exception &e, ErrorCode errorCode);
-	void handleInvalidError(
-		TransactionContext &txn, SystemException &e, ErrorCode errorCode);
 
-	virtual void getActiveTxnList(
-		TransactionContext &txn, util::Set<TransactionId> &txnList) = 0;
-	void archive(TransactionContext &txn, ArchiveHandler *handler, ResultSize preReadNum);
-
-	virtual bool validate(TransactionContext &txn, std::string &errorMessage);
-	virtual std::string dump(TransactionContext &txn);
+	bool validate(TransactionContext &txn, std::string &errorMessage);
+	std::string dump(TransactionContext &txn);
 	std::string dump(TransactionContext &txn, util::XArray<OId> &oIdList);
+
+
 
 public:  
 	ContainerId getContainerId() const {
@@ -542,6 +494,9 @@ public:
 		columnSchema_->getFirstSchema(columnNum, varColumnNum, rowFixedColumnSize);
 		int64_t status = ColumnSchema::convertToInitSchemaStatus(columnNum, varColumnNum, rowFixedColumnSize);
 		return status;
+	}
+	bool isFirstColumnAdd() {
+		return columnSchema_->isFirstColumnAdd();
 	}
 
 	ColumnSchemaId getColumnSchemaId() const {
@@ -564,14 +519,6 @@ public:
 		return baseContainerImage_->normalRowArrayNum_;
 	}
 
-	uint16_t getSmallRowArrayNum() const {
-		if (getNormalRowArrayNum() < SMALL_ROW_ARRAY_MAX_SIZE) {
-			return getNormalRowArrayNum();
-		} else {
-			return SMALL_ROW_ARRAY_MAX_SIZE;
-		}
-	}
-
 	void getAffinityStr(util::String &affinityStr) {
 		char temporary[AFFINITY_STRING_MAX_LENGTH + 1];
 		memcpy(temporary, getAffinityBinary(), AFFINITY_STRING_MAX_LENGTH);
@@ -580,28 +527,16 @@ public:
 		affinityStr = temporary;
 	}
 
+	DSGroupId getBaseGroupId() const {
+		return baseContainerImage_->baseGroupId_;
+	}
+
 	bool isInvalid() const {
 		return (baseContainerImage_->status_ & CONTAINER_INVALID_BIT) != 0;
 	}
 
-	void setContainerInvalid() {
-		baseContainerImage_->status_ |= CONTAINER_INVALID_BIT;
-	}
-
-	void setCompressionErrorMode(bool isError) {
-		isCompressionErrorMode_ = isError;
-	}
-	bool isCompressionErrorMode() {
-		return isCompressionErrorMode_;
-	}
 	void setVersionId(uint32_t versionId) {
 		baseContainerImage_->versionId_ = versionId;
-	}
-	OId getTriggerOId() const {
-		return baseContainerImage_->triggerListOId_;
-	}
-	void setTriggerOId(OId oId) {
-		baseContainerImage_->triggerListOId_ = oId;
 	}
 
 	void updateNullsStats(const uint8_t *nullbits) {
@@ -610,34 +545,37 @@ public:
 	uint32_t getNullbitsSize() const {
 		return indexSchema_->getNullbitsSize();
 	}
-	void setNullStats(ColumnId columnId) {
-		indexSchema_->setNullStats(columnId);
+
+	ExpireType getExpireType() const;
+
+	ContainerAttribute getAttribute() const {
+		ContainerAttribute *attribute =
+			commonContainerSchema_->get<ContainerAttribute>(
+				META_TYPE_ATTRIBUTES);
+		if (attribute == NULL) {
+			return CONTAINER_ATTR_SINGLE;
+		}
+		else {
+			return *attribute;
+		}
+	}
+
+	DataStoreV4 *getDataStore() {
+		return dataStore_;
 	}
 
 	virtual ColumnId getRowIdColumnId() = 0;
 	virtual ColumnType getRowIdColumnType() = 0;
 
-	virtual bool checkRunTime(TransactionContext &txn) = 0;
-
-	virtual uint32_t getRealColumnNum(TransactionContext &txn) = 0;
-	virtual ColumnInfo* getRealColumnInfoList(TransactionContext &txn) = 0;
-	virtual uint32_t getRealRowSize(TransactionContext &txn) = 0;
-	virtual uint32_t getRealRowFixedDataSize(TransactionContext &txn) = 0;
+	bool checkRunTime(TransactionContext &txn);
 
 	TablePartitioningVersionId getTablePartitioningVersionId();
 	void setTablePartitioningVersionId(
 		TablePartitioningVersionId versionId);
-	int64_t setTablePartitioningVersion(TransactionContext &txn, TablePartitioningVersionId versionId);
 
-	static util::String getContainerName(util::StackAllocator &alloc,
-		const FullContainerKey &containerKey) {
-		util::String containerName(alloc);
-		containerKey.toString(alloc, containerName);
-		return containerName;
-	}
 	bool isExpired(TransactionContext &txn) {
 		Timestamp currentTime = txn.getStatementStartTime().getUnixTime();
-		Timestamp lastExpiredTime = getDataStore()->getLatestExpirationCheckTime(txn.getPartitionId());
+		Timestamp lastExpiredTime = getDataStore()->stats().getExpiredTime();
 
 		if (currentTime < lastExpiredTime) {
 			currentTime = lastExpiredTime;
@@ -649,45 +587,57 @@ public:
 		}
 		return false;
 	}
-	Timestamp getContainerExpirationTime() const {
-		int64_t duration = getContainerExpirationDutation();
-		if (duration != INT64_MAX) {
-			Timestamp endTime = getContainerExpirationEndTime();
-			Timestamp expirationTime = getContainerExpirationEndTime() + duration;
-			if (endTime < expirationTime) {
-				return expirationTime;
-			} else {
-				return MAX_TIMESTAMP;
-			}
-		}
-		return MAX_TIMESTAMP;
-	}
+
 	static Timestamp calcErasableTime(Timestamp baseTime, int64_t duration) {
-		ExpireIntervalCategoryId expireCategoryId = DEFAULT_EXPIRE_CATEGORY_ID;
-		ChunkKey chunkKey = UNDEF_CHUNK_KEY;
-		calcChunkKey(baseTime, duration, expireCategoryId, chunkKey);
-		Timestamp erasableTime = DataStore::convertChunkKey2Timestamp(chunkKey);
+		ChunkKey chunkKey = calcChunkKey(baseTime, duration);
+		Timestamp erasableTime = DataStoreV4::DataAffinityUtils::convertChunkKey2Timestamp(chunkKey);
 		return erasableTime;
 	}
-
-	RowArray *getCacheRowArray(TransactionContext &txn);
+	static ChunkKey calcChunkKey(Timestamp startTime, const ContainerExpirationInfo& info) {
+		Timestamp baseTime = getContainerExpirationEndTime(startTime, info);
+		int64_t duration = info.info_.duration_;
+		return calcChunkKey(baseTime, duration);
+	}
+	ChunkKey getChunkKey() {
+		return calcChunkKey(getContainerExpirationEndTime(), getContainerExpirationDuration());
+	}
 
 	uint16_t getRowKeyColumnNum() const {
 		return columnSchema_->getRowKeyColumnNum();
 	}
 	uint32_t getRowKeyFixedDataSize(util::StackAllocator &alloc) const;
-	void getFields(TransactionContext &txn, 
-		MessageRowStore* messageRowStore, 
-		util::Vector<ColumnId> &columnIdList, util::XArray<KeyData> &fields);
 	void getRowKeyFields(TransactionContext &txn, uint32_t rowKeySize, const uint8_t *rowKey, util::XArray<KeyData> &fields);
 	ColumnInfo *getRowKeyColumnInfoList(TransactionContext &txn);
 
-	TreeFuncInfo *createTreeFuncInfo(TransactionContext &txn, const util::Vector<ColumnId> &columnIds) {
-		util::StackAllocator &alloc = txn.getDefaultAllocator();
-		TreeFuncInfo *funcInfo = ALLOC_NEW(alloc) TreeFuncInfo(alloc);
-		funcInfo->initialize(columnIds, columnSchema_);
-		return funcInfo;
+	AllocateStrategy& getMapAllocateStrategy() {
+		return mapAllocateStrategy_;
 	}
+	AllocateStrategy& getRowAllocateStrategy() {
+		return rowAllocateStrategy_;
+	}
+	AllocateStrategy& getMetaAllocateStrategy() {
+		return metaAllocateStrategy_;
+	}
+
+	Timestamp getContainerExpirationTime() const {
+		int64_t duration = getContainerExpirationDuration();
+		if (duration != INT64_MAX) {
+			Timestamp endTime = getContainerExpirationEndTime();
+			Timestamp expirationTime = getContainerExpirationEndTime() + duration;
+			if (endTime < expirationTime) {
+				return expirationTime;
+			}
+			else {
+				return MAX_TIMESTAMP;
+			}
+		}
+		return MAX_TIMESTAMP;
+	}
+
+	void validateIndexInfo(const IndexInfo &info) const;
+	static void validateIndexInfo(
+			ContainerType type, ColumnType columnType, MapType mapType);
+
 protected:  
 	/*!
 		@brief Mode of operation of put
@@ -743,6 +693,8 @@ protected:
 			case COLUMN_TYPE_FLOAT:
 			case COLUMN_TYPE_DOUBLE:
 			case COLUMN_TYPE_TIMESTAMP:
+			case COLUMN_TYPE_MICRO_TIMESTAMP:
+			case COLUMN_TYPE_NANO_TIMESTAMP:
 			case COLUMN_TYPE_OID: {
 				data_ = reinterpret_cast<uint8_t *>(
 					txn.getDefaultAllocator().allocate(
@@ -773,35 +725,42 @@ protected:
 		@brief Compare method for sort
 	*/
 	struct SortPred {
-		const Operator *op_;
+		Operator op_;
 		TransactionContext *txn_;
 		const ColumnType columnType_;
 		const bool isNullLast_;
-		SortPred(TransactionContext &txn, const Operator *op,
-			const ColumnType columnType, bool isNullLast)
-			: op_(op), txn_(&txn), columnType_(columnType),
-			isNullLast_(isNullLast) {}
+
+		SortPred(
+				TransactionContext &txn, Operator op,
+				const ColumnType columnType, bool isNullLast) :
+				op_(op), txn_(&txn), columnType_(columnType),
+				isNullLast_(isNullLast) {
+		}
+
 		bool operator()(const SortKey &v1, const SortKey &v2) const {
 			if (v1.data() == NULL) {
 				if (v2.data() == NULL) {
 					return false;
-				} else {
+				}
+				else {
 					return !isNullLast_;
 				}
 			}
 			else if (v2.data() == NULL) {
 				return isNullLast_;
-			} else {
+			}
+			else {
 				Value value1_;
 				Value value2_;
 				value1_.set(v1.data(), columnType_);
 				value2_.set(v2.data(), columnType_);
-				return (*op_)(*txn_, value1_.data(), value1_.size(), value2_.data(),
-					value2_.size());
+				return op_(
+						*txn_,
+						value1_.data(), value1_.size(),
+						value2_.data(), value2_.size());
 			}
 		}
 	};
-
 
 	enum ToRowMode {
 		TO_MVCC,
@@ -817,7 +776,7 @@ protected:
 	}
 	class RsNotifier {
 	public:
-		RsNotifier(DataStore &dataStore) : dataStore_(dataStore), containerId_(UNDEF_CONTAINERID), mode_(TO_UNDEF) {
+		RsNotifier(DataStoreV4 &dataStore) : dataStore_(dataStore), containerId_(UNDEF_CONTAINERID), mode_(TO_UNDEF) {
 		}
 		void set(ContainerId containerId, ToRowMode mode) {
 			assert(mode != TO_UNDEF);
@@ -833,9 +792,9 @@ protected:
 			mode_ = TO_UNDEF;
 			containerId_ = UNDEF_CONTAINERID;
 		}
-		void addUpdatedRow(PartitionId pId, RowId rowId, OId oId);
+		void addUpdatedRow(RowId rowId, OId oId);
 	protected:
-		DataStore &dataStore_;
+		DataStoreV4 &dataStore_;
 		ContainerId containerId_;
 		ToRowMode mode_;
 	};
@@ -858,45 +817,54 @@ protected:
 	IndexSchema *indexSchema_;
 	uint32_t rowImageSize_;
 	uint32_t rowFixedDataSize_;
+	AllocateStrategy keyStoreAllocateStrategy_;
 	AllocateStrategy metaAllocateStrategy_;
 	AllocateStrategy mapAllocateStrategy_;
 	AllocateStrategy rowAllocateStrategy_;
 	MvccStatus exclusiveStatus_;
 	util::StackAllocator &alloc_;
-	DataStore *dataStore_;
+	DataStoreV4 *dataStore_;
 	RsNotifier rsNotifier_;
 	FullContainerKeyCursor containerKeyCursor_;
-	bool isCompressionErrorMode_;  
 	RowArray *rowArrayCache_;
 	TreeFuncInfo *rowIdFuncInfo_;
 	TreeFuncInfo *mvccFuncInfo_;
 
 	static const int8_t NULL_VALUE;
 protected:  
-	BaseContainer(TransactionContext &txn, DataStore *dataStore, OId oId)
+	BaseContainer(TransactionContext &txn, DataStoreV4 *dataStore, OId oId)
 		: BaseObject(
-			  txn.getPartitionId(), *(dataStore->getObjectManager()), oId),
+			  *(dataStore->getObjectManager())),
 		  exclusiveStatus_(UNKNOWN),
 		  alloc_(txn.getDefaultAllocator()),
 		  dataStore_(dataStore),
 		  rsNotifier_(*dataStore),
-		  containerKeyCursor_(txn.getPartitionId(), *(dataStore->getObjectManager())),
-		  isCompressionErrorMode_(false), rowArrayCache_(NULL)
-		  ,
+		  containerKeyCursor_(*(dataStore->getObjectManager())),
+		  rowArrayCache_(NULL),
 		  rowIdFuncInfo_(NULL), mvccFuncInfo_(NULL)
 		{
+		resetMetaAllocateStrategy(getObjectManager(), metaAllocateStrategy_);
+
+		BaseObject::reset(*(getObjectManager()), getMetaAllocateStrategy());
+		BaseObject::load(oId, false);
+
+		containerKeyCursor_.reset(*(getObjectManager()), getMetaAllocateStrategy());
+
 		baseContainerImage_ = getBaseAddr<BaseContainerImage *>();
 		commonContainerSchema_ =
-			ALLOC_NEW(txn.getDefaultAllocator()) ShareValueList(txn,
-				*getObjectManager(), baseContainerImage_->columnSchemaOId_);
+			ALLOC_NEW(txn.getDefaultAllocator()) ShareValueList(
+				*getObjectManager(), getMetaAllocateStrategy(), baseContainerImage_->columnSchemaOId_);
 		columnSchema_ =
 			commonContainerSchema_->get<ColumnSchema>(META_TYPE_COLUMN_SCHEMA);
 		indexSchema_ = ALLOC_NEW(txn.getDefaultAllocator())
 			IndexSchema(txn, *getObjectManager(),
-				baseContainerImage_->indexSchemaOId_, getMetaAllcateStrategy());
+				baseContainerImage_->indexSchemaOId_, getMetaAllocateStrategy());
+		
+		resetRowAllocateStrategy(getObjectManager(), rowAllocateStrategy_);
+		resetMapAllocateStrategy(getObjectManager(), mapAllocateStrategy_);
 	}
-	BaseContainer(TransactionContext &txn, DataStore *dataStore)
-		: BaseObject(txn.getPartitionId(), *(dataStore->getObjectManager())),
+	BaseContainer(TransactionContext &txn, DataStoreV4 *dataStore)
+		: BaseObject(*(dataStore->getObjectManager())),
 		  baseContainerImage_(NULL),
 		  columnSchema_(NULL),
 		  commonContainerSchema_(NULL),
@@ -907,13 +875,39 @@ protected:
 		  alloc_(txn.getDefaultAllocator()),
 		  dataStore_(dataStore),
 		  rsNotifier_(*dataStore),
-		  containerKeyCursor_(txn.getPartitionId(), *(dataStore->getObjectManager())),
-		  isCompressionErrorMode_(false), rowArrayCache_(NULL)
-		  ,
+		  containerKeyCursor_(*(dataStore->getObjectManager())),
+		  rowArrayCache_(NULL),
 		  rowIdFuncInfo_(NULL), mvccFuncInfo_(NULL)
-	{}
+	{
+		resetMetaAllocateStrategy(getObjectManager(), metaAllocateStrategy_);
 
-	BaseContainer(TransactionContext &txn, DataStore *dataStore, BaseContainerImage *containerImage, ShareValueList *commonContainerSchema);
+		BaseObject::reset(*(getObjectManager()), getMetaAllocateStrategy());
+		containerKeyCursor_.reset(*(getObjectManager()), getMetaAllocateStrategy());
+	}
+
+	void resetMetaAllocateStrategy(ObjectManagerV4* objMgr, AllocateStrategy &strategy) const {
+		strategy.set(META_GROUP_ID, objMgr);
+	}
+	/*!
+		@brief Calculate AllocateStrategy of Map Object
+	*/
+	void resetMapAllocateStrategy(ObjectManagerV4* objMgr, AllocateStrategy &strategy) const {
+		strategy.set(baseContainerImage_->baseGroupId_, objMgr);
+	}
+	/*!
+		@brief Calculate AllocateStrategy of Row Object
+	*/
+	void resetRowAllocateStrategy(ObjectManagerV4* objMgr, AllocateStrategy &strategy) const {
+		strategy.set(baseContainerImage_->baseGroupId_ + 1, objMgr);
+	}
+
+	void setAllocateStrategy(ObjectManagerV4 *objMgr) {
+		resetMetaAllocateStrategy(objMgr, metaAllocateStrategy_);
+		resetRowAllocateStrategy(objMgr, rowAllocateStrategy_);
+		resetMapAllocateStrategy(objMgr, mapAllocateStrategy_);
+	}
+
+	void calcGroupId();
 
 	void replaceIndexSchema(TransactionContext &txn) {
 		UNUSED_VARIABLE(txn);
@@ -921,60 +915,58 @@ protected:
 		baseContainerImage_->indexSchemaOId_ = indexSchema_->getBaseOId();
 	}
 
+	bool checkIndexConstraint(
+		TransactionContext& txn, bool isCreate,
+		CreateDropIndexMode mode, const IndexInfo& info,
+		bool isCaseSensitive);
+
+	void putRowList(TransactionContext &txn, uint32_t rowSize,
+		const uint8_t *rowData, uint64_t numRow, PutStatus &status);
+	void getIndex(
+			TransactionContext &txn, const IndexData &indexData, bool forNull,
+			IndexAutoPtr &indexPtr) {
+		return indexSchema_->getIndex(txn, indexData, forNull, this, indexPtr);
+	}
+
 	BtreeMap *getRowIdMap(TransactionContext &txn) const {
 		return ALLOC_NEW(txn.getDefaultAllocator())
 			BtreeMap(txn, *getObjectManager(),
-				baseContainerImage_->rowIdMapOId_, mapAllocateStrategy_, 
+				baseContainerImage_->rowIdMapOId_, *const_cast<AllocateStrategy*>(&mapAllocateStrategy_), 
 				NULL, rowIdFuncInfo_);
 	}
 
-	BtreeMap *getMvccMap(TransactionContext &txn) const {
-		return ALLOC_NEW(txn.getDefaultAllocator())
-			BtreeMap(txn, *getObjectManager(), baseContainerImage_->mvccMapOId_,
-				mapAllocateStrategy_, NULL, mvccFuncInfo_);
+	void getMvccMap(
+			TransactionContext &txn, const IndexData &indexData,
+			BaseIndexStorage::AutoPtr<BtreeMap> &mvccMap) const {
+		IndexStorageSet *storageSet = indexData.storageSet_;
+		assert(storageSet != NULL);
+
+		BaseIndexStorage *&indexStorage = storageSet->mvccIndexStorage_;
+		mvccMap.initialize(indexStorage, getMvccMap(txn, &indexStorage));
+	}
+
+	BtreeMap* getMvccMap(
+			TransactionContext &txn, BaseIndexStorage **indexStorage = NULL) const {
+		return BaseIndexStorage::create<BtreeMap>(
+				txn, *getObjectManager(), MAP_TYPE_BTREE,
+				baseContainerImage_->mvccMapOId_,
+				*const_cast<AllocateStrategy*>(&mapAllocateStrategy_), NULL,
+				mvccFuncInfo_, indexStorage);
 	}
 
 	void setCreateRowId(TransactionContext &txn, RowId rowId);
 
-	static int64_t calcSchemaHashKey(MessageSchema *messageSchema);
-	static bool schemaCheck(TransactionContext &txn,
-		ObjectManager &objectManager, ShareValueList *commonContainerSchema,
-		MessageSchema *messageSchema);
-	static void finalizeSchema(TransactionContext &txn,
-		ObjectManager &objectManager, ShareValueList *commonContainerSchema);
-	static void initializeSchema(TransactionContext &txn,
-		ObjectManager &objectManager, MessageSchema *messageSchema,
-		const AllocateStrategy &allocateStrategy,
-		util::XArray<ShareValueList::ElemData> &list, uint32_t &allocateSize,
-		bool onMemory);
-
-	static int64_t calcTriggerHashKey(util::XArray<const uint8_t *> &binary);
-	static bool triggerCheck(TransactionContext &txn,
-		ObjectManager &objectManager, ShareValueList *commonContainerSchema,
-		util::XArray<const uint8_t *> &binary);
-	static void finalizeTrigger(TransactionContext &txn,
-		ObjectManager &objectManager, ShareValueList *commonContainerSchema);
-	static void initializeTrigger(TransactionContext &txn,
-		ObjectManager &objectManager, util::XArray<const uint8_t *> &binary,
-		const AllocateStrategy &allocateStrategy,
-		util::XArray<ShareValueList::ElemData> &list, uint32_t &allocateSize);
-
-	static BaseContainerImage *makeBaseContainerImage(TransactionContext &txn, const BibInfo::Container &bibInfo);
-
-	bool isSupportIndex(const IndexInfo &indexInfo) const;
 	IndexCursor createCursor(TransactionContext &txn, const MvccRowImage &mvccImage);
 
 	virtual void putRow(TransactionContext &txn, uint32_t rowSize,
 		const uint8_t *rowData, RowId &rowId, bool rowIdSpecified,
-		DataStore::PutStatus &status, PutRowOption putRowOption) = 0;
-	virtual void putRow(TransactionContext &txn,
+		PutStatus &status, PutRowOption putRowOption) = 0;
+	virtual void putRowInternal(TransactionContext &txn,
 		InputMessageRowStore *inputMessageRowStore, RowId &rowId,
 		bool rowIdSpecified,
-		DataStore::PutStatus &status, PutRowOption putRowOption) = 0;
+		PutStatus &status, PutRowOption putRowOption) = 0;
 	virtual void getIdList(TransactionContext &txn,
 		util::XArray<uint8_t> &serializedRowList,
-		util::XArray<RowId> &idList) = 0;
-	virtual void lockIdList(TransactionContext &txn, util::XArray<OId> &oIdList,
 		util::XArray<RowId> &idList) = 0;
 	void getCommonContainerOptionInfo(util::XArray<uint8_t> &containerSchema);
 	virtual void getContainerOptionInfo(
@@ -993,19 +985,17 @@ protected:
 	void indexInsertImpl(TransactionContext &txn, IndexData &indexData,
 		bool isImmediate);
 
+	void getFields(TransactionContext &txn, 
+		MessageRowStore* messageRowStore, 
+		util::Vector<ColumnId> &columnIdList, util::XArray<KeyData> &fields);
 	bool getKeyCondition(TransactionContext &txn, BtreeMap::SearchContext &sc,
-		const Operator *&op1, const Operator *&op2) const;
-	bool getKeyCondition(TransactionContext &txn, HashMap::SearchContext &sc,
 		const Operator *&op1, const Operator *&op2) const;
 	bool getKeyCondition(TransactionContext &txn, RtreeMap::SearchContext &sc,
 		const Operator *&op1, const Operator *&op2) const;
 	void getInitialSchemaStatus(uint32_t &columnNum, uint32_t &varColumnNum, uint32_t &rowFixedColumnSize) {
 		return columnSchema_->getFirstSchema(columnNum, varColumnNum, rowFixedColumnSize);
 	}
-public:
-	virtual void continueChangeSchema(TransactionContext &txn,
-		ContainerCursor &containerCursor) = 0;
-protected:
+
 	template <typename R>
 	void changeSchemaRecord(TransactionContext &txn,
 		BaseContainer &newContainer, util::XArray<uint32_t> &copyColumnMap,
@@ -1046,32 +1036,30 @@ protected:
 		const bool isList1Sorted, util::XArray<OId> &inputList2,
 		const bool isList2Sorted, util::XArray<OId> &mergeList,
 		OutputOrder outputOrder);
-	util::String getBibInfoImpl(TransactionContext &txn, const char* dbName, uint64_t pos, bool isEmptyId);
-	void getActiveTxnListImpl(
-		TransactionContext &txn, util::Set<TransactionId> &txnList);
 	template <typename R>
 	std::string dumpImpl(TransactionContext &txn);
 	template <typename R>
 	bool validateImpl(TransactionContext &txn, std::string &errorMessage,
 		RowId &preRowId, uint64_t &countRowNum, bool isCheckRowRate = false);
 
+
 	template <typename R>
 	void getRowIdListImpl(TransactionContext &txn, util::XArray<OId> &oIdList,
 		util::XArray<RowId> &rowIdList);
 	void addUpdatedRow(TransactionContext &txn, RowId rowId, OId oId) {
-		rsNotifier_.addUpdatedRow(txn.getPartitionId(), rowId, oId);
+		rsNotifier_.addUpdatedRow(rowId, oId);
 	}
 	void addRemovedRow(TransactionContext &txn, RowId rowId, OId oId) {
-		getDataStore()->addRemovedRow(txn.getPartitionId(), getContainerId(), 
+		getDataStore()->getResultSetManager()->addRemovedRow(getContainerId(),
 			rowId, oId);
 	}
 	void addRemovedRowArray(TransactionContext &txn, OId oId) {
-		getDataStore()->addRemovedRowArray(txn.getPartitionId(), 
+		getDataStore()->getResultSetManager()->addRemovedRowArray(
 			getContainerId(), oId);
 	}
 	virtual void setDummyMvccImage(TransactionContext &txn) = 0;
 
-	virtual void checkExclusive(TransactionContext &txn) = 0;
+	void checkExclusive(TransactionContext &txn);
 
 	inline bool isNoRowTransaction() const {
 		return exclusiveStatus_ == NO_ROW_TRANSACTION;
@@ -1091,11 +1079,14 @@ protected:
 		return exclusiveStatus_;
 	}
 
-	virtual bool getIndexData(TransactionContext &txn, const util::Vector<ColumnId> &columnIds,
+	bool getIndexData(TransactionContext &txn, const util::Vector<ColumnId> &columnIds,
 		MapType mapType, bool withUncommitted, IndexData &indexData,
-		bool withPartialMatch = false) const = 0;
-	virtual bool getIndexData(TransactionContext &txn, IndexCursor &indexCursor,
-		IndexData &indexData)  const = 0;
+		bool withPartialMatch = false) const;
+	bool getIndexData(TransactionContext &txn, IndexCursor &indexCursor,
+		IndexData &indexData) const {
+		return indexSchema_->getIndexData( 
+			txn, indexCursor, indexData);
+	}
 	const void *getIndexValue(TransactionContext &txn, util::Vector<ColumnId> &columnIds,
 		TreeFuncInfo *funcInfo, util::XArray<KeyData> &keyFieldList) {
 		const void *value = NULL;
@@ -1114,21 +1105,20 @@ protected:
 		}
 		return value;
 	}
-	virtual void getIndexList(
-		TransactionContext &txn, bool withUncommitted, util::XArray<IndexData> &list) const = 0;
-	virtual void createNullIndexData(TransactionContext &txn, 
-		IndexData &indexData) = 0;
-	virtual void finalizeIndex(TransactionContext &txn) = 0;
 
-	static AffinityGroupId calcAffnityGroupId(const uint8_t *affinityBinary) {
-		uint64_t hash = 0;
-		const uint8_t *key = affinityBinary;
-		uint32_t keylen = AFFINITY_STRING_MAX_LENGTH;
-		for (hash = 0; --keylen != UINT32_MAX; hash = hash * 37 + *(key)++)
-			;
+	void getIndexList(
+		TransactionContext &txn, bool withUncommitted, util::XArray<IndexData> &list) const;
 
-		AffinityGroupId groupId = static_cast<AffinityGroupId>(hash);
-		return groupId;
+	void createNullIndexData(TransactionContext &txn, IndexData &indexData) {
+		indexSchema_->createNullIndexData(txn, indexData, 
+			this);
+	}
+
+	void finalizeIndex(TransactionContext &txn, bool alreadyRemoved) {
+		if (!isExpired(txn) && !alreadyRemoved) {
+			indexSchema_->dropAll(txn, this, true);
+		}
+		indexSchema_->finalize(txn);
 	}
 
 	bool isAlterContainer() const {
@@ -1162,17 +1152,12 @@ protected:
 			GS_THROW_USER_ERROR(GS_ERROR_CM_INTERNAL_ERROR,
 				"Invalid container expiration.");
 		}
-		Timestamp endTime = baseContainerImage_->startTime_ + info->interval_ - 1;
-		if (baseContainerImage_->startTime_ <= endTime) {
-			return endTime;
-		} else {
-			return MAX_TIMESTAMP;
-		}
+		return getContainerExpirationEndTime(baseContainerImage_->startTime_, *info);
 	}
 	ContainerExpirationInfo* getContainerExpirationInfo() const {
 		return commonContainerSchema_->get<ContainerExpirationInfo>(META_TYPE_CONTAINER_DURATION);
 	}
-	int64_t getContainerExpirationDutation() const {
+	int64_t getContainerExpirationDuration() const {
 		ContainerExpirationInfo *info =  commonContainerSchema_->get<ContainerExpirationInfo>(META_TYPE_CONTAINER_DURATION);
 		if (info != NULL) {
 			return info->info_.duration_;
@@ -1180,69 +1165,95 @@ protected:
 			return INT64_MAX;
 		}
 	}
-	static void calcChunkKey(Timestamp baseTime, int64_t duration,
-		ExpireIntervalCategoryId &expireCategoryId, ChunkKey &chunkKey) {
+	static Timestamp getContainerExpirationEndTime(Timestamp startTime, const ContainerExpirationInfo& info) {
+		Timestamp endTime = startTime + info.interval_ - 1;
+		if (startTime <= endTime) {
+			return endTime;
+		}
+		else {
+			return MAX_TIMESTAMP;
+		}
+	}
+
+	static ChunkKey calcChunkKey(Timestamp baseTime, int64_t duration) {
 		if (duration <= 0) {
 			GS_THROW_USER_ERROR(
 				GS_ERROR_DS_CM_EXPIRATION_TIME_INVALID, "Invalid duration : " << duration);
 		}
-		expireCategoryId =  ChunkManager::DataAffinityUtils::calcExpireIntervalCategoryId(duration);
+		ChunkKey chunkKey = MAX_CHUNK_KEY;
+		ExpireIntervalCategoryId expireCategoryId = DataStoreV4::DataAffinityUtils::calcExpireIntervalCategoryId(duration);
 		if (baseTime + duration + EXPIRE_MARGIN >
 			baseTime) {
-			uint64_t roundingBitNum = ChunkManager::DataAffinityUtils::getExpireTimeRoundingBitNum(expireCategoryId);
-			chunkKey = ChunkManager::DataAffinityUtils::convertTimestamp2ChunkKey(
+			uint64_t roundingBitNum = DataStoreV4::DataAffinityUtils::getExpireTimeRoundingBitNum(expireCategoryId);
+			chunkKey = DataStoreV4::DataAffinityUtils::convertTimestamp2ChunkKey(
 				baseTime + duration + EXPIRE_MARGIN,
 				roundingBitNum, true);
 		}
-		else {
-			chunkKey = MAX_CHUNK_KEY;
-		}
+		return chunkKey;
 	}
 
 	const uint8_t *getAffinityBinary() const {
 		return commonContainerSchema_->get<uint8_t>(META_TYPE_AFFINITY);
 	}
 
-public:  
-	AllocateStrategy getMapAllcateStrategy() const {
-		return mapAllocateStrategy_;
-	}
-	AllocateStrategy getRowAllcateStrategy() const {
-		return rowAllocateStrategy_;
-	}
-	AllocateStrategy getMetaAllcateStrategy() const {
-		return metaAllocateStrategy_;
-	}
+	template<typename C>
+	static SchemaFeatureLevel resolveSchemaFeatureLevel(const C &container);
 
 protected:  
-	virtual void incrementRowNum() = 0;
-	virtual void decrementRowNum() = 0;
+	void setContainerInvalid() {
+		baseContainerImage_->status_ |= CONTAINER_INVALID_BIT;
+	}
 
-	virtual void insertRowIdMap(TransactionContext &txn, BtreeMap *map,
-		const void *constKey, OId oId) = 0;
-	virtual void insertMvccMap(TransactionContext &txn, BtreeMap *map,
-		TransactionId tId, MvccRowImage &mvccImage) = 0;
-	virtual void insertValueMap(TransactionContext &txn, ValueMap &valueMap,
-		const void *constKey, OId oId, bool isNull) = 0;
-	virtual void updateRowIdMap(TransactionContext &txn, BtreeMap *map,
-		const void *constKey, OId oldOId, OId newOId) = 0;
-	virtual void updateMvccMap(TransactionContext &txn, BtreeMap *map,
+	uint16_t getSmallRowArrayNum() const {
+		if (getNormalRowArrayNum() < SMALL_ROW_ARRAY_MAX_SIZE) {
+			return getNormalRowArrayNum();
+		} else {
+			return SMALL_ROW_ARRAY_MAX_SIZE;
+		}
+	}
+
+	void incrementRowNum() {
+		baseContainerImage_->rowNum_++;
+	}
+	void decrementRowNum() {
+		baseContainerImage_->rowNum_--;
+	}
+
+	void insertRowIdMap(TransactionContext &txn, BtreeMap *map,
+		const void *constKey, OId oId);
+	void insertMvccMap(TransactionContext &txn, BtreeMap *map,
+		TransactionId tId, MvccRowImage &mvccImage);
+	void insertValueMap(TransactionContext &txn, ValueMap &valueMap,
+		const void *constKey, OId oId, bool isNull);
+	void updateRowIdMap(TransactionContext &txn, BtreeMap *map,
+		const void *constKey, OId oldOId, OId newOId);
+	void updateMvccMap(TransactionContext &txn, BtreeMap *map,
 		TransactionId tId, MvccRowImage &oldMvccImage,
-		MvccRowImage &newMvccImage) = 0;
-	virtual void updateValueMap(TransactionContext &txn, ValueMap &valueMap,
-		const void *constKey, OId oldOId, OId newOId, bool isNull) = 0;
-	virtual void removeRowIdMap(TransactionContext &txn, BtreeMap *map,
-		const void *constKey, OId oId) = 0;
-	virtual void removeMvccMap(TransactionContext &txn, BtreeMap *map,
-		TransactionId tId, MvccRowImage &mvccImage) = 0;
-	virtual void removeValueMap(TransactionContext &txn, ValueMap &valueMap,
-		const void *constKey, OId oId, bool isNull) = 0;
+		MvccRowImage &newMvccImage);
+	void updateValueMap(TransactionContext &txn, ValueMap &valueMap,
+		const void *constKey, OId oldOId, OId newOId, bool isNull);
+	void removeRowIdMap(TransactionContext &txn, BtreeMap *map,
+		const void *constKey, OId oId);
+	void removeMvccMap(TransactionContext &txn, BtreeMap *map,
+		TransactionId tId, MvccRowImage &mvccImage);
+	void removeValueMap(TransactionContext &txn, ValueMap &valueMap,
+		const void *constKey, OId oId, bool isNull);
 
-	virtual void updateIndexData(
-		TransactionContext &txn, const IndexData &indexData) = 0;
+	void updateIndexData(
+		TransactionContext &txn, const IndexData &indexData);
 	void updateValueMaps(TransactionContext &txn, 
 		const util::XArray<std::pair<OId, OId> > &moveList);
 
+	void handleUpdateError(
+		TransactionContext &txn, std::exception &e, ErrorCode errorCode);
+	void handleInvalidError(
+		TransactionContext &txn, SystemException &e, ErrorCode errorCode);
+
+	virtual void lockIdList(TransactionContext &txn, util::XArray<OId> &oIdList,
+		util::XArray<RowId> &idList) = 0;
+
+	static bool hasTermConditionUpdator(BtreeMap::SearchContext &sc);
+	static bool hasTermConditionUpdator(RtreeMap::SearchContext &sc);
 };
 
 /*!
@@ -1250,46 +1261,39 @@ protected:
 */
 class ContainerAutoPtr {
 public:
-	ContainerAutoPtr(TransactionContext &txn, DataStore *dataStore,
-		PartitionId pId, const FullContainerKey &containerKey,
-		uint8_t containerType, uint32_t schemaSize,
-		const uint8_t *containerSchema, bool isEnable,
-		int32_t featureVersion,
-		DataStore::PutStatus &status, bool isCaseSensitive = false)
+	ContainerAutoPtr(TransactionContext& txn, DataStoreV4* dataStore,
+		OId oId, uint8_t containerType, bool allowExpiration)
 		: stackAutoPtr_(txn.getDefaultAllocator()) {
-		BaseContainer *container =
-			dataStore->putContainer(txn, pId, containerKey, containerType,
-				schemaSize, containerSchema, isEnable, featureVersion,
-				status, isCaseSensitive);
+		if (oId == UNDEF_OID) {
+			stackAutoPtr_.set(NULL);
+			return;
+		}
+		util::StackAllocator& alloc = txn.getDefaultAllocator();
+		KeyDataStoreValue keyStoreValue(UNDEF_CONTAINERID, oId, dataStore->getStoreType(), CONTAINER_ATTR_ANY);
+		DSInputMes input(alloc, DS_GET_CONTAINER_OBJECT, containerType, allowExpiration);
+		StackAllocAutoPtr<DSContainerOutputMes> ret(alloc, 
+			static_cast<DSContainerOutputMes*>(dataStore->exec(&txn, &keyStoreValue, &input)));
+		stackAutoPtr_.set(ret.get()->releaseContainerPtr());
+	}
+	ContainerAutoPtr(TransactionContext& txn, BaseContainer* container)
+		: stackAutoPtr_(txn.getDefaultAllocator()) {
 		stackAutoPtr_.set(container);
 	}
 
-	ContainerAutoPtr(TransactionContext &txn, DataStore *dataStore,
-		PartitionId pId, const FullContainerKey &containerKey,
-		uint8_t containerType, bool isCaseSensitive = false, bool allowExpiration = false)
-		: stackAutoPtr_(txn.getDefaultAllocator()) {
-		BaseContainer *container =
-			dataStore->getContainer(txn, pId, containerKey, containerType, isCaseSensitive, allowExpiration);
-		stackAutoPtr_.set(container);
-	}
-	ContainerAutoPtr(TransactionContext &txn, DataStore *dataStore,
-		PartitionId pId, const ContainerCursor &containerCursor)
+	ContainerAutoPtr(TransactionContext &txn, DataStoreV4 *dataStore,
+		const ContainerCursor &containerCursor)
 		: stackAutoPtr_(txn.getDefaultAllocator()) {
 		bool allowExpiration = true;
-		BaseContainer *newContainer =
-			dataStore->getContainer(txn, pId, containerCursor, allowExpiration);
-		stackAutoPtr_.set(newContainer);
+
+		util::StackAllocator& alloc = txn.getDefaultAllocator();
+		KeyDataStoreValue keyStoreValue(UNDEF_CONTAINERID, containerCursor.getContainerOId(),
+			dataStore->getStoreType(), CONTAINER_ATTR_ANY);
+		DSInputMes input(alloc, DS_GET_CONTAINER_OBJECT, ANY_CONTAINER, allowExpiration);
+		StackAllocAutoPtr<DSContainerOutputMes> ret(alloc,
+			static_cast<DSContainerOutputMes*>(dataStore->exec(&txn, &keyStoreValue, &input)));
+		stackAutoPtr_.set(ret.get()->releaseContainerPtr());
 	}
 
-	ContainerAutoPtr(TransactionContext &txn, DataStore *dataStore,
-		PartitionId pId, ContainerId containerId, uint8_t containerType, bool allowExpiration = false)
-		: stackAutoPtr_(txn.getDefaultAllocator()) {
-		BaseContainer *container =
-			dataStore->getContainer(txn, pId, containerId, containerType, allowExpiration);
-		stackAutoPtr_.set(container);
-	}
-	~ContainerAutoPtr() {
-	}
 
 	BaseContainer *getBaseContainer() {
 		return stackAutoPtr_.get();
@@ -1319,22 +1323,6 @@ protected:
 	ContainerAutoPtr(TransactionContext &txn)
 		: stackAutoPtr_(txn.getDefaultAllocator()) {}
 	StackAllocAutoPtr<BaseContainer> stackAutoPtr_;
-};
-
-/*!
-	@brief Auto_ptr for Container object during recovery phase
-*/
-class ContainerForRestoreAutoPtr : public ContainerAutoPtr {
-public:
-	ContainerForRestoreAutoPtr(TransactionContext &txn, DataStore *dataStore,
-		PartitionId pId, OId oId, ContainerId containerId, uint8_t containerType)
-		: ContainerAutoPtr(txn) {
-		BaseContainer *container =
-			dataStore->getContainerForRestore(txn, pId, oId, containerId, containerType);
-		stackAutoPtr_.set(container);
-	}
-
-private:
 };
 
 class BaseContainer::RowArray {
@@ -1539,7 +1527,6 @@ public:
 	TransactionId getTxnId() const;
 	static bool isRemoved(RowHeader *binary);
 
-	void archive(TransactionContext &txn, ArchiveHandler *handler);
 	std::string dump(TransactionContext &txn);
 
 	BaseContainer::RowArray *getRowArray();
@@ -1655,6 +1642,8 @@ public:
 	static Column getRowIdColumn(const BaseContainer &container);
 
 private:  
+	friend class ContainerRowScanner;
+
 	static const size_t MAX_ROW_NUM_OFFSET = 0;									
 	static const size_t ROW_NUM_OFFSET = MAX_ROW_NUM_OFFSET + sizeof(uint16_t);	
 	static const size_t ROWID_OFFSET = ROW_NUM_OFFSET + sizeof(uint16_t);		
@@ -1780,7 +1769,6 @@ public:
 		TreeFuncInfo *funcInfo, bool &isNullValue);
 	void getFields(TransactionContext& txn, util::Vector<ColumnId> &columnIds,
 		util::XArray<KeyData> &fields);
-	void archive(TransactionContext &txn, ArchiveHandler *handler);
 
 	void lock(TransactionContext &txn);
 	void setFirstUpdate();
@@ -1887,7 +1875,7 @@ public:
 	struct HandlerEntry {
 	public:
 		HandlerEntry();
-		bool isAvalilable() const;
+		bool isAvailable() const;
 
 	private:
 		friend class ContainerRowScanner;
@@ -1952,6 +1940,21 @@ private:
 	RowArray &rowArray_;
 	VirtualValueList *virtualValueList_;
 };
+
+template<typename C>
+SchemaFeatureLevel BaseContainer::resolveSchemaFeatureLevel(
+		const C &container) {
+	const uint32_t columnNum = container.getColumnNum();
+
+	SchemaFeatureLevel level = 1;
+	for (uint32_t i = 0; i < columnNum; i++) {
+		level = std::max(
+				level,
+				resolveColumnSchemaFeatureLevel(container.getColumnInfo(i)));
+	}
+
+	return level;
+}
 
 inline bool ContainerRowScanner::scanRowUnchecked(
 		TransactionContext &txn, BaseContainer &container,
@@ -2066,14 +2069,26 @@ bool ContainerRowScanner::scanRowArraySpecific(
 				T == BaseContainer::ROW_ARRAY_GENERAL);
 
 		do {
-			if (!impl->begin()) {
+			impl->resetCursor();
+			if (impl->row_.isRemoved() && !impl->next()) {
 				break;
 			}
 
-			do {
+			uint32_t rest = impl->getRowNum() - impl->elemCursor_;
+			for (;;) {
 				handler(txn, *impl);
+
+				if (--rest <= 0) {
+					break;
+				}
+				impl->nextCursor();
+				if (impl->row_.isRemoved()) {
+					if (!impl->next()) {
+						break;
+					}
+					rest = impl->getRowNum() - impl->elemCursor_;
+				}
 			}
-			while (impl->next());
 
 			if (!handler.update(txn)) {
 				return false;

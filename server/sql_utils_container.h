@@ -24,66 +24,121 @@ class ResourceSet;
 class Query;
 
 struct SQLContainerUtils {
+	typedef SQLValues::TupleColumnList TupleColumnList;
+
 	typedef SQLExprs::Expression Expression;
 
 	typedef SQLOps::ColumnTypeList ColumnTypeList;
+	typedef SQLOps::OpStore OpStore;
 	typedef SQLOps::OpContext OpContext;
 	typedef SQLOps::Projection Projection;
 
-	class ScanCursor;
+	typedef SQLOps::ExtOpContext ExtOpContext;
 
+	class ScanCursor;
+	class ScanCursorAccessor;
+
+	struct IndexScanInfo;
 	struct ContainerUtils;
 };
 
 class SQLContainerUtils::ScanCursor {
 public:
-	struct Source;
-	class LatchTarget;
+	class Holder;
 
-	static util::AllocUniquePtr<ScanCursor>::ReturnType create(
-			util::StdAllocator<void, void> &alloc, const Source &source);
 	virtual ~ScanCursor();
+
+	virtual bool scanFull(OpContext &cxt, const Projection &proj) = 0;
+	virtual bool scanRange(OpContext &cxt, const Projection &proj) = 0;
+	virtual bool scanIndex(OpContext &cxt, const IndexScanInfo &info) = 0;
+	virtual bool scanMeta(
+			OpContext &cxt, const Projection &proj, const Expression *pred) = 0;
+
+	virtual uint32_t getOutputIndex() = 0;
+	virtual void setOutputIndex(uint32_t index) = 0;
+
+	virtual ScanCursorAccessor& getAccessor() = 0;
+
+protected:
+	ScanCursor();
+
+private:
+	ScanCursor(const ScanCursor&);
+	ScanCursor& operator=(const ScanCursor&);
+};
+
+class SQLContainerUtils::ScanCursor::Holder {
+public:
+	virtual ~Holder();
+	virtual util::AllocUniquePtr<ScanCursor>::ReturnType attach() = 0;
+
+protected:
+	Holder();
+
+private:
+	Holder(const Holder&);
+	Holder& operator=(const Holder&);
+};
+
+class SQLContainerUtils::ScanCursorAccessor :
+		public SQLValues::BaseLatchTarget {
+public:
+	struct Source;
+
+	static util::AllocUniquePtr<ScanCursorAccessor>::ReturnType create(
+			const Source &source);
+	virtual ~ScanCursorAccessor();
+
+	virtual util::AllocUniquePtr<ScanCursor::Holder>::ReturnType createCursor(
+			const OpStore::ResourceRef &accessorRef) = 0;
 
 	virtual void unlatch() throw() = 0;
 	virtual void close() throw() = 0;
 
-	virtual bool scanFull(OpContext &cxt, const Projection &proj) = 0;
-	virtual bool scanIndex(
-			OpContext &cxt, const Projection &proj,
-			const SQLExprs::IndexConditionList &condList) = 0;
-	virtual bool scanUpdates(OpContext &cxt, const Projection &proj) = 0;
-	virtual bool scanMeta(
-			OpContext &cxt, const Projection &proj, const Expression *pred) = 0;
-
 	virtual void getIndexSpec(
-			OpContext &cxt, SQLExprs::IndexSelector &selector) = 0;
+			ExtOpContext &cxt, const TupleColumnList &inColumnList,
+			SQLExprs::IndexSelector &selector) = 0;
 	virtual bool isIndexLost() = 0;
+	virtual bool isRowDuplicatable() = 0;
+	virtual bool isRangeScanFinished() = 0;
 
-	virtual uint32_t getOutputIndex() = 0;
-	virtual void setOutputIndex(uint32_t index) = 0;
-};
+	virtual void setIndexSelection(const SQLExprs::IndexSelector &selector) = 0;
+	virtual const SQLExprs::IndexSelector& getIndexSelection() = 0;
 
-struct SQLContainerUtils::ScanCursor::Source {
-	Source(
-			util::StackAllocator &alloc,
-			const SQLOps::ContainerLocation &location,
-			const ColumnTypeList *columnTypeList);
+	virtual void setRowIdFiltering() = 0;
+	virtual bool isRowIdFiltering() = 0;
 
-	util::StackAllocator &alloc_;
-	SQLOps::ContainerLocation location_;
-	const ColumnTypeList *columnTypeList_;
-};
-
-class SQLContainerUtils::ScanCursor::LatchTarget :
-		public SQLValues::BaseLatchTarget {
-public:
-	LatchTarget(ScanCursor *cursor = NULL);
-
-	virtual void unlatch() throw();
-	virtual void close() throw();
+protected:
+	ScanCursorAccessor();
 
 private:
-	ScanCursor *cursor_;
+	ScanCursorAccessor(const ScanCursorAccessor&);
+	ScanCursorAccessor& operator=(const ScanCursorAccessor&);
+};
+
+struct SQLContainerUtils::ScanCursorAccessor::Source {
+	Source(
+			SQLValues::VarAllocator &varAlloc,
+			const SQLOps::ContainerLocation &location,
+			const ColumnTypeList *columnTypeList,
+			const OpContext::Source &cxtSrc);
+
+	SQLValues::VarAllocator &varAlloc_;
+	SQLOps::ContainerLocation location_;
+	const ColumnTypeList *columnTypeList_;
+	int64_t indexLimit_;
+	int64_t memLimit_;
+	std::pair<uint64_t, uint64_t> partialExecSizeRange_;
+	OpContext::Source cxtSrc_;
+};
+
+struct SQLContainerUtils::IndexScanInfo {
+	IndexScanInfo(
+			const SQLExprs::IndexConditionList &condList,
+			const uint32_t *inputIndex);
+
+	const SQLExprs::IndexConditionList *condList_;
+	const uint32_t *inputIndex_;
 };
 
 struct SQLContainerUtils::ContainerUtils {

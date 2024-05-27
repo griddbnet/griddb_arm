@@ -1,5 +1,5 @@
 %define griddb_name griddb
-%define griddb_ver 4.5.0
+%define griddb_ver 5.5.0
 %define griddb_instdir /usr/griddb-%{griddb_ver}
 %define griddb_homedir /var/lib/gridstore
 # do not strip
@@ -10,7 +10,7 @@
 Name:           %{griddb_name}
 Summary:        GridDB Community Edition
 Version:        %{griddb_ver}
-Release:        1.linux
+Release:        linux
 Group:          Applications/Databases
 Vendor:         Toshiba Digital Solutions Corporation
 License:        AGPL-3.0 (and Apache-2.0)
@@ -30,9 +30,8 @@ rm -rf %{buildroot}
 # Install files
 mkdir -p %{buildroot}%{griddb_instdir}/bin
 mkdir -p %{buildroot}%{griddb_instdir}/conf
+mkdir -p %{buildroot}%{griddb_instdir}/conf_multicast
 mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/MessagePack
-mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/activemq-cpp-library
-mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/apr
 mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/ebb
 mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/picojson
 mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/purewell
@@ -43,60 +42,82 @@ mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/json-simple
 mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/uuid
 mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/omaha
 mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/zigzag_encoding
+mkdir -p %{buildroot}%{griddb_instdir}/3rd_party/fletcher32_simd
 mkdir -p %{buildroot}%{griddb_instdir}/docs
 mkdir -p %{buildroot}%{griddb_instdir}/docs/sample
 mkdir -p %{buildroot}%{griddb_instdir}/docs/sample/program
 mkdir -p %{buildroot}%{griddb_homedir}
 mkdir -p %{buildroot}/usr/bin
 mkdir -p %{buildroot}/usr/share/java
+mkdir -p %{buildroot}/usr/griddb/bin
+mkdir -p %{buildroot}/usr/lib/systemd/system
 
-install -c -m 750 bin/gsserver             %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gsserver                        %{buildroot}%{griddb_instdir}/bin
+install -c -m 700 bin/gs_adduser                      %{buildroot}%{griddb_instdir}/bin
+install -c -m 700 bin/gs_deluser                      %{buildroot}%{griddb_instdir}/bin
+install -c -m 700 bin/gs_passwd                       %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_joincluster                  %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_leavecluster                 %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_startnode                    %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_stat                         %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_stopcluster                  %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_stopnode                     %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_checkpoint                   %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_config                       %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_logconf                      %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_logs                         %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_paramconf                    %{buildroot}%{griddb_instdir}/bin
+install -c -m 750 bin/gs_partition                    %{buildroot}%{griddb_instdir}/bin
+install -c -m 640 bin/util_client.py                  %{buildroot}%{griddb_instdir}/bin
+install -c -m 640 bin/log.py                          %{buildroot}%{griddb_instdir}/bin
+install -c -m 640 bin/util.py                         %{buildroot}%{griddb_instdir}/bin
+install -c -m 644 bin/gridstore.jar                   %{buildroot}%{griddb_instdir}/bin/gridstore-%{version}.jar
+install -c -m 644 bin/gridstore-conf.jar              %{buildroot}%{griddb_instdir}/bin/gridstore-conf-%{version}.jar
+install -c -m 750 service/bin/gridstore               %{buildroot}%{griddb_instdir}/bin/
 
-install -c -m 700 bin/gs_adduser           %{buildroot}%{griddb_instdir}/bin
-install -c -m 700 bin/gs_deluser           %{buildroot}%{griddb_instdir}/bin
-install -c -m 700 bin/gs_passwd            %{buildroot}%{griddb_instdir}/bin
-install -c -m 750 bin/gs_joincluster       %{buildroot}%{griddb_instdir}/bin
-install -c -m 750 bin/gs_leavecluster      %{buildroot}%{griddb_instdir}/bin
-install -c -m 750 bin/gs_startnode         %{buildroot}%{griddb_instdir}/bin
-install -c -m 750 bin/gs_stat              %{buildroot}%{griddb_instdir}/bin
-install -c -m 750 bin/gs_stopcluster       %{buildroot}%{griddb_instdir}/bin
-install -c -m 750 bin/gs_stopnode          %{buildroot}%{griddb_instdir}/bin
-install -c -m 640 bin/log.py               %{buildroot}%{griddb_instdir}/bin
-install -c -m 640 bin/util.py              %{buildroot}%{griddb_instdir}/bin
+install -c -m 640 conf/gs_cluster.json     %{buildroot}%{griddb_instdir}/conf_multicast
+install -c -m 640 conf/gs_node.json        %{buildroot}%{griddb_instdir}/conf_multicast
+install -c -m 640 conf/password            %{buildroot}%{griddb_instdir}/conf_multicast
 
-install -c -m 644 bin/gridstore.jar        %{buildroot}%{griddb_instdir}/bin/gridstore-%{version}.jar
-install -c -m 644 bin/gridstore-conf.jar   %{buildroot}%{griddb_instdir}/bin/gridstore-conf-%{version}.jar
-
-install -c -m 640 conf/gs_cluster.json     %{buildroot}%{griddb_instdir}/conf
-install -c -m 640 conf/gs_node.json        %{buildroot}%{griddb_instdir}/conf
-install -c -m 640 conf/password            %{buildroot}%{griddb_instdir}/conf
+install -c -m 640 installer/conf/gs_cluster.json     %{buildroot}%{griddb_instdir}/conf
+install -c -m 640 installer/conf/gs_node.json        %{buildroot}%{griddb_instdir}/conf
+install -c -m 640 installer/conf/password            %{buildroot}%{griddb_instdir}/conf
+install -c -m 640 installer/conf/initGsh             %{buildroot}%{griddb_instdir}/conf
+install -c -m 640 service/conf/gridstore.conf        %{buildroot}%{griddb_instdir}/conf
+install -c -m 640 service/lib/systemd/system/gridstore.service                      %{buildroot}/usr/lib/systemd/system
 
 install -c -m 640 3rd_party/3rd_party.md                        %{buildroot}%{griddb_instdir}/3rd_party
 install -c -m 640 3rd_party/Apache_License-2.0.txt              %{buildroot}%{griddb_instdir}/3rd_party
 install -c -m 640 3rd_party/BSD_License.txt                     %{buildroot}%{griddb_instdir}/3rd_party
 install -c -m 640 3rd_party/MIT_License.txt                     %{buildroot}%{griddb_instdir}/3rd_party
 install -c -m 640 3rd_party/MessagePack/COPYING                 %{buildroot}%{griddb_instdir}/3rd_party/MessagePack
-install -c -m 640 3rd_party/activemq-cpp-library/org/NOTICE.txt %{buildroot}%{griddb_instdir}/3rd_party/activemq-cpp-library
-install -c -m 640 3rd_party/apr/org/NOTICE                      %{buildroot}%{griddb_instdir}/3rd_party/apr
 install -c -m 640 3rd_party/ebb/LICENSE                         %{buildroot}%{griddb_instdir}/3rd_party/ebb
-install -c -m 640 3rd_party/picojson/org/include/README.mkdn    %{buildroot}%{griddb_instdir}/3rd_party/picojson
 install -c -m 640 3rd_party/purewell/purewell.txt               %{buildroot}%{griddb_instdir}/3rd_party/purewell
 install -c -m 640 3rd_party/sha2/README                         %{buildroot}%{griddb_instdir}/3rd_party/sha2
 install -c -m 640 3rd_party/slf4j/LICENSE.txt                   %{buildroot}%{griddb_instdir}/3rd_party/slf4j
 install -c -m 640 3rd_party/slf4j/slf4j-api-1.7.7.jar           %{buildroot}%{griddb_instdir}/3rd_party/slf4j
 install -c -m 640 3rd_party/slf4j/slf4j-jdk14-1.7.7.jar         %{buildroot}%{griddb_instdir}/3rd_party/slf4j
 install -c -m 640 3rd_party/yield/yield.txt                     %{buildroot}%{griddb_instdir}/3rd_party/yield
-install -c -m 640 3rd_party/json-simple/fangyidong/LICENSE.txt  %{buildroot}%{griddb_instdir}/3rd_party/json-simple
-install -c -m 640 3rd_party/uuid/uuid/COPYING                   %{buildroot}%{griddb_instdir}/3rd_party/uuid
 install -c -m 640 3rd_party/omaha/COPYING                       %{buildroot}%{griddb_instdir}/3rd_party/omaha
 install -c -m 640 3rd_party/zigzag_encoding/LICENSE             %{buildroot}%{griddb_instdir}/3rd_party/zigzag_encoding
+install -c -m 640 3rd_party/picojson/org/include/README.mkdn                %{buildroot}%{griddb_instdir}/3rd_party/picojson
+install -c -m 640 3rd_party/json-simple/fangyidong/LICENSE.txt              %{buildroot}%{griddb_instdir}/3rd_party/json-simple
+install -c -m 640 3rd_party/uuid/uuid/COPYING                               %{buildroot}%{griddb_instdir}/3rd_party/uuid
+install -c -m 640 3rd_party/fletcher32_simd/fletcher32_simd/LICENSE         %{buildroot}%{griddb_instdir}/3rd_party/fletcher32_simd
+
+
 
 install -c -m 640 README.md                                     %{buildroot}%{griddb_instdir}
 install -c -m 644 docs/sample/program/Sample1.java              %{buildroot}%{griddb_instdir}/docs/sample/program
+install -c -m 644 docs/sample/program/Sample2.java              %{buildroot}%{griddb_instdir}/docs/sample/program
+install -c -m 644 docs/sample/program/Sample3.java              %{buildroot}%{griddb_instdir}/docs/sample/program
+install -c -m 644 docs/sample/program/SampleFetchAll.java              %{buildroot}%{griddb_instdir}/docs/sample/program
+install -c -m 644 docs/sample/program/SampleMultiGet.java              %{buildroot}%{griddb_instdir}/docs/sample/program
+install -c -m 644 docs/sample/program/SampleMultiPut.java              %{buildroot}%{griddb_instdir}/docs/sample/program
+
 
 # Install symbolic links
 ln -sf %{griddb_instdir}/bin/gsserver              %{buildroot}/usr/bin
-
 ln -sf %{griddb_instdir}/bin/gs_adduser            %{buildroot}/usr/bin
 ln -sf %{griddb_instdir}/bin/gs_deluser            %{buildroot}/usr/bin
 ln -sf %{griddb_instdir}/bin/gs_passwd             %{buildroot}/usr/bin
@@ -106,9 +127,18 @@ ln -sf %{griddb_instdir}/bin/gs_startnode          %{buildroot}/usr/bin
 ln -sf %{griddb_instdir}/bin/gs_stat               %{buildroot}/usr/bin
 ln -sf %{griddb_instdir}/bin/gs_stopcluster        %{buildroot}/usr/bin
 ln -sf %{griddb_instdir}/bin/gs_stopnode           %{buildroot}/usr/bin
-
+ln -sf %{griddb_instdir}/bin/gs_checkpoint         %{buildroot}/usr/bin
+ln -sf %{griddb_instdir}/bin/gs_config             %{buildroot}/usr/bin
+ln -sf %{griddb_instdir}/bin/gs_logconf            %{buildroot}/usr/bin
+ln -sf %{griddb_instdir}/bin/gs_logs               %{buildroot}/usr/bin
+ln -sf %{griddb_instdir}/bin/gs_paramconf          %{buildroot}/usr/bin
+ln -sf %{griddb_instdir}/bin/gs_partition          %{buildroot}/usr/bin
+ln -sf %{griddb_instdir}/bin/log.py                %{buildroot}%{griddb_instdir}/bin/logs.py
+ln -sf %{griddb_instdir}/bin/util_client.py        %{buildroot}%{griddb_instdir}/bin/util_server.py
+ln -sf %{griddb_instdir}/bin/gridstore             %{buildroot}/usr/griddb/bin
 ln -sf %{griddb_instdir}/bin/gridstore-%{version}.jar         %{buildroot}/usr/share/java/gridstore.jar
 ln -sf %{griddb_instdir}/bin/gridstore-conf-%{version}.jar    %{buildroot}/usr/share/java/gridstore-conf.jar
+
 
 %pre
 
@@ -125,7 +155,7 @@ if [ "$1" = "2" ]; then
     exit 1
   fi
 fi
-
+	
 # Register user and group
 GROUPID=`/bin/awk -F: '{if ($1 == "gsadm") print $4}' < /etc/passwd`
 if [ x"${GROUPID}" != x"" ]; then
@@ -162,9 +192,9 @@ else
     echo ""
     exit 1
   else
-    groupadd -g 124 -o -r gridstore >/dev/null 2>&1 || :
+    groupadd -g 1224 -o -r gridstore >/dev/null 2>&1 || :
     useradd -M -N -g gridstore -o -r -d %{griddb_homedir} -s /bin/bash \
-		-c "GridDB" -u 124 gsadm >/dev/null 2>&1 || :
+		-c "GridDB" -u 1224 gsadm >/dev/null 2>&1 || :
     echo ""
     echo "------------------------------------------------------------"
     echo "Information:"
@@ -193,20 +223,45 @@ if [ ! -e %{griddb_homedir}/conf ]; then
   mkdir -p %{griddb_homedir}/conf
   chown gsadm:gridstore %{griddb_homedir}/conf
 fi
+if [ ! -e /etc/sysconfig/gridstore ]; then
+  mkdir -p /etc/sysconfig/gridstore
+  chown gsadm:gridstore /etc/sysconfig/gridstore
+fi
 
 # Copy definition files when not exists
+#%{griddb_instdir}/conf/changeCluster.sh %{griddb_instdir}
 if [ ! -e %{griddb_homedir}/conf/gs_cluster.json ]; then
   cp %{griddb_instdir}/conf/gs_cluster.json %{griddb_homedir}/conf
   chown gsadm:gridstore %{griddb_homedir}/conf/gs_cluster.json
 fi
+
+
+
 if [ ! -e %{griddb_homedir}/conf/gs_node.json ]; then
   cp %{griddb_instdir}/conf/gs_node.json %{griddb_homedir}/conf
   chown gsadm:gridstore %{griddb_homedir}/conf/gs_node.json
 fi
+
+# Generate /var/lib/gridstore/.gsshrc file in case the python3 installed 
+if [ -f /usr/bin/python3 ]; then
+  /usr/bin/python3 %{griddb_instdir}/conf/initGsh
+  if [ -f /var/lib/gridstore/.gsshrc ]; then
+    chown gsadm:gridstore /var/lib/gridstore/.gsshrc
+  fi
+fi
+
+if [ ! -e /etc/sysconfig/gridstore/gridstore.conf ]; then
+  cp %{griddb_instdir}/conf/gridstore.conf /etc/sysconfig/gridstore/gridstore.conf
+  chown gsadm:gridstore /etc/sysconfig/gridstore/gridstore.conf
+fi
+
 if [ ! -e %{griddb_homedir}/conf/password ]; then
   cp %{griddb_instdir}/conf/password %{griddb_homedir}/conf
   chown gsadm:gridstore %{griddb_homedir}/conf/password
 fi
+
+# Enabled and reload gridstore service 
+systemctl enable gridstore.service
 
 # Create .bash_profile for gsadm user
 GSADMHOME=`/bin/awk -F: '{if ($1 == "gsadm") print $6}' < /etc/passwd`
@@ -233,6 +288,26 @@ fi
  chown gsadm:gridstore /var/lib/gridstore/.bash_profile
 fi
 
+%preun
+if [ "$1" = "0" ]; then
+  # Uninstallation
+  # If gsserver process exists
+  SVR_PROC=`/usr/bin/pgrep gsserver`
+  if [ x"${SVR_PROC}" != x"" ]; then
+    echo ""
+    echo "------------------------------------------------------------"
+    echo "Uninstallation Error:"
+    echo "  GridDB server is running. Please stop GridDB server."
+    echo "------------------------------------------------------------"
+    echo ""
+    exit 1
+  fi
+  /usr/bin/systemctl disable gridstore
+elif [ "$1" = "1" ]; then
+  # Upgrade or Update
+  echo ""
+fi
+
 %files
 
 %defattr(755,gsadm,gridstore)
@@ -241,8 +316,6 @@ fi
 %dir %{griddb_instdir}/conf
 %dir %{griddb_instdir}/3rd_party
 %dir %{griddb_instdir}/3rd_party/MessagePack
-%dir %{griddb_instdir}/3rd_party/activemq-cpp-library
-%dir %{griddb_instdir}/3rd_party/apr
 %dir %{griddb_instdir}/3rd_party/ebb
 %dir %{griddb_instdir}/3rd_party/picojson
 %dir %{griddb_instdir}/3rd_party/purewell
@@ -253,6 +326,7 @@ fi
 %dir %{griddb_instdir}/3rd_party/uuid
 %dir %{griddb_instdir}/3rd_party/omaha
 %dir %{griddb_instdir}/3rd_party/zigzag_encoding
+%dir %{griddb_instdir}/3rd_party/fletcher32_simd
 %dir %{griddb_instdir}/docs
 %dir %{griddb_instdir}/docs/sample
 %dir %{griddb_instdir}/docs/sample/program
@@ -269,20 +343,31 @@ fi
 %{griddb_instdir}/bin/gs_stat
 %{griddb_instdir}/bin/gs_stopcluster
 %{griddb_instdir}/bin/gs_stopnode
+%{griddb_instdir}/bin/gs_checkpoint
+%{griddb_instdir}/bin/gs_config
+%{griddb_instdir}/bin/gs_logconf
+%{griddb_instdir}/bin/gs_logs
+%{griddb_instdir}/bin/gs_paramconf
+%{griddb_instdir}/bin/gs_partition
+%{griddb_instdir}/bin/logs.py
+%{griddb_instdir}/bin/util_client.py
+%{griddb_instdir}/bin/util_server.py
 %{griddb_instdir}/bin/log.py
 %{griddb_instdir}/bin/util.py
+%{griddb_instdir}/bin/gridstore
 %{griddb_instdir}/bin/gridstore-%{version}.jar
 %{griddb_instdir}/bin/gridstore-conf-%{version}.jar
 %{griddb_instdir}/conf/gs_cluster.json
 %{griddb_instdir}/conf/gs_node.json
 %{griddb_instdir}/conf/password
+%{griddb_instdir}/conf_multicast/gs_cluster.json
+%{griddb_instdir}/conf_multicast/gs_node.json
+%{griddb_instdir}/conf_multicast/password
 %{griddb_instdir}/3rd_party/3rd_party.md
 %{griddb_instdir}/3rd_party/Apache_License-2.0.txt
 %{griddb_instdir}/3rd_party/BSD_License.txt
 %{griddb_instdir}/3rd_party/MIT_License.txt
 %{griddb_instdir}/3rd_party/MessagePack/COPYING
-%{griddb_instdir}/3rd_party/activemq-cpp-library/NOTICE.txt
-%{griddb_instdir}/3rd_party/apr/NOTICE
 %{griddb_instdir}/3rd_party/ebb/LICENSE
 %{griddb_instdir}/3rd_party/picojson/README.mkdn
 %{griddb_instdir}/3rd_party/purewell/purewell.txt
@@ -295,8 +380,17 @@ fi
 %{griddb_instdir}/3rd_party/uuid/COPYING
 %{griddb_instdir}/3rd_party/omaha/COPYING
 %{griddb_instdir}/3rd_party/zigzag_encoding/LICENSE
+%{griddb_instdir}/3rd_party/fletcher32_simd/LICENSE
+
 %{griddb_instdir}/README.md
 %{griddb_instdir}/docs/sample/program/Sample1.java
+%{griddb_instdir}/docs/sample/program/Sample2.java
+%{griddb_instdir}/docs/sample/program/Sample3.java
+%{griddb_instdir}/docs/sample/program/SampleFetchAll.java
+%{griddb_instdir}/docs/sample/program/SampleMultiGet.java
+%{griddb_instdir}/docs/sample/program/SampleMultiPut.java
+%{griddb_instdir}/conf/initGsh
+%{griddb_instdir}/conf/gridstore.conf
 /usr/bin/gsserver
 /usr/bin/gs_adduser
 /usr/bin/gs_deluser
@@ -307,9 +401,27 @@ fi
 /usr/bin/gs_stat
 /usr/bin/gs_stopcluster
 /usr/bin/gs_stopnode
+/usr/bin/gs_checkpoint
+/usr/bin/gs_config
+/usr/bin/gs_logconf
+/usr/bin/gs_logs
+/usr/bin/gs_paramconf
+/usr/bin/gs_partition
 /usr/share/java/gridstore.jar
 /usr/share/java/gridstore-conf.jar
+/usr/lib/systemd/system/gridstore.service
+/usr/griddb/bin/gridstore
 
 %changelog
-* Wed Jun 17 2020 Toshiba Digital Solutions Corporation
-- 4.5.0
+* Mon Nov 13 2023 Toshiba Digital Solutions Corporation
+- 5.3.1
+* Mon Jun 12 2023 Toshiba Digital Solutions Corporation
+- 5.3.0
+* Tue Oct 25 2022 Toshiba Digital Solutions Corporation
+- 5.1.0
+* Thu Apr 21 2022 Toshiba Digital Solutions Corporation
+- 5.0.0
+* Tue Aug 26 2021 Toshiba Digital Solutions Corporation
+- 4.6.1
+* Thu Feb 25 2021 Toshiba Digital Solutions Corporation
+- 4.6.0
